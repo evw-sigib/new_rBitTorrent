@@ -1,0 +1,1129 @@
+//! `rbittorrent-supervisor`: PID 1 of the rbittorrent Home Assistant app.
+//!
+//! Startup is strictly ordered and fail-closed:
+//!
+//! 1. read + validate `/data/options.json` (and the pasted WireGuard `.conf`)
+//! 2. resolve the WireGuard endpoint once, while normal DNS still works
+//! 3. load the nftables kill-switch atomically (drop-by-default, no IPv6)
+//! 4. point `/etc/resolv.conf` at the in-tunnel DNS
+//! 5. create `wg0`, add split-return routes, wait for the first handshake
+//! 6. lease a port with NAT-PMP inside the tunnel, open it in the firewall
+//! 7. only then start rtbit (sandboxed, bound to `wg0`)
+//!
+//! The Web UI account is written into rtbit's credential store before rtbit
+//! ever starts, and the unprivileged Ingress proxy (port 8099: sidebar +
+//! watchdog) starts right after the kill-switch.
+//!
+//! Afterwards it renews the lease every 45 s, restarts rtbit only when the
+//! forwarded port really changes, respawns rtbit after crashes, reaps orphans
+//! and shuts everything down in order on SIGTERM/SIGINT.
+//!
+//! The control plane is deliberately single-threaded (`current_thread`
+//! runtime): it idles in a couple of MiB and never competes with rtbit, which
+//! sizes its own multi-threaded runtime to all available cores.
+
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::watch;
+use tokio::time::{Instant, sleep, sleep_until};
+use tracing::{debug, error, info, warn};
+
+use rbittorrent_supervisor::config::{Options, Paths, Secret, Settings};
+use rbittorrent_supervisor::exec::{Runner, SystemRunner};
+use rbittorrent_supervisor::firewall::RulesetSpec;
+use rbittorrent_supervisor::host::{self, PortState};
+use rbittorrent_supervisor::ingress::{self, Health};
+use rbittorrent_supervisor::migration::{self, SeedJob};
+use rbittorrent_supervisor::natpmp::{Client, NatPmpError, PortDecision, PortForwarder};
+use rbittorrent_supervisor::process::{Backoff, Rtbit, RtbitSpec};
+use rbittorrent_supervisor::wireguard::{TunnelPlan, WG_FWMARK, WG_IFACE};
+use rbittorrent_supervisor::{
+    config, firewall, ha_supervisor, init_logging, natpmp, process, wireguard,
+};
+
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const DEFAULT_OPTIONS_PATH: &str = "/data/options.json";
+const DEFAULT_RTBIT_BINARY: &str = "/usr/local/bin/rtbit";
+const DEFAULT_RESOLV_CONF: &str = "/etc/resolv.conf";
+
+/// Per-attempt limit for the first WireGuard handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// WireGuard's REJECT_AFTER_TIME: older sessions cannot carry traffic.
+const HANDSHAKE_STALE_AFTER: Duration = Duration::from_secs(180);
+const STALE_ESCALATE_AFTER: Duration = Duration::from_secs(600);
+const HEALTH_INTERVAL: Duration = Duration::from_secs(30);
+/// Grace period when restarting rtbit for a new forwarded port.
+const RTBIT_RESTART_GRACE: Duration = Duration::from_secs(5);
+/// Grace period on app shutdown (config.yaml `timeout: 30`).
+const RTBIT_SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
+/// rtbit's own graceful-shutdown budget (flushes the session/fast-resume DB).
+const RTBIT_INTERNAL_SHUTDOWN: Duration = Duration::from_secs(12);
+/// An rtbit that ran this long without crashing resets the respawn backoff.
+const RTBIT_STABLE_AFTER: Duration = Duration::from_secs(300);
+const REAP_INTERVAL: Duration = Duration::from_secs(30);
+const PMP_HINT_EVERY: Duration = Duration::from_secs(1800);
+/// The free-space check runs at most this often; its banner at most hourly.
+const DISK_CHECK_EVERY: Duration = Duration::from_secs(600);
+const DISK_WARN_EVERY: Duration = Duration::from_secs(3600);
+const INGRESS_STOP_GRACE: Duration = Duration::from_secs(3);
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => {}
+        Some("--version" | "-V") => {
+            println!("rbittorrent-supervisor {VERSION}");
+            return ExitCode::SUCCESS;
+        }
+        Some("--help" | "-h") => {
+            print_help();
+            return ExitCode::SUCCESS;
+        }
+        Some("healthcheck") => return healthcheck(),
+        Some("ingress-proxy") => return ingress::main_from_stdin(),
+        Some(other) => {
+            eprintln!("rbittorrent-supervisor: unknown argument `{other}` (try --help)");
+            return ExitCode::from(2);
+        }
+    }
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("rbittorrent-supervisor: cannot start the async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(run())
+}
+
+fn print_help() {
+    println!(
+        "rbittorrent-supervisor {VERSION}
+PID-1 supervisor for rustTorrent (rtbit) behind a fail-closed WireGuard kill-switch.
+
+USAGE:
+    rbittorrent-supervisor              run as the app's init process
+    rbittorrent-supervisor healthcheck  exit 0 when http://127.0.0.1:8099/__health reports healthy
+                                (rtbit running, fresh WireGuard handshake, Web UI answering)
+    rbittorrent-supervisor ingress-proxy
+                                internal: the Home Assistant Ingress proxy, started by the
+                                supervisor itself (configuration arrives on stdin)
+    rbittorrent-supervisor --version    print the version
+    rbittorrent-supervisor --help       print this help
+
+ENVIRONMENT (development/testing only):
+    RBITTORRENT_OPTIONS      options file        (default {DEFAULT_OPTIONS_PATH})
+    RBITTORRENT_CONFIG_ROOT  app config folder   (default /config)
+    RBITTORRENT_RTBIT        rtbit binary        (default {DEFAULT_RTBIT_BINARY})
+    RBITTORRENT_RESOLV_CONF  resolver file       (default {DEFAULT_RESOLV_CONF})"
+    );
+}
+
+/// Docker HEALTHCHECK: the same verdict as Home Assistant's watchdog.
+fn healthcheck() -> ExitCode {
+    use std::io::{Read, Write};
+    let addr = SocketAddr::from(([127, 0, 0, 1], config::INGRESS_PORT));
+    let result = (|| -> std::io::Result<String> {
+        let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
+        s.set_read_timeout(Some(Duration::from_secs(8)))?;
+        write!(
+            s,
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            ingress::HEALTH_PATH
+        )?;
+        let mut reply = String::new();
+        s.take(8192).read_to_string(&mut reply)?;
+        Ok(reply)
+    })();
+    match result {
+        Ok(reply) if reply.starts_with("HTTP/1.1 200") => ExitCode::SUCCESS,
+        Ok(reply) => {
+            let body = reply.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+            eprintln!("unhealthy: {body}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("unhealthy: the Ingress proxy is not answering on {addr}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn env_path(var: &str, default: &str) -> PathBuf {
+    std::env::var_os(var).map_or_else(|| PathBuf::from(default), PathBuf::from)
+}
+
+async fn run() -> ExitCode {
+    let options_path = env_path("RBITTORRENT_OPTIONS", DEFAULT_OPTIONS_PATH);
+    let options = Options::load(&options_path);
+    init_logging(options.as_ref().map(|o| o.log_level).unwrap_or_default());
+    info!(
+        "rbittorrent supervisor {VERSION} starting (pid {})",
+        std::process::id()
+    );
+    process::become_subreaper_if_needed();
+
+    let mut options = match options {
+        Ok(o) => o,
+        Err(e) => {
+            error!("{e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let paths = Paths {
+        config_root: env_path("RBITTORRENT_CONFIG_ROOT", "/config"),
+    };
+    // Before validation: may provide /config/wg0.conf and the folders.
+    let migration = migration::prepare(&mut options, &migration::Roots::new(&paths.config_root));
+    let settings = match Settings::from_options(&options, &paths) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("configuration error: {e:#}");
+            error!("fix the app configuration in Home Assistant and start the app again");
+            return ExitCode::FAILURE;
+        }
+    };
+    for note in &settings.notes {
+        warn!("config: {note}");
+    }
+    info!("WireGuard configuration from {}", settings.wireguard_source);
+
+    let shutdown = match spawn_signal_handlers() {
+        Ok(rx) => rx,
+        Err(e) => {
+            error!("cannot install signal handlers: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    spawn_reaper();
+
+    match supervise(&settings, migration, shutdown).await {
+        Ok(()) => {
+            info!("shutdown complete");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!("fatal: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// SIGTERM/SIGINT flip the shutdown flag; a second signal exits immediately.
+fn spawn_signal_handlers() -> Result<watch::Receiver<bool>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).context("SIGTERM")?;
+    let mut int = signal(SignalKind::interrupt()).context("SIGINT")?;
+    let (tx, rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let name = tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = int.recv() => "SIGINT",
+        };
+        info!("{name} received: stopping rtbit, then the tunnel");
+        let _ = tx.send(true);
+        tokio::select! {
+            _ = term.recv() => {},
+            _ = int.recv() => {},
+        }
+        warn!("second signal received: exiting immediately");
+        std::process::exit(130);
+    });
+    Ok(rx)
+}
+
+/// PID-1 duty: reap re-parented orphans on SIGCHLD (and periodically).
+fn spawn_reaper() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let sigchld = signal(SignalKind::child());
+    tokio::spawn(async move {
+        let mut sigchld = match sigchld {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!("cannot watch SIGCHLD ({e}); reaping orphans periodically only");
+                None
+            }
+        };
+        loop {
+            match sigchld.as_mut() {
+                Some(s) => {
+                    tokio::select! {
+                        _ = s.recv() => {},
+                        _ = sleep(REAP_INTERVAL) => {},
+                    }
+                }
+                None => sleep(REAP_INTERVAL).await,
+            }
+            // Let tokio collect its own children first.
+            sleep(Duration::from_millis(50)).await;
+            process::reap_orphans();
+        }
+    });
+}
+
+fn shutting_down(rx: &watch::Receiver<bool>) -> bool {
+    *rx.borrow()
+}
+
+/// Runs `fut` unless shutdown is requested first (then returns `None`).
+async fn unless_shutdown<T>(
+    rx: &mut watch::Receiver<bool>,
+    fut: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if shutting_down(rx) {
+        return None;
+    }
+    tokio::select! {
+        v = fut => Some(v),
+        _ = rx.wait_for(|v| *v) => None,
+    }
+}
+
+async fn preflight(runner: &impl Runner) -> Result<()> {
+    let ip = runner
+        .run("ip", &["-V"], None)
+        .await
+        .context("`ip` from iproute2 is required")?;
+    let ip_version = format!("{}{}", ip.stdout, ip.stderr);
+    if !ip_version.contains("iproute2") {
+        anyhow::bail!(
+            "`ip` is not iproute2 ({}); BusyBox ip cannot create WireGuard links",
+            ip_version.trim()
+        );
+    }
+    let wg = runner
+        .run("wg", &["--version"], None)
+        .await
+        .context("`wg` from wireguard-tools is required")?;
+    let nft = runner
+        .run("nft", &["--version"], None)
+        .await
+        .context("`nft` from nftables is required")?;
+    info!(
+        "tools: {} | {} | {}",
+        ip_version.trim(),
+        wg.stdout.trim(),
+        nft.stdout.trim()
+    );
+    ensure_ipv6_sockets()
+}
+
+/// rtbit opens dual-stack `[::]` UDP sockets (DHT, UDP trackers) even in
+/// IPv4-only mode, so a kernel booted with `ipv6.disable=1` makes it exit at
+/// once. IPv6 *traffic* is still dropped by the kill-switch; only the socket
+/// family has to exist. Failing here beats an endless rtbit crash loop.
+fn ensure_ipv6_sockets() -> Result<()> {
+    match std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)) {
+        Ok(_) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EAFNOSUPPORT) => anyhow::bail!(
+            "the host kernel has IPv6 disabled completely (ipv6.disable=1), but rtbit needs \
+             IPv6 sockets to start. Remove ipv6.disable=1 from the kernel command line; this \
+             app still blocks all IPv6 traffic with its kill-switch"
+        ),
+        // Any other error (e.g. sysctl-disabled IPv6) does not stop rtbit.
+        Err(e) => {
+            debug!("IPv6 socket probe: {e}");
+            Ok(())
+        }
+    }
+}
+
+fn prepare_dirs(s: &Settings) -> Result<()> {
+    for dir in [
+        &s.data_home,
+        &s.cache_home,
+        &s.download_dir,
+        &s.completed_dir,
+    ] {
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    }
+    info!(
+        db = %s.data_home.display(),
+        cache = %s.cache_home.display(),
+        downloads = %s.download_dir.display(),
+        completed = %s.completed_dir.display(),
+        "storage ready"
+    );
+    Ok(())
+}
+
+async fn resolve_with_retry(endpoint: &config::Endpoint) -> Result<SocketAddrV4> {
+    let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(8));
+    let mut attempt = 1;
+    loop {
+        match wireguard::resolve_endpoint(endpoint).await {
+            Ok(addr) => {
+                info!("WireGuard endpoint {endpoint} -> {addr}");
+                return Ok(addr);
+            }
+            Err(e) if attempt < 6 => {
+                let d = backoff.next_delay();
+                warn!("{e:#}; retrying in {}s", d.as_secs());
+                sleep(d).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Phase 2 of the qBittorrent import plus the banner line.
+struct MigrationRun {
+    status: String,
+    job: Option<SeedJob>,
+}
+
+async fn supervise(
+    s: &Settings,
+    migration: migration::Migration,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let runner = SystemRunner;
+    preflight(&runner).await?;
+    prepare_dirs(s)?;
+    host::raise_udp_buffer_limits();
+    // Supervisor API: before the kill-switch (it uses the normal network).
+    supervisor_checks(s).await;
+
+    // The Web UI account goes into rtbit's credential store before rtbit
+    // ever runs: port 8080 is never open and never waits for first-run setup.
+    let rtbit_spec = rtbit_spec(s);
+    let (password, generated) = s.resolve_webui_password()?;
+    rtbit_spec
+        .set_credentials(&s.webui_username, &password)
+        .await
+        .context("cannot store the Web UI account in rtbit")?;
+    if generated {
+        warn!(
+            "`webui_password` is empty: generated a random password for Web UI user `{}` and \
+             saved it in /config/{} (this app's own config folder on the Samba/SSH \
+             share). The Home Assistant sidebar signs in automatically; use this password for \
+             LAN access and Sonarr/Radarr, or set `webui_password` yourself.",
+            s.webui_username,
+            config::GENERATED_PASSWORD_FILE
+        );
+    } else {
+        info!(
+            "Web UI account `{}` ready (sidebar signs in automatically, port {} needs the password)",
+            s.webui_username, s.webui_port
+        );
+    }
+
+    let migration = MigrationRun {
+        status: migration.status.clone(),
+        job: migration.has_work().then(|| SeedJob {
+            api: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, s.webui_port)),
+            username: s.webui_username.clone(),
+            password: password.clone(),
+            config_root: s.config_root.clone(),
+            data_roots: migration::default_data_roots(),
+            migration,
+        }),
+    };
+
+    // A. Endpoint resolution happens before DNS is locked down.
+    let Some(endpoint) =
+        unless_shutdown(&mut shutdown, resolve_with_retry(&s.wireguard.endpoint)).await
+    else {
+        return Ok(());
+    };
+    let endpoint = endpoint?;
+    let (lan, connected) = wireguard::detect_lan(&runner).await?;
+    info!(gateway = %lan.gateway, dev = %lan.dev, "uplink detected");
+
+    // B. Fail-closed kill-switch before anything else talks to the network.
+    let ruleset = RulesetSpec {
+        lan_iface: lan.dev.clone(),
+        wg_iface: WG_IFACE.to_owned(),
+        lan_cidrs: s.local_allow_cidrs.clone(),
+        webui_port: s.webui_port,
+        ingress_port: s.ingress_port,
+        ingress_sources: config::HASSIO_NETWORK,
+        endpoint,
+        wg_fwmark: WG_FWMARK,
+        bt_ports: Vec::new(),
+    };
+    firewall::install(&runner, &ruleset).await?;
+    let cidrs: Vec<String> = s
+        .local_allow_cidrs
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    info!(
+        "kill-switch active: IPv6 dropped, LAN [{}] may only reach port {} (replies only), \
+         Home Assistant {} may reach Ingress port {}, everything else must use {WG_IFACE}",
+        cidrs.join(", "),
+        s.webui_port,
+        config::HASSIO_NETWORK,
+        s.ingress_port
+    );
+    let resolv = env_path("RBITTORRENT_RESOLV_CONF", DEFAULT_RESOLV_CONF);
+    wireguard::lock_resolv_conf(&resolv, &s.wireguard.dns)?;
+    info!("DNS locked to {:?} via the tunnel", s.wireguard.dns);
+
+    // The Ingress proxy (sidebar + watchdog) runs from here on, so the panel
+    // shows a "starting" page instead of an error while the tunnel comes up.
+    let (health, health_rx) = watch::channel(Health {
+        detail: "connecting the WireGuard tunnel".into(),
+        ..Health::default()
+    });
+    let (stop_ingress, stop_rx) = watch::channel(false);
+    let ingress_task = tokio::spawn(supervise_ingress(
+        ingress_config_line(s, &password)?,
+        health_rx,
+        stop_rx,
+    ));
+    drop(password);
+
+    let result = run_tunnel(
+        s,
+        &runner,
+        lan,
+        connected,
+        endpoint,
+        rtbit_spec,
+        migration,
+        &health,
+        &mut shutdown,
+    )
+    .await;
+    let _ = stop_ingress.send(true);
+    if tokio::time::timeout(INGRESS_STOP_GRACE * 2, ingress_task)
+        .await
+        .is_err()
+    {
+        warn!("the Ingress proxy did not stop in time");
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_tunnel(
+    s: &Settings,
+    runner: &SystemRunner,
+    lan: wireguard::LanRoute,
+    connected: Vec<rbittorrent_supervisor::cidr::Ipv4Cidr>,
+    endpoint: SocketAddrV4,
+    rtbit_spec: RtbitSpec,
+    migration: MigrationRun,
+    health: &watch::Sender<Health>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    // C. Tunnel, retried until it works (rtbit never starts without it).
+    let nat_pmp_gateway = s.nat_pmp.as_ref().map(|n| n.gateway);
+    let plan = TunnelPlan {
+        lan,
+        endpoint,
+        lan_routes: wireguard::plan_lan_routes(&s.local_allow_cidrs, &connected),
+        tunnel_hosts: wireguard::tunnel_hosts(&s.wireguard.dns, nat_pmp_gateway),
+    };
+    let probe_ip = nat_pmp_gateway
+        .or_else(|| s.wireguard.dns.first().copied())
+        .unwrap_or(config::PROTON_GATEWAY);
+    let probe = SocketAddrV4::new(probe_ip, natpmp::NATPMP_PORT);
+    let mut backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(300));
+    loop {
+        let attempt = async {
+            wireguard::bring_up(runner, &s.wireguard, &plan).await?;
+            wireguard::wait_for_handshake(runner, &s.wireguard, probe, HANDSHAKE_TIMEOUT).await
+        };
+        match unless_shutdown(shutdown, attempt).await {
+            None => {
+                wireguard::tear_down(runner).await;
+                return Ok(());
+            }
+            Some(Ok(())) => break,
+            Some(Err(e)) => {
+                error!("tunnel setup failed: {e:#}");
+                wireguard::tear_down(runner).await;
+                let d = backoff.next_delay();
+                warn!(
+                    "retrying the tunnel in {}s (rtbit stays stopped)",
+                    d.as_secs()
+                );
+                let _ = health.send(Health {
+                    detail: format!(
+                        "WireGuard tunnel setup failed; retrying in {}s",
+                        d.as_secs()
+                    ),
+                    ..Health::default()
+                });
+                if unless_shutdown(shutdown, sleep(d)).await.is_none() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // D. Port forwarding + rtbit.
+    let result = run_session(s, runner, rtbit_spec, migration, health, shutdown).await;
+    wireguard::tear_down(runner).await;
+    result
+}
+
+/// Port-conflict guard and discovery through the Supervisor API. Best
+/// effort: nothing here can stop the app.
+async fn supervisor_checks(s: &Settings) {
+    let Some(api) = ha_supervisor::SupervisorApi::from_env().await else {
+        debug!(
+            "no SUPERVISOR_TOKEN (not running under Home Assistant): skipping Supervisor checks"
+        );
+        return;
+    };
+    let slugs: Vec<String> = migration::candidate_roots(&migration::Roots::new(&s.config_root))
+        .into_iter()
+        .filter_map(|(_, slug)| slug)
+        .collect();
+    let apps = api.qbittorrent_apps(&slugs).await;
+    if let Some(banner) = ha_supervisor::conflict_banner(&apps, s.webui_port) {
+        warn!("{banner}");
+    } else if !apps.is_empty() {
+        let names: Vec<&str> = apps.iter().map(|a| a.slug.as_str()).collect();
+        info!(
+            "qBittorrent app(s) installed but not running: {}",
+            names.join(", ")
+        );
+    }
+    let config = match ha_supervisor::own_hostname() {
+        Some(host) => serde_json::json!({ "host": host, "port": s.webui_port, "ssl": false }),
+        None => serde_json::json!({ "port": s.webui_port, "ssl": false }),
+    };
+    match api.announce("qbittorrent", config).await {
+        Ok(_) => info!(
+            "offered the qBittorrent API (port {}) to Home Assistant's discovery",
+            s.webui_port
+        ),
+        Err(e) => debug!("Home Assistant discovery not available: {e:#}"),
+    }
+}
+
+fn rtbit_spec(s: &Settings) -> RtbitSpec {
+    RtbitSpec {
+        binary: env_path("RBITTORRENT_RTBIT", DEFAULT_RTBIT_BINARY),
+        home: s
+            .data_home
+            .parent()
+            .map_or_else(|| s.data_home.clone(), Path::to_path_buf),
+        data_home: s.data_home.clone(),
+        cache_home: s.cache_home.clone(),
+        download_dir: s.download_dir.clone(),
+        completed_dir: s.completed_dir.clone(),
+        webui_port: s.webui_port,
+        bind_device: WG_IFACE.to_owned(),
+        listen_ip: s.wireguard.address.addr(),
+        log_level: s.log_level,
+        dht: s.enable_dht,
+        shutdown_timeout: RTBIT_INTERNAL_SHUTDOWN,
+        sandbox: true,
+    }
+}
+
+fn ingress_config_line(s: &Settings, password: &Secret) -> Result<String> {
+    let cfg = ingress::ProxyConfig {
+        listen: SocketAddr::from(([0, 0, 0, 0], s.ingress_port)),
+        upstream: SocketAddr::from(([127, 0, 0, 1], s.webui_port)),
+        // Ingress and the watchdog always come from the Supervisor; loopback
+        // is for the Docker HEALTHCHECK. Other apps on 172.30.32.0/23 pass
+        // the firewall but are refused here: they must never inherit the
+        // automatic sign-in.
+        allowed_peers: vec![
+            format!("{}/32", ingress::SUPERVISOR_IP),
+            "127.0.0.1/32".to_owned(),
+        ],
+        username: s.webui_username.clone(),
+        password: password.expose().to_owned(),
+        log_level: s.log_level,
+    };
+    serde_json::to_string(&cfg).context("cannot encode the Ingress configuration")
+}
+
+/// Keeps the Ingress proxy child running and feeds it health heartbeats.
+async fn supervise_ingress(
+    config_line: String,
+    mut health: watch::Receiver<Health>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            error!("cannot locate the supervisor binary for the Ingress proxy: {e}");
+            return;
+        }
+    };
+    let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
+    let mut health_open = true;
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        let started = Instant::now();
+        let (mut child, mut stdin) = match process::spawn_ingress(&exe, &config_line, true).await {
+            Ok(x) => x,
+            Err(e) => {
+                error!("{e:#}");
+                if unless_shutdown(&mut stop, sleep(backoff.next_delay()))
+                    .await
+                    .is_none()
+                {
+                    return;
+                }
+                continue;
+            }
+        };
+        let current = health.borrow_and_update().clone();
+        send_health(&mut stdin, &current).await;
+        let status = loop {
+            tokio::select! {
+                status = child.wait() => break Some(status),
+                changed = health.changed(), if health_open => {
+                    if changed.is_err() {
+                        health_open = false;
+                        continue;
+                    }
+                    let h = health.borrow_and_update().clone();
+                    send_health(&mut stdin, &h).await;
+                }
+                () = stop_requested(&mut stop) => break None,
+            }
+        };
+        let Some(status) = status else {
+            // EOF on its stdin makes the proxy exit by itself.
+            drop(stdin);
+            if tokio::time::timeout(INGRESS_STOP_GRACE, child.wait())
+                .await
+                .is_err()
+            {
+                child.start_kill().ok();
+                let _ = child.wait().await;
+            }
+            return;
+        };
+        match status {
+            Ok(st) => warn!("the Ingress proxy exited ({st}); restarting it"),
+            Err(e) => warn!("waiting for the Ingress proxy failed: {e}"),
+        }
+        if started.elapsed() >= Duration::from_secs(60) {
+            backoff.reset();
+        }
+        if unless_shutdown(&mut stop, sleep(backoff.next_delay()))
+            .await
+            .is_none()
+        {
+            return;
+        }
+    }
+}
+
+async fn stop_requested(rx: &mut watch::Receiver<bool>) {
+    let _ = rx.wait_for(|v| *v).await;
+}
+
+async fn send_health(stdin: &mut tokio::process::ChildStdin, h: &Health) {
+    let Ok(mut line) = serde_json::to_string(h) else {
+        return;
+    };
+    line.push('\n');
+    if let Err(e) = stdin.write_all(line.as_bytes()).await {
+        debug!("cannot send a heartbeat to the Ingress proxy: {e}");
+    }
+}
+
+/// NAT-PMP failure bookkeeping, so logs stay informative but not noisy.
+#[derive(Debug, Default)]
+struct PmpHealth {
+    failures: u32,
+    ever_succeeded: bool,
+    last_hint: Option<Instant>,
+}
+
+impl PmpHealth {
+    fn success(&mut self) {
+        if self.failures > 0 && self.ever_succeeded {
+            info!("NAT-PMP port forwarding recovered");
+        }
+        self.failures = 0;
+        self.ever_succeeded = true;
+    }
+
+    fn failure(&mut self, e: &NatPmpError, fallback_port: u16) {
+        self.failures += 1;
+        let hint_due = self.last_hint.is_none_or(|t| t.elapsed() >= PMP_HINT_EVERY);
+        if e.needs_pmp_hint() && !self.ever_succeeded && hint_due {
+            warn!("NAT-PMP: {e}");
+            warn!("{}", natpmp::PMP_HINT);
+            warn!(
+                "continuing without a forwarded port (rtbit listens on {fallback_port}, \
+                 downloads work, but peers cannot connect to you); retrying in the background"
+            );
+            self.last_hint = Some(Instant::now());
+        } else if self.failures == 1 {
+            warn!("NAT-PMP renewal failed: {e}; retrying shortly");
+        } else {
+            debug!(failures = self.failures, "NAT-PMP still failing: {e}");
+        }
+    }
+}
+
+struct Session<'a, R: Runner> {
+    runner: &'a R,
+    rtbit: Rtbit,
+    respawn: Backoff,
+    respawn_at: Option<Instant>,
+    /// Port rtbit is (or should be) listening on.
+    listen_port: u16,
+    /// Last NAT-PMP port applied to firewall + rtbit (None = fallback port).
+    applied_lease: Option<u16>,
+    tunnel_healthy: bool,
+    nat_pmp: bool,
+    public_ip: Option<Ipv4Addr>,
+    download_dir: PathBuf,
+    disk_checked: Option<Instant>,
+    disk_warned: Option<Instant>,
+    /// The startup banner was logged; later port changes log it again.
+    announced: bool,
+    /// qBittorrent import, for the banner.
+    migration_status: String,
+    health: &'a watch::Sender<Health>,
+}
+
+impl<R: Runner> Session<'_, R> {
+    fn start_rtbit(&mut self) {
+        if self.rtbit.is_running() {
+            return;
+        }
+        self.check_disk(true);
+        match self.rtbit.spawn(self.listen_port) {
+            Ok(()) => self.respawn_at = None,
+            Err(e) => {
+                error!("{e:#}");
+                self.schedule_respawn();
+            }
+        }
+        self.publish();
+    }
+
+    /// Sends the current state to the Ingress proxy (`/__health`).
+    fn publish(&self) {
+        let detail = if !self.tunnel_healthy {
+            "the WireGuard tunnel has no recent handshake"
+        } else if !self.rtbit.is_running() {
+            "rtbit is not running (restarting)"
+        } else {
+            "rtbit is running behind the VPN"
+        };
+        let _ = self.health.send(Health {
+            rtbit: self.rtbit.is_running(),
+            tunnel: self.tunnel_healthy,
+            port: Some(self.listen_port),
+            detail: detail.into(),
+        });
+    }
+
+    /// Free-space guard for the download folder (a USB disk that is not
+    /// mounted makes /media fall back to Home Assistant's own disk).
+    fn check_disk(&mut self, force: bool) {
+        let now = Instant::now();
+        if !force
+            && self
+                .disk_checked
+                .is_some_and(|t| now - t < DISK_CHECK_EVERY)
+        {
+            return;
+        }
+        self.disk_checked = Some(now);
+        let low = host::available_bytes(&self.download_dir).is_ok_and(|b| b < host::LOW_DISK_BYTES);
+        if !low {
+            self.disk_warned = None;
+        } else if self.disk_warned.is_none_or(|t| now - t >= DISK_WARN_EVERY) {
+            host::warn_if_low_disk(&self.download_dir);
+            self.disk_warned = Some(now);
+        }
+    }
+
+    fn port_state(&self) -> PortState {
+        match (self.nat_pmp, self.applied_lease) {
+            (false, _) => PortState::Static(self.listen_port),
+            (true, Some(p)) => PortState::Forwarded(p),
+            (true, None) => PortState::Pending(self.listen_port),
+        }
+    }
+
+    fn log_banner(&mut self) {
+        self.announced = true;
+        info!(
+            "{}",
+            host::status_banner(
+                self.public_ip,
+                self.port_state(),
+                &self.migration_status,
+                host::cpu_cores(),
+                &host::storage_summary(&self.download_dir),
+            )
+        );
+    }
+
+    fn schedule_respawn(&mut self) {
+        let d = self.respawn.next_delay();
+        warn!("restarting rtbit in {}s", d.as_secs());
+        self.respawn_at = Some(Instant::now() + d);
+    }
+
+    /// Applies a freshly leased port: firewall first, then rtbit, and only if
+    /// the port actually changed.
+    async fn apply_lease(&mut self, lease: &natpmp::Lease) {
+        match natpmp::decide(self.applied_lease, lease.port) {
+            PortDecision::Unchanged => {
+                debug!(
+                    port = lease.port,
+                    lifetime = lease.lifetime,
+                    "NAT-PMP lease renewed"
+                );
+            }
+            PortDecision::Changed { old, new } => {
+                if let Err(e) = firewall::set_bt_ports(self.runner, &lease.firewall_ports()).await {
+                    error!("{e:#}; keeping the previous port for now");
+                    return;
+                }
+                match old {
+                    None => info!(
+                        port = new,
+                        "NAT-PMP forwarded port {new} (TCP+UDP) opened on {WG_IFACE}"
+                    ),
+                    Some(o) => {
+                        info!("NAT-PMP forwarded port changed {o} -> {new}; restarting rtbit")
+                    }
+                }
+                self.applied_lease = Some(new);
+                if self.listen_port != new {
+                    self.listen_port = new;
+                    if self.rtbit.is_running() {
+                        self.rtbit.stop(RTBIT_RESTART_GRACE).await;
+                    }
+                    self.start_rtbit();
+                }
+                if self.announced {
+                    self.log_banner();
+                }
+            }
+        }
+    }
+}
+
+async fn run_session(
+    s: &Settings,
+    runner: &impl Runner,
+    rtbit_spec: RtbitSpec,
+    migration: MigrationRun,
+    health: &watch::Sender<Health>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let mut session = Session {
+        runner,
+        rtbit: Rtbit::new(rtbit_spec),
+        respawn: Backoff::new(Duration::from_secs(2), Duration::from_secs(120)),
+        respawn_at: None,
+        listen_port: s.fallback_listen_port,
+        applied_lease: None,
+        tunnel_healthy: true,
+        nat_pmp: s.nat_pmp.is_some(),
+        public_ip: None,
+        download_dir: s.download_dir.clone(),
+        disk_checked: None,
+        disk_warned: None,
+        announced: false,
+        migration_status: migration.status,
+        health,
+    };
+    let _ = health.send(Health {
+        tunnel: true,
+        detail: "tunnel up; leasing a port and starting rtbit".into(),
+        ..Health::default()
+    });
+
+    // NAT-PMP: verify the public IP through the tunnel, then lease a port.
+    let mut forwarder = match &s.nat_pmp {
+        Some(n) => {
+            let gw = SocketAddrV4::new(n.gateway, natpmp::NATPMP_PORT);
+            let client = Client::connect(s.wireguard.address.addr(), gw)
+                .await
+                .with_context(|| format!("cannot open the NAT-PMP socket towards {gw}"))?;
+            Some(PortForwarder::new(client))
+        }
+        None => None,
+    };
+    let mut pmp = PmpHealth::default();
+    let mut pmp_retry = Backoff::new(Duration::from_secs(10), Duration::from_secs(300));
+    let mut next_pmp = Instant::now() + natpmp::RENEW_INTERVAL;
+
+    if let Some(f) = forwarder.as_mut() {
+        match f.client().external_address().await {
+            Ok(ext) => {
+                if wireguard::is_public(ext.ip.into()) {
+                    info!(
+                        "VPN exit verified: public IPv4 {} (NAT-PMP epoch {})",
+                        ext.ip, ext.epoch
+                    );
+                    session.public_ip = Some(ext.ip);
+                } else {
+                    warn!("NAT-PMP reports a non-public address {}", ext.ip);
+                }
+            }
+            Err(e) => debug!("NAT-PMP external address: {e}"),
+        }
+        match f.lease().await {
+            Ok(lease) => {
+                pmp.success();
+                session.apply_lease(&lease).await;
+            }
+            Err(e) => {
+                pmp.failure(&e, s.fallback_listen_port);
+                next_pmp = Instant::now() + pmp_retry.next_delay();
+            }
+        }
+    } else {
+        info!(
+            "NAT-PMP disabled: rtbit listens on {} (opened on {WG_IFACE} for providers with a static forwarded port)",
+            s.fallback_listen_port
+        );
+        firewall::set_bt_ports(runner, &[s.fallback_listen_port]).await?;
+    }
+    session.start_rtbit();
+    session.log_banner();
+    // qBittorrent categories/torrents go in through rtbit's own API.
+    let mut seeding = migration.job.map(|job| tokio::spawn(migration::seed(job)));
+
+    let mut health = tokio::time::interval(HEALTH_INTERVAL);
+    health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    health.tick().await; // the first tick fires immediately
+    let mut stale_since: Option<Instant> = None;
+    let mut stale_escalated = false;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.wait_for(|v| *v) => break,
+
+            res = async {
+                match seeding.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            }, if seeding.is_some() => {
+                seeding = None;
+                match res {
+                    Ok(Ok(report)) => {
+                        migration::log_report(&report);
+                        session.migration_status =
+                            format!("{}; {}", session.migration_status, report.summary());
+                    }
+                    Ok(Err(e)) => warn!("qBittorrent import: {e:#} (tried again at the next start)"),
+                    Err(e) => warn!("qBittorrent import task failed: {e}"),
+                }
+            }
+
+            status = session.rtbit.exited() => {
+                match status {
+                    Ok(st) => error!("rtbit exited unexpectedly ({st})"),
+                    Err(e) => error!("rtbit wait failed: {e}"),
+                }
+                session.publish();
+                session.schedule_respawn();
+            }
+
+            _ = sleep_until(session.respawn_at.unwrap_or_else(Instant::now)), if session.respawn_at.is_some() => {
+                if session.tunnel_healthy {
+                    session.respawn_at = None;
+                    session.start_rtbit();
+                } else {
+                    debug!("tunnel unhealthy; delaying rtbit restart");
+                    session.respawn_at = Some(Instant::now() + Duration::from_secs(10));
+                }
+            }
+
+            _ = sleep_until(next_pmp), if forwarder.is_some() => {
+                if let Some(f) = forwarder.as_mut() {
+                    match f.lease().await {
+                        Ok(lease) => {
+                            pmp.success();
+                            pmp_retry.reset();
+                            if lease.gateway_restarted {
+                                warn!("NAT-PMP gateway restarted (epoch went backwards); mappings were re-created");
+                            }
+                            if session.public_ip.is_none()
+                                && let Ok(ext) = f.client().external_address().await
+                                && wireguard::is_public(ext.ip.into())
+                            {
+                                session.public_ip = Some(ext.ip);
+                            }
+                            session.apply_lease(&lease).await;
+                            next_pmp = Instant::now() + natpmp::RENEW_INTERVAL;
+                        }
+                        Err(e) => {
+                            pmp.failure(&e, s.fallback_listen_port);
+                            next_pmp = Instant::now() + pmp_retry.next_delay();
+                        }
+                    }
+                }
+            }
+
+            _ = health.tick() => {
+                if session.rtbit.uptime().is_some_and(|u| u >= RTBIT_STABLE_AFTER) {
+                    session.respawn.reset();
+                }
+                let age = wireguard::handshake_age(runner, &s.wireguard).await;
+                let fresh = matches!(age, Ok(Some(a)) if a <= HANDSHAKE_STALE_AFTER);
+                if fresh {
+                    if !session.tunnel_healthy {
+                        info!("WireGuard tunnel healthy again");
+                    }
+                    session.tunnel_healthy = true;
+                    stale_since = None;
+                    stale_escalated = false;
+                } else {
+                    if session.tunnel_healthy {
+                        warn!(
+                            "no WireGuard handshake for over {}s ({age:?}); all torrent traffic is \
+                             blocked by the kill-switch until the tunnel recovers",
+                            HANDSHAKE_STALE_AFTER.as_secs()
+                        );
+                        stale_since = Some(Instant::now());
+                    }
+                    session.tunnel_healthy = false;
+                    if !stale_escalated && stale_since.is_some_and(|t| t.elapsed() >= STALE_ESCALATE_AFTER) {
+                        error!(
+                            "the VPN server {} has not answered for 10 minutes; restart the app \
+                             (re-resolves the endpoint) or generate a config for another Proton server",
+                            s.wireguard.endpoint
+                        );
+                        stale_escalated = true;
+                    }
+                }
+                session.check_disk(false);
+                session.publish();
+            }
+        }
+    }
+
+    if let Some(task) = seeding {
+        task.abort();
+    }
+    // Orderly shutdown: rtbit flushes its session DB, then mappings go, then wg0.
+    session.rtbit.stop(RTBIT_SHUTDOWN_GRACE).await;
+    if let Some(f) = forwarder.as_mut() {
+        f.release().await;
+    }
+    Ok(())
+}

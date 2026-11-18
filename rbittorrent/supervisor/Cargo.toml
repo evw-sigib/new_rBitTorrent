@@ -1,0 +1,80 @@
+[package]
+name = "rbittorrent-supervisor"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.88"
+description = "PID-1 supervisor for rustTorrent (rtbit) behind a fail-closed Proton VPN WireGuard tunnel with RFC 6886 NAT-PMP port forwarding"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "rbittorrent-supervisor"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.100"
+bytes = "1.12.2"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+libc = "0.2.177"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.48.0", default-features = false, features = [
+    "rt",
+    "macros",
+    "net",
+    "time",
+    "process",
+    "signal",
+    "sync",
+    "io-util",
+] }
+tracing = { version = "0.1.41", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.20", default-features = false, features = [
+    "fmt",
+    "std",
+] }
+
+# musl's allocator serialises threads on one lock; mimalloc is faster and
+# returns freed pages to the kernel promptly. `no_thp`: without it mimalloc
+# madvises its arenas for transparent huge pages, which quadrupled idle RSS
+# (7.6 MB vs 1.9 MB per process, measured). glibc dev/test builds keep the
+# system allocator.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false, features = ["no_thp"] }
+
+[dev-dependencies]
+http-body-util = { version = "0.1.5", features = ["channel"] }
+tokio = { version = "1.48.0", default-features = false, features = [
+    "rt",
+    "macros",
+    "net",
+    "time",
+    "test-util",
+] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "warn"
+dbg_macro = "deny"
+todo = "deny"
+
+[profile.release]
+# Speed over size: the supervisor is tiny either way, and opt-level 3 keeps
+# loops vectorised. (rtbit itself is upstream's opt-level 3 build; its SHA-1
+# uses ring/OpenSSL with runtime ARMv8-SHA / x86 SHA-NI detection, so no
+# target-cpu flags are needed and Pi 3/4 without crypto extensions still work.)
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+incremental = false

@@ -1,0 +1,6 @@
+# Rust build output
+target/
+rbittorrent/supervisor/target/
+# Python caches from the test helpers
+__pycache__/
+*.pyc

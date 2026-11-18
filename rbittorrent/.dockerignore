@@ -1,0 +1,6 @@
+# Only the supervisor sources are needed in the build context.
+supervisor/target
+tests
+DOCS.md
+README.md
+CHANGELOG.md

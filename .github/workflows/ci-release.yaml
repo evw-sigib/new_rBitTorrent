@@ -1,0 +1,303 @@
+name: CI / Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  APP_DIR: rbittorrent
+  CRATE_DIR: rbittorrent/supervisor
+  CARGO_TERM_COLOR: always
+  # Supervisor revision whose schemas config.yaml is validated against.
+  HA_SUPERVISOR_REF: e610ca810eab5f7444dfb7f74a3b7c869685c797
+
+jobs:
+  supervisor:
+    name: Supervisor crate (fmt, clippy, tests, cross-builds)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.CRATE_DIR }}
+      - name: cargo fmt --check
+        working-directory: ${{ env.CRATE_DIR }}
+        run: cargo fmt --all -- --check
+      - name: cargo clippy -D warnings
+        working-directory: ${{ env.CRATE_DIR }}
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: cargo test
+        working-directory: ${{ env.CRATE_DIR }}
+        run: cargo test --locked
+      - name: nftables ruleset in the real kernel (private netns)
+        working-directory: ${{ env.CRATE_DIR }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq nftables
+          BIN=$(cargo test --locked --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .executable != null) | .executable' | head -n1)
+          sudo NFT_LIVE_TEST=1 unshare -n "$BIN" nft_live --nocapture
+      # mimalloc is C, so the musl targets need a cross C compiler: zig.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install cargo-zigbuild
+        run: pip install -q cargo-zigbuild==0.24.1 ziglang==0.17.1
+      - name: Static musl cross-builds (zig cc)
+        working-directory: ${{ env.CRATE_DIR }}
+        run: |
+          echo "| target | rbittorrent-supervisor |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            cargo zigbuild --locked --release --target "$t"
+            f="target/$t/release/rbittorrent-supervisor"
+            file "$f"
+            file "$f" | grep -Eq 'statically linked|static-pie linked'
+            echo "| \`$t\` | $(stat -c %s "$f") bytes |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          target/x86_64-unknown-linux-musl/release/rbittorrent-supervisor --version
+
+  app-config:
+    name: App config vs. Supervisor schema
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: home-assistant/supervisor
+          ref: ${{ env.HA_SUPERVISOR_REF }}
+          path: .ha-supervisor
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install Supervisor requirements
+        run: pip install -q -r .ha-supervisor/requirements.txt
+      - name: Validate config.yaml, translations and security policy
+        run: PYTHONPATH=.ha-supervisor python .github/scripts/validate_app.py "$APP_DIR"
+
+  e2e:
+    name: Kernel end-to-end (WireGuard + kill-switch + NAT-PMP)
+    runs-on: ubuntu-24.04
+    needs: supervisor
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.CRATE_DIR }}
+      - name: Build supervisor
+        working-directory: ${{ env.CRATE_DIR }}
+        run: cargo build --locked --release
+      - name: Install kernel tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wireguard-tools nftables iproute2
+          sudo modprobe wireguard
+      - name: Run end-to-end test in network namespaces
+        run: sudo python3 "$APP_DIR/tests/e2e_netns.py" --supervisor "$CRATE_DIR/target/release/rbittorrent-supervisor"
+
+  image:
+    name: Image (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    needs: [supervisor, app-config, e2e]
+    # The aarch64 supervisor compiles natively under QEMU.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: aarch64
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read image name and version from config.yaml
+        id: meta
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import yaml
+          c = yaml.safe_load(open("rbittorrent/config.yaml"))
+          print("version=" + str(c["version"]))
+          print("image=" + c["image"].replace("{arch}", "${{ matrix.arch }}"))
+          EOF
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (load locally for tests)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.APP_DIR }}
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            BUILD_ARCH=${{ matrix.arch }}
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
+            BUILD_REPOSITORY=${{ github.repository }}
+          tags: local/rbittorrent:test
+          load: true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+      - name: Smoke tests
+        env:
+          IMG: local/rbittorrent:test
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          run() { docker run --rm --platform "$PLATFORM" "$@"; }
+          echo "::group::binaries"
+          run --entrypoint /usr/local/bin/rbittorrent-supervisor "$IMG" --version
+          run --entrypoint /usr/local/bin/rbittorrent-supervisor "$IMG" --help
+          # Started only by the supervisor, with a pipe on stdin: by hand it refuses.
+          set +e; run --entrypoint /usr/local/bin/rbittorrent-supervisor "$IMG" ingress-proxy; code=$?; set -e
+          test "$code" -eq 2
+          # Docker HEALTHCHECK: fails (non-zero) when nothing serves /__health.
+          if run --entrypoint /usr/local/bin/rbittorrent-supervisor "$IMG" healthcheck; then exit 1; fi
+          run --entrypoint /usr/local/bin/rtbit "$IMG" --version
+          run --entrypoint /usr/local/bin/rtbit "$IMG" --help | sed -n 1,20p
+          run --entrypoint /usr/local/bin/rtbit "$IMG" server start --help | grep -E 'disable-upnp-port-forward|disable-lsd|bind-device|ipv4-only'
+          echo "::endgroup::"
+          echo "::group::tools"
+          run --entrypoint ip "$IMG" -V | grep iproute2
+          run --entrypoint wg "$IMG" --version
+          run --entrypoint nft "$IMG" --version
+          echo "::endgroup::"
+          echo "::group::forbidden components absent"
+          run --entrypoint /bin/sh "$IMG" -c '
+            set -e
+            for f in /usr/bin/wg-quick /bin/bash /usr/bin/bash /init /etc/s6-overlay /usr/sbin/openvpn; do
+              if [ -e "$f" ]; then echo "found forbidden $f"; exit 1; fi
+            done
+            echo "no wg-quick, bash, s6-overlay or openvpn"'
+          echo "::endgroup::"
+          echo "::group::static linking (ldd)"
+          run --entrypoint /usr/bin/ldd "$IMG" /usr/local/bin/rbittorrent-supervisor 2>&1 || true
+          run --entrypoint /usr/bin/ldd "$IMG" /usr/local/bin/rtbit 2>&1 || true
+          cid=$(docker create --platform "$PLATFORM" "$IMG")
+          docker cp "$cid:/usr/local/bin/rbittorrent-supervisor" ./rbittorrent-supervisor
+          docker cp "$cid:/usr/local/bin/rtbit" ./rtbit
+          docker rm "$cid" >/dev/null
+          for f in rbittorrent-supervisor rtbit; do
+            file "$f"
+            file "$f" | grep -Eq 'statically linked|static-pie linked'
+          done
+          echo "::endgroup::"
+          echo "::group::fail-fast on bad configuration"
+          echo '{}' > options.json
+          set +e
+          out=$(run -v "$PWD/options.json:/data/options.json:ro" "$IMG" 2>&1); code=$?
+          set -e
+          echo "$out"
+          test "$code" -eq 1
+          grep -qi 'wireguard' <<<"$out"
+          if grep -qi 'panicked' <<<"$out"; then exit 1; fi
+          echo "::endgroup::"
+          size=$(docker image inspect -f '{{.Size}}' "$IMG")
+          {
+            echo "### ${{ matrix.arch }}"
+            echo "| item | size |"
+            echo "|---|---|"
+            echo "| image (uncompressed) | $((size / 1024 / 1024)) MiB |"
+            echo "| rbittorrent-supervisor | $(stat -c %s rbittorrent-supervisor) bytes |"
+            echo "| rtbit | $(stat -c %s rtbit) bytes |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: rtbit memory benchmark (native amd64 only)
+        if: matrix.arch == 'amd64'
+        env:
+          IMG: local/rbittorrent:test
+        run: |
+          set -euo pipefail
+          docker run -d --name bench --entrypoint /usr/local/bin/rtbit \
+            -e XDG_DATA_HOME=/config/db -e XDG_CACHE_HOME=/config/cache -e XDG_CONFIG_HOME=/config/db \
+            -e RTBIT_HTTP_API_LISTEN_ADDR=0.0.0.0:8080 -e RTBIT_UPNP_PORT_FORWARD_DISABLE=true \
+            -e RTBIT_LSD_DISABLE=true -e RTBIT_IPV4_ONLY=true -e RTBIT_FASTRESUME=true \
+            -e RTBIT_DOWNLOAD_FOLDER=/tmp -p 127.0.0.1:8080:8080 \
+            "$IMG" server start /tmp
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break; sleep 1; done
+          sleep 20
+          rss() { docker exec bench grep -E 'VmRSS' /proc/1/status | awk '{print $2}'; }
+          idle=$(rss)
+          tok=$(docker exec bench sh -c 'cat /config/db/*/setup-token')
+          curl -fsS -o /dev/null -X POST -H 'Content-Type: application/json' \
+            -d "{\"setup_token\":\"$tok\",\"username\":\"bench\",\"password\":\"bench-password-123\"}" \
+            http://127.0.0.1:8080/auth/setup
+          for i in 1 2 3; do
+            curl -fsS -o /dev/null -d 'username=bench&password=bench-password-123' http://127.0.0.1:8080/api/v2/auth/login
+          done
+          sleep 5
+          after=$(rss)
+          docker exec bench cat /proc/1/status | grep -E 'VmRSS|VmHWM|RssAnon|RssFile|Threads'
+          docker rm -f bench >/dev/null
+          {
+            echo "| rtbit idle RSS (musl, amd64 runner) | ${idle} KiB |"
+            echo "| rtbit RSS after setup + 3 logins | ${after} KiB |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.APP_DIR }}
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            BUILD_ARCH=${{ matrix.arch }}
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
+            BUILD_REPOSITORY=${{ github.repository }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:latest
+          push: true
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.arch }}
+
+  manifest:
+    name: Multi-arch manifest
+    runs-on: ubuntu-24.04
+    needs: image
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create ghcr.io/<owner>/rbittorrent (amd64 + arm64)
+        run: |
+          set -euo pipefail
+          read -r version template < <(python3 -c '
+          import yaml
+          c = yaml.safe_load(open("rbittorrent/config.yaml"))
+          print(c["version"], c["image"])')
+          multi="${template/\{arch\}-/}"
+          for tag in "$version" latest; do
+            docker buildx imagetools create -t "$multi:$tag" \
+              "${template/\{arch\}/amd64}:$version" \
+              "${template/\{arch\}/aarch64}:$version"
+          done
+          docker buildx imagetools inspect "$multi:$version"

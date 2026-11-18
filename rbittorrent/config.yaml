@@ -1,0 +1,115 @@
+---
+name: rBittorrent
+version: "1.0.0"
+slug: rbittorrent
+description: >-
+  Drop-in qBittorrent replacement: the rustTorrent (rtbit) engine behind a
+  fail-closed Proton VPN WireGuard kill-switch with NAT-PMP port forwarding.
+url: https://github.com/evw-sigib/new_rbittorrent
+arch:
+  - aarch64
+  - amd64
+image: ghcr.io/evw-sigib/{arch}-rbittorrent
+startup: application
+boot: auto
+# The Rust supervisor is PID 1 and reaps zombies itself; no tini/s6.
+init: false
+# rtbit needs up to 12 s to flush its fast-resume database on stop.
+timeout: 30
+stage: experimental
+
+# Kernel WireGuard + nftables need NET_ADMIN only. No SYS_ADMIN, no
+# SYS_MODULE, no full_access, no host_network.
+privileged:
+  - NET_ADMIN
+devices:
+  - /dev/net/tun
+
+# Default role only (no hassio_role): used to warn about a qBittorrent app
+# that is still running and to offer the qBittorrent integration through
+# discovery. The token never reaches rtbit.
+hassio_api: true
+discovery:
+  - qbittorrent
+
+# Sidebar access through the built-in Ingress proxy (rbittorrent-supervisor,
+# port 8099): accepts only Home Assistant's Supervisor, signs in
+# automatically and keeps the web UI inside /api/hassio_ingress/<token>/.
+# Streaming keeps large .torrent uploads out of the Supervisor's memory.
+ingress: true
+ingress_port: 8099
+ingress_entry: web/
+ingress_stream: true
+panel_icon: mdi:download-network
+panel_title: rBittorrent
+
+# qBittorrent's default port, so Sonarr/Radarr/Prowlarr, qBitController and
+# Home Assistant's qBittorrent integration keep working unchanged
+# (password-protected, LAN only). Set the host port to empty to disable it.
+ports:
+  8080/tcp: 8080
+ports_description:
+  8080/tcp: Web UI + qBittorrent API (qBittorrent's port; LAN only, password-protected)
+webui: http://[HOST]:[PORT:8080]/web/
+# 200 only while rtbit runs and the WireGuard handshake is fresh, so the
+# Watchdog toggle restarts the app (and re-resolves the VPN server) when the
+# tunnel stalls.
+watchdog: http://[HOST]:[PORT:8099]/__health
+
+map:
+  - type: app_config
+    path: /config
+    read_only: false
+  - type: media
+    read_only: false
+  - type: share
+    read_only: false
+  # Read-only: finds an old qBittorrent app's settings, categories, torrents
+  # and WireGuard file (mounted at /app_configs).
+  - type: all_app_configs
+    read_only: true
+
+# rtbit's DHT/peer caches are rebuilt automatically; keep backups small.
+backup_exclude:
+  - "**/cache/*"
+  - "cache/*"
+
+options:
+  wireguard_conf: ""
+  webui_username: admin
+  import_from_qbittorrent: true
+  import_active_torrents: false
+  enable_dht: true
+  enable_nat_pmp: true
+  nat_pmp_gateway: 10.2.0.1
+  listen_port: 4240
+  download_dir: /media/rbittorrent/downloads
+  completed_dir: /media/rbittorrent/completed
+  local_allow_cidrs:
+    - 172.30.32.0/23
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 10.0.0.0/8
+  log_level: info
+
+schema:
+  wireguard_conf: str?
+  wg_private_key: password?
+  wg_public_key: str?
+  wg_preshared_key: password?
+  wg_endpoint: str?
+  wg_address: str?
+  wg_dns: str?
+  webui_username: str
+  webui_password: password?
+  import_from_qbittorrent: bool
+  import_active_torrents: bool
+  enable_dht: bool
+  enable_nat_pmp: bool
+  nat_pmp_gateway: str
+  listen_port: port
+  download_dir: str
+  completed_dir: str
+  local_allow_cidrs:
+    - str
+  log_level: list(trace|debug|info|warn|error)
