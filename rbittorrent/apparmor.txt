@@ -119,6 +119,8 @@ profile rbittorrent flags=(attach_disconnected,mediate_deleted) {
     /usr/share/zoneinfo/** r,
     owner @{PROC}/@{pid}/** r,
     @{PROC}/sys/vm/overcommit_memory r,
+    # The allocator checks whether transparent huge pages are on.
+    /sys/kernel/mm/transparent_hugepage/enabled r,
     /dev/null rw,
     /dev/urandom r,
   }
