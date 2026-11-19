@@ -10,7 +10,7 @@ ARG ALPINE_VERSION=3.24
 ARG RUST_VERSION=1.99
 
 # ---------------------------------------------------------------------------
-# rtbit, compiled from the pinned upstream release with exactly one change:
+# rtbit, compiled from the pinned upstream release with one runtime change:
 # mimalloc as #[global_allocator] (rtbit/mimalloc.patch). musl's own
 # allocator serialises every thread on one lock and holds on to freed
 # memory; mimalloc has per-thread heaps and returns pages to the kernel, so
@@ -30,16 +30,20 @@ RUN apk add --no-cache clang lld git npm pkgconf musl-dev openssl-dev openssl-li
 WORKDIR /src
 RUN git clone --depth 1 --branch "${RTBIT_TAG}" "${RTBIT_REPO}" . \
  && test "$(git rev-parse HEAD)" = "${RTBIT_COMMIT}"
-COPY rtbit/mimalloc.patch /tmp/mimalloc.patch
-RUN git apply --verbose /tmp/mimalloc.patch \
- && grep -q 'static GLOBAL: mimalloc::MiMalloc' crates/rtbit/src/main.rs
+# swagger-vendored.patch is build-only: Swagger UI (rtbit's /swagger page)
+# comes from a checksum-pinned crate instead of a curl download from
+# github.com inside build.rs.
+COPY rtbit/mimalloc.patch rtbit/swagger-vendored.patch /tmp/
+RUN git apply --verbose /tmp/mimalloc.patch /tmp/swagger-vendored.patch \
+ && grep -q 'static GLOBAL: mimalloc::MiMalloc' crates/rtbit/src/main.rs \
+ && grep -q '"vendored"' crates/librtbit/Cargo.toml
 ENV OPENSSL_STATIC=1 \
     CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
     CARGO_PROFILE_RELEASE_OPT_LEVEL=3 \
     CARGO_PROFILE_RELEASE_LTO=thin \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
     CARGO_PROFILE_RELEASE_STRIP=symbols
-# --locked: the dependency versions are upstream's Cargo.lock plus mimalloc.
+# --locked: upstream's Cargo.lock plus mimalloc and utoipa-swagger-ui-vendored.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,id=rtbit-${TARGETARCH},sharing=locked \
     cargo build --release --locked -p rtbit \

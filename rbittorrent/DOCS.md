@@ -487,12 +487,15 @@ To check it yourself:
   and the **mimalloc** allocator. mimalloc's transparent-huge-page hint is
   off, because it quadrupled idle memory.
 - **rtbit is compiled from source** in the image build: the pinned upstream
-  release `v0.2.0-beta.4`, commit-checked, with one change, **mimalloc** as
-  its global allocator (`rtbit/mimalloc.patch`). musl's own allocator makes
-  all threads wait on one lock and keeps freed memory. mimalloc uses
-  per-thread heaps and returns memory to the kernel, so rtbit scales over
-  all cores and shrinks again after a burst, which matters on a 4 GB Pi.
-  It is built with `opt-level = 3`, thin LTO and one codegen unit.
+  release `v0.2.0-beta.4`, commit-checked, with one runtime change,
+  **mimalloc** as its global allocator (`rtbit/mimalloc.patch`). musl's own
+  allocator makes all threads wait on one lock and keeps freed memory.
+  mimalloc uses per-thread heaps and returns memory to the kernel, so rtbit
+  scales over all cores and shrinks again after a burst, which matters on a
+  4 GB Pi. It is built with `opt-level = 3`, thin LTO and one codegen unit.
+  A second, build-only patch (`rtbit/swagger-vendored.patch`) takes the
+  Swagger UI page from a checksum-pinned crate, so the build downloads
+  nothing that `Cargo.lock` does not pin.
 - Its SHA-1 piece hashing picks ARMv8 or SHA-NI instructions at runtime. No
   `target-cpu` flags are set, so it also runs on a Raspberry Pi 3 or 4.
 - The [speed test](#speed-test) costs nothing while idle: its threads and
@@ -554,5 +557,6 @@ contains keys or passwords.
 
 The BitTorrent engine is
 [rustTorrent](https://github.com/thedancingdeveloper-org/rusttorrent)
-(`rtbit`), built from its release source with one change: the mimalloc
-allocator.
+(`rtbit`), built from its release source with one runtime change: the
+mimalloc allocator. Its Swagger UI comes from the checksum-pinned
+`utoipa-swagger-ui-vendored` crate instead of a download at build time.

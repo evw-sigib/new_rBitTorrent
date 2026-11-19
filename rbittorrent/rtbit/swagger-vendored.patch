@@ -1,0 +1,37 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 3d27fa3..9adae86 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -9690,9 +9690,16 @@ dependencies = [
+  "serde_json",
+  "url",
+  "utoipa",
++ "utoipa-swagger-ui-vendored",
+  "zip 9.1.3",
+ ]
+ 
++[[package]]
++name = "utoipa-swagger-ui-vendored"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "552a64d6a0d251ae28bc021838800943cce60c9ec2e60ff331f54e79f696268f"
++
+ [[package]]
+ name = "uuid"
+ version = "1.28.0"
+diff --git a/crates/librtbit/Cargo.toml b/crates/librtbit/Cargo.toml
+index ab59755..36bf6f2 100644
+--- a/crates/librtbit/Cargo.toml
++++ b/crates/librtbit/Cargo.toml
+@@ -136,7 +136,10 @@ nix = { version = "0.31", features = ["uio", "fs"] }
+ thiserror = "2"
+ utoipa = { version = "6", optional = true }
+ utoipa-axum = { version = "0.3", optional = true }
+-utoipa-swagger-ui = { version = "10", features = ["axum"], optional = true }
++# rBittorrent: `vendored` takes Swagger UI from the utoipa-swagger-ui-vendored
++# crate (checksum-pinned in Cargo.lock) instead of downloading a zip from
++# github.com with curl during the build.
++utoipa-swagger-ui = { version = "10", features = ["axum", "vendored"], optional = true }
+ 
+ [target.'cfg(windows)'.dependencies]
+ windows = { version = "0.62", features = ["Win32", "Win32_System", "Win32_System_IO", "Win32_System_Ioctl"] }
