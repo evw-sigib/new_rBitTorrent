@@ -87,6 +87,10 @@ jobs:
         run: pip install -q -r .ha-supervisor/requirements.txt
       - name: Validate config.yaml, translations and security policy
         run: PYTHONPATH=.ha-supervisor python .github/scripts/validate_app.py "$APP_DIR"
+      - name: Lint the test and CI Python scripts (pyflakes)
+        run: |
+          pip install -q pyflakes
+          python -m pyflakes .github/scripts "$APP_DIR/tests"
 
   e2e:
     name: Kernel end-to-end (WireGuard + kill-switch + NAT-PMP)

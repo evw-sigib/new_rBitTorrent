@@ -144,7 +144,8 @@ def http_get(ns, src, ip, port, path, timeout=5):
     r = sh(sys.executable, "-c", code, ns=ns, check=False, timeout=timeout + 5)
     if r.returncode != 0:
         return None, (r.stderr.strip().splitlines() or ["?"])[-1]
-    head, _, body = r.stdout.partition("\r\n\r\n")
+    # sh() captures in text mode, which already turned CRLF into LF.
+    head, _, body = r.stdout.replace("\r\n", "\n").partition("\n\n")
     try:
         return int(head.split()[1]), body
     except (IndexError, ValueError):
@@ -457,7 +458,7 @@ Endpoint = {ENDPOINT_IP}:51820
         env=env, stdout=log, stderr=subprocess.STDOUT,
     )
     try:
-        checks(sup, cli_priv)
+        checks(sup, cli_priv, supervisor)
     finally:
         if sup.poll() is None:
             sup.kill()
@@ -469,7 +470,7 @@ Endpoint = {ENDPOINT_IP}:51820
         print("----- end of log -----")
 
 
-def checks(sup, cli_priv):
+def checks(sup, cli_priv, supervisor):
     wait_for(lambda: starts(), 90, "rtbit (fake) to start")
     wait_for(lambda: f"forwarded port {PORT_A}" in log_text(), 30, "NAT-PMP lease")
     first = starts()[0]
