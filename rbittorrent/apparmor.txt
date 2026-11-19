@@ -40,9 +40,12 @@ profile rbittorrent flags=(attach_disconnected,mediate_deleted) {
   deny /sys/firmware/** rwklx,
   deny /sys/kernel/security/** rwklx,
 
-  # Children start in their own profiles.
-  /usr/local/bin/rtbit cx -> rtbit,
-  /usr/local/bin/rbittorrent-supervisor cx -> ingress,
+  # Children start in their own profiles, stacked on this one (`&`): both
+  # run with no_new_privs, and AppArmor then only allows a transition that
+  # keeps the current profile. The child gets what both profiles allow,
+  # which is what the child profile allows.
+  /usr/local/bin/rtbit cx -> &rtbit,
+  /usr/local/bin/rbittorrent-supervisor cx -> &ingress,
 
   profile rtbit flags=(attach_disconnected,mediate_deleted) {
     #include <abstractions/base>

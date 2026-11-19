@@ -410,11 +410,15 @@ jobs:
           grep -q 'AppArmor profile `local_rbittorrent` confines the app' <<<"$logs"
           grep -q 'rtbit filesystem sandbox active (AppArmor `local_rbittorrent//rtbit`)' <<<"$logs"
           grep -q 'Ingress proxy filesystem sandbox active (AppArmor `local_rbittorrent//ingress`)' <<<"$logs"
-          grep -q 'AppArmor `local_rbittorrent//rtbit (enforce)`' <<<"$logs"
-          grep -q 'AppArmor `local_rbittorrent//ingress (enforce)`' <<<"$logs"
+          # Stacked on the app's profile: the only transition AppArmor allows
+          # under no_new_privs.
+          stacked() { echo "(local_rbittorrent//&local_rbittorrent//$1|local_rbittorrent//$1//&local_rbittorrent) \(enforce\)"; }
+          grep -Eq "AppArmor \`$(stacked rtbit)\`" <<<"$logs"
+          grep -Eq "AppArmor \`$(stacked ingress)\`" <<<"$logs"
           grep -q 'auth: enabled (user "admin")' <<<"$logs"
           label=$(docker exec aa /bin/sh -c 'cat /proc/$(pidof rtbit)/attr/current')
-          test "$label" = "local_rbittorrent//rtbit (enforce)"
+          echo "rtbit's label: $label"
+          grep -Eqx "$(stacked rtbit)" <<<"$label"
           docker exec aa /bin/sh -c 'wget -qO- http://127.0.0.1:8099/__health' | tee health.json
           grep -q '"fs_sandbox":true' health.json
           if docker exec aa cat /proc/1/environ >/dev/null 2>&1; then

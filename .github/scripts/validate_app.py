@@ -47,8 +47,13 @@ def check_apparmor(profile: Path, slug: str) -> list:
     print(f"apparmor.txt: profile {get_profile_name(profile)!r}")
     text = profile.read_text()
     for child in ("rtbit", "ingress"):
-        if f"profile {child} " not in text or f"cx -> {child}," not in text:
-            errors.append(f"apparmor.txt has no child profile `{child}` with a cx transition")
+        # Stacked (`&`): the children run with no_new_privs, and AppArmor
+        # refuses any other transition then.
+        if f"profile {child} " not in text or f"cx -> &{child}," not in text:
+            errors.append(
+                f"apparmor.txt has no child profile `{child}` with a stacked cx transition "
+                f"(`cx -> &{child},`)"
+            )
     with tempfile.TemporaryDirectory() as tmp:
         adjusted = Path(tmp) / "profile"
         adjust_profile(slug, profile, adjusted)

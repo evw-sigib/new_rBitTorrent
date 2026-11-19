@@ -3,10 +3,10 @@
 //! HAOS kernels enable AppArmor only (`CONFIG_LSM="apparmor"`, no Landlock),
 //! and the Supervisor loads the app's `apparmor.txt` under the app's slug.
 //! That profile switches rtbit and the Ingress proxy to the child profiles
-//! `<slug>//rtbit` and `<slug>//ingress` when they are executed. This module
-//! reads the labels from `/proc` so the supervisor can tell whether its own
-//! profile is the app's, and prove that a child really runs in its child
-//! profile before trusting it.
+//! `<slug>//rtbit` and `<slug>//ingress`, stacked on the app's profile, when
+//! they are executed. This module reads the labels from `/proc` so the
+//! supervisor can tell whether its own profile is the app's, and prove that
+//! a child really runs in its child profile before trusting it.
 
 use std::path::Path;
 
@@ -98,14 +98,16 @@ pub fn app_profile(label: &Label) -> Result<String, String> {
     Ok(label.name.clone())
 }
 
-/// Whether `label` is `<profile>//<child>`, enforced.
+/// Whether `label` confines a task to `<profile>//<child>`, enforced: the
+/// child profile stacked on the app's profile (`<profile>//&<profile>//<child>`,
+/// the only transition AppArmor allows under `no_new_privs`), or the child
+/// profile alone.
 pub fn is_child(label: &Label, profile: &str, child: &str) -> bool {
+    let want = format!("{profile}//{child}");
+    let parts: Vec<&str> = label.name.split("//&").collect();
     label.enforced()
-        && label
-            .name
-            .strip_prefix(profile)
-            .and_then(|rest| rest.strip_prefix("//"))
-            == Some(child)
+        && parts.contains(&want.as_str())
+        && parts.iter().all(|p| *p == want || *p == profile)
 }
 
 #[cfg(test)]
@@ -146,6 +148,37 @@ mod tests {
         let p = "local_rbittorrent";
         assert!(is_child(
             &l("local_rbittorrent//rtbit (enforce)"),
+            p,
+            RTBIT_CHILD
+        ));
+        // Stacked on the app's profile, in either order.
+        assert!(is_child(
+            &l("local_rbittorrent//&local_rbittorrent//rtbit (enforce)\n"),
+            p,
+            RTBIT_CHILD
+        ));
+        assert!(is_child(
+            &l("local_rbittorrent//rtbit//&local_rbittorrent (enforce)"),
+            p,
+            RTBIT_CHILD
+        ));
+        assert!(!is_child(
+            &l("local_rbittorrent//&local_rbittorrent//rtbit (mixed)"),
+            p,
+            RTBIT_CHILD
+        ));
+        assert!(!is_child(
+            &l("local_rbittorrent//&unconfined (enforce)"),
+            p,
+            RTBIT_CHILD
+        ));
+        assert!(!is_child(
+            &l("local_rbittorrent//rtbit//&docker-default (enforce)"),
+            p,
+            RTBIT_CHILD
+        ));
+        assert!(!is_child(
+            &l("local_rbittorrent//&local_rbittorrent//ingress (enforce)"),
             p,
             RTBIT_CHILD
         ));
