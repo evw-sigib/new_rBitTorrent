@@ -21,7 +21,8 @@
 |---|---|
 | `rbittorrent/config.yaml` | App manifest (NET_ADMIN only, Ingress, port 8080, watchdog) |
 | `rbittorrent/Dockerfile` | Multi-stage build: static musl supervisor + rtbit compiled from the pinned upstream release |
-| `rbittorrent/rtbit/mimalloc.patch` | The one runtime change to rtbit: mimalloc as its global allocator |
+| `rbittorrent/rtbit/mimalloc.patch` | mimalloc as rtbit's global allocator |
+| `rbittorrent/rtbit/auth-banner.patch` | rtbit's startup log reports the stored Web UI login as `auth: enabled` |
 | `rbittorrent/rtbit/swagger-vendored.patch` | Build-only: Swagger UI from a checksum-pinned crate, no download from github.com |
 | `rbittorrent/supervisor/` | `rbittorrent-supervisor`, the Rust PID 1 (config, firewall, WireGuard, NAT-PMP, migration, process, Ingress, benchmark) |
 | `rbittorrent/tests/` | Kernel end-to-end leak test (network namespaces + real WireGuard) |
@@ -41,8 +42,9 @@ sudo python3 ../tests/e2e_netns.py --supervisor target/release/rbittorrent-super
 ## Credits
 
 [rustTorrent](https://github.com/thedancingdeveloper-org/rusttorrent) (`rtbit`)
-is the BitTorrent engine, built from its release source with one runtime
-change: the mimalloc allocator (`rbittorrent/rtbit/mimalloc.patch`).
+is the BitTorrent engine, built from its release source with three small
+patches in `rbittorrent/rtbit/`: the mimalloc allocator, a startup-log fix
+and a build-only Swagger UI change.
 
 [repo-badge]: https://img.shields.io/badge/Add%20repository-Home%20Assistant-41BDF5?logo=home-assistant
 [repo-add]: https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fevw-sigib%2Fnew_rbittorrent

@@ -182,7 +182,10 @@ jobs:
             grep -q -- "--$flag" <<<"$help" || { echo "rtbit --help lacks --$flag"; exit 1; }
           done
           # rtbit is our own build: mimalloc is linked in as the allocator.
-          run --entrypoint /bin/sh "$IMG" -c 'grep -c mimalloc /usr/local/bin/rtbit' | grep -qv '^0$'
+          # (No `producer | grep -q` anywhere: with pipefail, grep -q exiting
+          # early kills the producer with SIGPIPE and fails the step.)
+          count=$(run --entrypoint /bin/sh "$IMG" -c 'grep -c mimalloc /usr/local/bin/rtbit || true')
+          test "$count" -gt 0
           echo "::endgroup::"
           echo "::group::tools"
           run --entrypoint ip "$IMG" -V | grep iproute2
@@ -229,16 +232,24 @@ jobs:
             if docker exec direct /usr/local/bin/rbittorrent-supervisor healthcheck; then ok=1; break; fi
             sleep 1
           done
-          docker logs direct 2>&1 | tail -n 60
+          logs=$(docker logs direct 2>&1)
+          tail -n 60 <<<"$logs"
           test "$ok" -eq 1
-          docker logs direct 2>&1 | grep -q 'VPN OFF'
+          grep -q 'VPN OFF' <<<"$logs"
+          # The supervisor stores the Web UI account before rtbit's first
+          # start: the API on 8080 is never open, even on a fresh install.
+          grep -q 'auth: enabled (user "admin")' <<<"$logs"
+          if docker exec direct wget -qO /dev/null http://127.0.0.1:8080/api/v2/torrents/info; then
+            echo "rtbit's API answered without a login"; exit 1
+          fi
           # The status bar data: vpn=false, the listen port, no tunnel.
           docker exec direct /bin/sh -c 'wget -qO- http://127.0.0.1:8099/__health' | tee health.json
           grep -q '"vpn":false' health.json
           grep -q '"port":4240' health.json
           docker stop -t 30 direct
           test "$(docker inspect -f '{{.State.ExitCode}}' direct)" -eq 0
-          docker logs direct 2>&1 | grep -q 'shutdown complete'
+          logs=$(docker logs direct 2>&1)
+          grep -q 'shutdown complete' <<<"$logs"
           docker rm direct >/dev/null
           echo "::endgroup::"
           size=$(docker image inspect -f '{{.Size}}' "$IMG")

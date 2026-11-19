@@ -10,8 +10,8 @@ ARG ALPINE_VERSION=3.24
 ARG RUST_VERSION=1.99
 
 # ---------------------------------------------------------------------------
-# rtbit, compiled from the pinned upstream release with one runtime change:
-# mimalloc as #[global_allocator] (rtbit/mimalloc.patch). musl's own
+# rtbit, compiled from the pinned upstream release. The one change to how it
+# runs: mimalloc as #[global_allocator] (rtbit/mimalloc.patch). musl's own
 # allocator serialises every thread on one lock and holds on to freed
 # memory; mimalloc has per-thread heaps and returns pages to the kernel, so
 # rtbit's multi-threaded runtime scales over all cores and its RSS drops
@@ -30,12 +30,15 @@ RUN apk add --no-cache clang lld git npm pkgconf musl-dev openssl-dev openssl-li
 WORKDIR /src
 RUN git clone --depth 1 --branch "${RTBIT_TAG}" "${RTBIT_REPO}" . \
  && test "$(git rev-parse HEAD)" = "${RTBIT_COMMIT}"
+# auth-banner.patch: the startup log says "auth: enabled" when the login
+# the supervisor stored protects the API (upstream printed "not set up").
 # swagger-vendored.patch is build-only: Swagger UI (rtbit's /swagger page)
 # comes from a checksum-pinned crate instead of a curl download from
 # github.com inside build.rs.
-COPY rtbit/mimalloc.patch rtbit/swagger-vendored.patch /tmp/
-RUN git apply --verbose /tmp/mimalloc.patch /tmp/swagger-vendored.patch \
+COPY rtbit/mimalloc.patch rtbit/auth-banner.patch rtbit/swagger-vendored.patch /tmp/
+RUN git apply --verbose /tmp/mimalloc.patch /tmp/auth-banner.patch /tmp/swagger-vendored.patch \
  && grep -q 'static GLOBAL: mimalloc::MiMalloc' crates/rtbit/src/main.rs \
+ && grep -q 'store.username()' crates/rtbit/src/main.rs \
  && grep -q '"vendored"' crates/librtbit/Cargo.toml
 ENV OPENSSL_STATIC=1 \
     CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
