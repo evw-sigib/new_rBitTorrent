@@ -54,7 +54,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::benchmark::{self, HardwareResult, PeeringTarget, SpeedTarget};
@@ -67,8 +67,22 @@ pub const SUPERVISOR_IP: Ipv4Addr = Ipv4Addr::new(172, 30, 32, 2);
 pub const INGRESS_PATH_PREFIX: &str = "/api/hassio_ingress/";
 
 const MAX_CONNECTIONS: usize = 128;
+/// Connections from health-only peers (the Docker HEALTHCHECK) have their
+/// own small pool, so Ingress traffic can never starve the watchdog.
+const MAX_HEALTH_ONLY_CONNECTIONS: usize = 8;
+/// Also the idle keep-alive limit: hyper starts this timer whenever the
+/// connection waits for the next request head.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Handshake plus response headers from rtbit (a streamed body may then
+/// take as long as it needs).
+const UPSTREAM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A whole sign-in or token refresh, body included.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound on a token lifetime rtbit announces.
+const MAX_TOKEN_LIFETIME: Duration = Duration::from_secs(24 * 3600);
+/// `POST /__benchmark` takes no input; anything bigger is refused.
+const MAX_BENCHMARK_BODY: usize = 16 << 10;
 /// Upper bound for an HTML page that gets the base/shim injected.
 const MAX_REWRITE_BYTES: usize = 4 << 20;
 /// Upper bound for rtbit's login responses.
@@ -112,8 +126,13 @@ pub type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 pub struct ProxyConfig {
     pub listen: SocketAddr,
     pub upstream: SocketAddr,
-    /// Peers that may connect, as CIDRs (`172.30.32.2/32`, `127.0.0.1/32`).
+    /// Peers that may use the proxy, as CIDRs (`172.30.32.2/32`).
     pub allowed_peers: Vec<String>,
+    /// Peers that may only read `/__health` (`127.0.0.1/32` for the Docker
+    /// HEALTHCHECK): rtbit shares the network namespace, so loopback must
+    /// never reach the signed-in proxy or the speed test.
+    #[serde(default)]
+    pub health_only_peers: Vec<String>,
     pub username: String,
     pub password: String,
     #[serde(default)]
@@ -132,6 +151,7 @@ impl fmt::Debug for ProxyConfig {
             .field("listen", &self.listen)
             .field("upstream", &self.upstream)
             .field("allowed_peers", &self.allowed_peers)
+            .field("health_only_peers", &self.health_only_peers)
             .field("username", &self.username)
             .field("password", &"<redacted>")
             .finish()
@@ -158,6 +178,10 @@ pub struct Health {
     /// The VPN exit address NAT-PMP reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_ip: Option<Ipv4Addr>,
+    /// Counts rtbit starts. A new value means rtbit restarted and every
+    /// session the proxy holds is gone.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// A request from the proxy to the supervisor (one JSON line on stdout).
@@ -269,9 +293,14 @@ async fn run(cfg: ProxyConfig, mut status: impl tokio::io::AsyncBufRead + Unpin)
         .await
         .with_context(|| format!("cannot listen on {}", cfg.listen))?;
     info!(
-        "Ingress proxy listening on {} (accepting {}), forwarding to rtbit on {}",
+        "Ingress proxy listening on {} (accepting {}; /__health only: {}), forwarding to rtbit on {}",
         cfg.listen,
         cfg.allowed_peers.join(", "),
+        if cfg.health_only_peers.is_empty() {
+            "none".to_owned()
+        } else {
+            cfg.health_only_peers.join(", ")
+        },
         cfg.upstream
     );
     let heartbeats = async {
@@ -324,6 +353,8 @@ fn stdout_pipe() -> std::io::Result<tokio::net::unix::pipe::Sender> {
 
 #[derive(Default)]
 struct BearerState {
+    /// The rtbit start the tokens belong to ([`Health::generation`]).
+    generation: u64,
     access: Option<String>,
     refresh: Option<String>,
     expires: Option<Instant>,
@@ -334,6 +365,7 @@ struct BearerState {
 
 #[derive(Default)]
 struct SidState {
+    generation: u64,
     sid: Option<String>,
     obtained: Option<Instant>,
     retry_after: Option<Instant>,
@@ -379,6 +411,7 @@ pub struct Proxy {
     upstream: SocketAddr,
     upstream_host: HeaderValue,
     allowed: Vec<Ipv4Cidr>,
+    health_only: Vec<Ipv4Cidr>,
     username: String,
     password: String,
     bearer: Mutex<BearerState>,
@@ -386,6 +419,7 @@ pub struct Proxy {
     rejected: AtomicU64,
     last_reject_log: std::sync::Mutex<Option<Instant>>,
     health: std::sync::Mutex<Option<(Health, Instant)>>,
+    rtbit_generation: AtomicU64,
     speed_target: SpeedTarget,
     peering: Vec<PeeringTarget>,
     supervisor_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>,
@@ -394,12 +428,22 @@ pub struct Proxy {
     benchmark_done: std::sync::Mutex<Option<Instant>>,
 }
 
-/// Clears the "speed test running" flag however the test ends.
-struct BusyGuard<'a>(&'a AtomicBool);
+/// What a peer may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Full,
+    HealthOnly,
+    Denied,
+}
 
-impl Drop for BusyGuard<'_> {
+/// Clears the "speed test running" flag however the test ends. It lives in
+/// the spawned test task, so a client that disconnects mid-test cannot
+/// release the lock (or skip the cooldown) while the test still runs.
+struct BusyGuard(Arc<Proxy>);
+
+impl Drop for BusyGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.0.benchmark_busy.store(false, Ordering::Release);
     }
 }
 
@@ -422,20 +466,23 @@ impl Proxy {
         if cfg.allowed_peers.is_empty() {
             bail!("the Ingress proxy needs at least one allowed peer");
         }
-        let allowed = cfg
-            .allowed_peers
-            .iter()
-            .map(|p| {
-                p.parse::<Ipv4Cidr>()
-                    .map_err(|e| anyhow::anyhow!("invalid allowed peer `{p}`: {e}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let parse = |list: &[String]| {
+            list.iter()
+                .map(|p| {
+                    p.parse::<Ipv4Cidr>()
+                        .map_err(|e| anyhow::anyhow!("invalid allowed peer `{p}`: {e}"))
+                })
+                .collect::<Result<Vec<_>>>()
+        };
+        let allowed = parse(&cfg.allowed_peers)?;
+        let health_only = parse(&cfg.health_only_peers)?;
         let upstream_host =
             HeaderValue::from_str(&cfg.upstream.to_string()).context("invalid upstream address")?;
         Ok(Arc::new(Self {
             upstream: cfg.upstream,
             upstream_host,
             allowed,
+            health_only,
             username: cfg.username.clone(),
             password: cfg.password.clone(),
             bearer: Mutex::new(BearerState::default()),
@@ -443,6 +490,7 @@ impl Proxy {
             rejected: AtomicU64::new(0),
             last_reject_log: std::sync::Mutex::new(None),
             health: std::sync::Mutex::new(None),
+            rtbit_generation: AtomicU64::new(0),
             speed_target: cfg.speed_target.clone().unwrap_or_default(),
             peering: cfg
                 .peering
@@ -487,8 +535,12 @@ impl Proxy {
     }
 
     /// `POST /__benchmark`: one test at a time, JSON-only (a plain form or
-    /// link from another site cannot trigger it), with a short cooldown.
-    async fn benchmark_response(&self, h: &HeaderMap) -> Response<ProxyBody> {
+    /// link from another site cannot trigger it), with a short cooldown. The
+    /// test runs in its own task: a client that goes away does not stop it,
+    /// and the lock and cooldown hold until it really ends.
+    async fn benchmark_response(self: &Arc<Self>, req: Request<Incoming>) -> Response<ProxyBody> {
+        let (parts, body) = req.into_parts();
+        let h = &parts.headers;
         let is_json = h
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
@@ -508,10 +560,17 @@ impl Proxy {
         {
             return json_error(StatusCode::FORBIDDEN, "cross-site requests are refused");
         }
+        // Read (and ignore) the body, so the connection stays usable.
+        if collect_limited(body, MAX_BENCHMARK_BODY).await.is_err() {
+            return json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "the speed test takes no request body",
+            );
+        }
         if self.benchmark_busy.swap(true, Ordering::AcqRel) {
             return too_many("a speed test is already running", 10);
         }
-        let _busy = BusyGuard(&self.benchmark_busy);
+        let busy = BusyGuard(self.clone());
         if let Some(done) = *lock(&self.benchmark_done) {
             let wait = BENCHMARK_COOLDOWN.saturating_sub(done.elapsed());
             if !wait.is_zero() {
@@ -521,7 +580,24 @@ impl Proxy {
                 );
             }
         }
+        let proxy = self.clone();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _busy = busy;
+            let body = proxy.run_benchmark().await;
+            let _ = tx.send(body);
+        });
+        match rx.await {
+            Ok(body) => json(StatusCode::OK, &body),
+            Err(_) => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the speed test stopped unexpectedly",
+            ),
+        }
+    }
 
+    /// The speed test itself; returns the JSON answer.
+    async fn run_benchmark(&self) -> String {
         let health = self.current_health().map(|(h, _)| h);
         let direct = health.as_ref().is_some_and(|h| h.direct);
         let route = if direct { "eth0" } else { "wg0" };
@@ -558,19 +634,20 @@ impl Proxy {
             opt_num(hardware.as_ref().and_then(|h| h.disk_write_mb_s)),
             opt_num(hardware.as_ref().and_then(|h| h.sha1_mb_s)),
         );
-        let body = serde_json::json!({
+        serde_json::json!({
             "mode": if direct { "direct" } else { "vpn" },
             "route": route,
             "network": network,
             "hardware": hardware,
             "hardware_error": hardware_error,
             "seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
-        });
-        json(StatusCode::OK, &body.to_string())
+        })
+        .to_string()
     }
 
     /// Records the supervisor's latest view of rtbit and the tunnel.
     pub fn set_health(&self, h: Health) {
+        self.rtbit_generation.store(h.generation, Ordering::Release);
         *self
             .health
             .lock()
@@ -634,15 +711,23 @@ impl Proxy {
         }
     }
 
-    fn peer_allowed(&self, ip: IpAddr) -> bool {
+    /// Health-only peers are matched first, so a peer on both lists is
+    /// still limited to `/__health`.
+    pub fn peer_access(&self, ip: IpAddr) -> Access {
         let v4 = match ip {
             IpAddr::V4(v4) => v4,
             IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
                 Some(v4) => v4,
-                None => return false,
+                None => return Access::Denied,
             },
         };
-        self.allowed.iter().any(|c| c.contains_addr(v4))
+        if self.health_only.iter().any(|c| c.contains_addr(v4)) {
+            Access::HealthOnly
+        } else if self.allowed.iter().any(|c| c.contains_addr(v4)) {
+            Access::Full
+        } else {
+            Access::Denied
+        }
     }
 
     fn log_rejection(&self, peer: SocketAddr) {
@@ -668,6 +753,15 @@ impl Proxy {
     /// A valid rtbit access token, signing in or refreshing as needed.
     async fn bearer(&self) -> Option<String> {
         let mut st = self.bearer.lock().await;
+        let generation = self.rtbit_generation.load(Ordering::Acquire);
+        if st.generation != generation {
+            // rtbit restarted: its tokens are gone.
+            st.access = None;
+            st.refresh = None;
+            st.expires = None;
+            st.retry_after = None;
+            st.generation = generation;
+        }
         let now = Instant::now();
         if let (Some(token), Some(expires)) = (&st.access, st.expires)
             && expires > now + TOKEN_REFRESH_MARGIN
@@ -725,6 +819,13 @@ impl Proxy {
     /// A valid qBittorrent-API session cookie value.
     async fn sid(&self) -> Option<String> {
         let mut st = self.sid.lock().await;
+        let generation = self.rtbit_generation.load(Ordering::Acquire);
+        if st.generation != generation {
+            st.sid = None;
+            st.obtained = None;
+            st.retry_after = None;
+            st.generation = generation;
+        }
         let now = Instant::now();
         if let (Some(sid), Some(at)) = (&st.sid, st.obtained)
             && at.elapsed() < SID_LIFETIME
@@ -772,6 +873,21 @@ impl Proxy {
     }
 
     async fn token_request(&self, path: &str, json: String) -> Result<TokenResponse, LoginError> {
+        tokio::time::timeout(AUTH_TIMEOUT, self.token_request_inner(path, json))
+            .await
+            .unwrap_or_else(|_| {
+                Err(LoginError::Unreachable(anyhow::anyhow!(
+                    "no answer to {path} within {}s",
+                    AUTH_TIMEOUT.as_secs()
+                )))
+            })
+    }
+
+    async fn token_request_inner(
+        &self,
+        path: &str,
+        json: String,
+    ) -> Result<TokenResponse, LoginError> {
         let resp = self
             .post(path, "application/json", json)
             .await
@@ -787,6 +903,17 @@ impl Proxy {
     }
 
     async fn sid_login(&self) -> Result<String, LoginError> {
+        tokio::time::timeout(AUTH_TIMEOUT, self.sid_login_inner())
+            .await
+            .unwrap_or_else(|_| {
+                Err(LoginError::Unreachable(anyhow::anyhow!(
+                    "no answer to the qBittorrent-API login within {}s",
+                    AUTH_TIMEOUT.as_secs()
+                )))
+            })
+    }
+
+    async fn sid_login_inner(&self) -> Result<String, LoginError> {
         let form = format!(
             "username={}&password={}",
             form_encode(&self.username),
@@ -838,29 +965,47 @@ impl Proxy {
     }
 
     async fn send(&self, req: Request<ProxyBody>) -> Result<Response<Incoming>> {
-        let stream =
-            tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(self.upstream))
+        let exchange = async {
+            let stream =
+                tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(self.upstream))
+                    .await
+                    .context("connection timed out")?
+                    .with_context(|| format!("cannot connect to {}", self.upstream))?;
+            let _ = stream.set_nodelay(true);
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
                 .await
-                .context("connection timed out")?
-                .with_context(|| format!("cannot connect to {}", self.upstream))?;
-        let _ = stream.set_nodelay(true);
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                .context("HTTP handshake with rtbit failed")?;
+            tokio::spawn(async move {
+                if let Err(e) = conn.with_upgrades().await {
+                    debug!("rtbit connection ended: {e}");
+                }
+            });
+            sender
+                .send_request(req)
+                .await
+                .context("rtbit closed the connection")
+        };
+        tokio::time::timeout(UPSTREAM_RESPONSE_TIMEOUT, exchange)
             .await
-            .context("HTTP handshake with rtbit failed")?;
-        tokio::spawn(async move {
-            if let Err(e) = conn.with_upgrades().await {
-                debug!("rtbit connection ended: {e}");
-            }
-        });
-        sender
-            .send_request(req)
-            .await
-            .context("rtbit closed the connection")
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "rtbit did not answer within {}s",
+                    UPSTREAM_RESPONSE_TIMEOUT.as_secs()
+                )
+            })?
     }
 
     // -- request handling ----------------------------------------------------
 
-    async fn handle(&self, mut req: Request<Incoming>) -> Response<ProxyBody> {
+    /// One request. `access` comes from [`Proxy::peer_access`]; `permit` is
+    /// the connection's slot, kept by a WebSocket tunnel for as long as it
+    /// runs.
+    pub async fn handle(
+        self: &Arc<Self>,
+        mut req: Request<Incoming>,
+        access: Access,
+        permit: Arc<OwnedSemaphorePermit>,
+    ) -> Response<ProxyBody> {
         let prefix = ingress_prefix(req.headers());
         let Some(pq) = req.uri().path_and_query().cloned() else {
             return text(StatusCode::BAD_REQUEST, "bad request");
@@ -872,7 +1017,14 @@ impl Proxy {
         let navigation = wants_html(req.headers());
         let method = req.method().clone();
 
-        if path == HEALTH_PATH && matches!(method, Method::GET | Method::HEAD) {
+        let health = path == HEALTH_PATH && matches!(method, Method::GET | Method::HEAD);
+        if access != Access::Full && !health {
+            return text(
+                StatusCode::FORBIDDEN,
+                "Forbidden: this address may only read /__health.\n",
+            );
+        }
+        if health {
             return self.health_response().await;
         }
         if path == BENCHMARK_PATH {
@@ -882,7 +1034,7 @@ impl Proxy {
                     .insert(header::ALLOW, HeaderValue::from_static("POST"));
                 return r;
             }
-            return self.benchmark_response(req.headers()).await;
+            return self.benchmark_response(req).await;
         }
 
         // The sidebar is already signed in: tell the web UI that no login is needed.
@@ -897,8 +1049,8 @@ impl Proxy {
         let upgrade = is_upgrade(req.headers());
         let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
         let (parts, body) = req.into_parts();
-        let base_headers =
-            forward_headers(&parts.headers, upgrade, navigation, &self.upstream_host);
+        let plain = navigation || !keeps_encoding(&path);
+        let base_headers = forward_headers(&parts.headers, upgrade, plain, &self.upstream_host);
         let replayable = body.is_end_stream();
         let mut body = Some(body);
 
@@ -946,7 +1098,7 @@ impl Proxy {
                 }
             }
             return self
-                .finish(resp, &method, &prefix, &path, client_upgrade)
+                .finish(resp, &method, &prefix, &path, client_upgrade, permit)
                 .await;
         }
     }
@@ -958,6 +1110,7 @@ impl Proxy {
         prefix: &str,
         path: &str,
         client_upgrade: Option<hyper::upgrade::OnUpgrade>,
+        permit: Arc<OwnedSemaphorePermit>,
     ) -> Response<ProxyBody> {
         if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
             let Some(client) = client_upgrade else {
@@ -965,6 +1118,8 @@ impl Proxy {
             };
             let upstream = hyper::upgrade::on(&mut resp);
             tokio::spawn(async move {
+                // The tunnel counts against MAX_CONNECTIONS until it closes.
+                let _permit = permit;
                 match tokio::try_join!(client, upstream) {
                     Ok((c, u)) => {
                         let mut c = TokioIo::new(c);
@@ -989,6 +1144,21 @@ impl Proxy {
         parts.headers.remove(header::X_FRAME_OPTIONS);
         parts.headers.remove(header::WWW_AUTHENTICATE);
 
+        if !prefix.is_empty() && *method == Method::HEAD && is_plain_html(&parts.headers) {
+            // Match what GET sends: the page is rewritten, so rtbit's
+            // validators and length do not apply.
+            for h in [
+                header::CONTENT_LENGTH,
+                header::ETAG,
+                header::LAST_MODIFIED,
+                header::CACHE_CONTROL,
+            ] {
+                parts.headers.remove(h);
+            }
+            parts
+                .headers
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        }
         let rewrite = !prefix.is_empty()
             && *method != Method::HEAD
             && !matches!(
@@ -1027,10 +1197,14 @@ impl Proxy {
 }
 
 fn store_tokens(st: &mut BearerState, t: TokenResponse) -> String {
-    let lifetime = t
-        .expires_in
-        .map_or(DEFAULT_TOKEN_LIFETIME, Duration::from_secs);
-    st.expires = Some(Instant::now() + lifetime);
+    let lifetime = t.expires_in.map_or(DEFAULT_TOKEN_LIFETIME, |s| {
+        Duration::from_secs(s.min(MAX_TOKEN_LIFETIME.as_secs()))
+    });
+    let now = Instant::now();
+    st.expires = Some(
+        now.checked_add(lifetime)
+            .unwrap_or_else(|| now + DEFAULT_TOKEN_LIFETIME),
+    );
     st.refresh = t.refresh_token;
     st.access = Some(t.access_token.clone());
     t.access_token
@@ -1040,15 +1214,13 @@ fn store_tokens(st: &mut BearerState, t: TokenResponse) -> String {
 // Server
 // ---------------------------------------------------------------------------
 
-/// Serves Ingress connections on `listener` until the task is dropped.
+/// Serves Ingress connections on `listener` until the task is dropped. A
+/// connection beyond the limit is closed at once instead of queueing, and
+/// health-only peers draw from their own pool.
 pub async fn serve(listener: TcpListener, proxy: Arc<Proxy>) -> Result<()> {
-    let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let ingress = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let health_only = Arc::new(Semaphore::new(MAX_HEALTH_ONLY_CONNECTIONS));
     loop {
-        let permit = limit
-            .clone()
-            .acquire_owned()
-            .await
-            .context("connection limiter closed")?;
         let (stream, peer) = match listener.accept().await {
             Ok(x) => x,
             Err(e) => {
@@ -1057,16 +1229,36 @@ pub async fn serve(listener: TcpListener, proxy: Arc<Proxy>) -> Result<()> {
                 continue;
             }
         };
+        let access = proxy.peer_access(peer.ip());
+        let pool = if access == Access::HealthOnly {
+            &health_only
+        } else {
+            &ingress
+        };
+        let Ok(permit) = pool.clone().try_acquire_owned() else {
+            debug!(%peer, "too many Ingress connections; closing this one");
+            drop(stream);
+            continue;
+        };
         let proxy = proxy.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            handle_connection(proxy, stream, peer).await;
-        });
+        tokio::spawn(handle_connection(
+            proxy,
+            stream,
+            peer,
+            access,
+            Arc::new(permit),
+        ));
     }
 }
 
-async fn handle_connection(proxy: Arc<Proxy>, mut stream: TcpStream, peer: SocketAddr) {
-    if !proxy.peer_allowed(peer.ip()) {
+async fn handle_connection(
+    proxy: Arc<Proxy>,
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    access: Access,
+    permit: Arc<OwnedSemaphorePermit>,
+) {
+    if access == Access::Denied {
         proxy.log_rejection(peer);
         const BODY: &str = "Forbidden: this port only serves Home Assistant Ingress.\n";
         let reply = format!(
@@ -1085,7 +1277,8 @@ async fn handle_connection(proxy: Arc<Proxy>, mut stream: TcpStream, peer: Socke
     let service_proxy = proxy.clone();
     let service = hyper::service::service_fn(move |req| {
         let proxy = service_proxy.clone();
-        async move { Ok::<_, Infallible>(proxy.handle(req).await) }
+        let permit = permit.clone();
+        async move { Ok::<_, Infallible>(proxy.handle(req, access, permit).await) }
     });
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder
@@ -1136,6 +1329,17 @@ fn strip_hop_by_hop(h: &mut HeaderMap, keep_upgrade: bool) {
     }
 }
 
+/// Requests that may keep `Accept-Encoding`: rtbit's APIs and static assets
+/// that are never HTML. Anything else might answer with a page that has to
+/// be rewritten, whatever the browser's `Accept` says (`*/*` included).
+fn keeps_encoding(path: &str) -> bool {
+    const ASSETS: [&str; 10] = [
+        ".js", ".mjs", ".css", ".json", ".wasm", ".svg", ".map", ".woff", ".woff2", ".ico",
+    ];
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("/api/") || ASSETS.iter().any(|ext| lower.ends_with(ext))
+}
+
 fn is_upgrade(h: &HeaderMap) -> bool {
     let connection_upgrade = h
         .get_all(header::CONNECTION)
@@ -1183,10 +1387,12 @@ pub fn ingress_prefix(h: &HeaderMap) -> String {
 
 /// Headers sent to rtbit: hop-by-hop, browser identity (cookies, origin,
 /// credentials) and Home Assistant's own headers are not forwarded.
+/// `plain`: ask for an uncompressed answer (HTML must arrive uncompressed so
+/// the base and shim can be injected).
 fn forward_headers(
     src: &HeaderMap,
     upgrade: bool,
-    navigation: bool,
+    plain: bool,
     upstream_host: &HeaderValue,
 ) -> HeaderMap {
     let mut h = src.clone();
@@ -1211,8 +1417,7 @@ fn forward_headers(
     for k in ha_specific {
         h.remove(k);
     }
-    if navigation {
-        // HTML must arrive uncompressed so the base/shim can be injected.
+    if plain {
         h.remove(header::ACCEPT_ENCODING);
     }
     if upgrade {
@@ -1293,7 +1498,10 @@ fn rewrite_location(h: &mut HeaderMap, prefix: &str, upstream: &SocketAddr) {
     }
 }
 
-/// `Path=/` cookies from rtbit would land on Home Assistant's own origin root.
+/// Scopes rtbit's cookies to the Ingress path: `Path=/x` becomes
+/// `Path=<prefix>/x`, and a cookie without `Path` gets `Path=<prefix>` (the
+/// browser's default could be `/api/hassio_ingress`, shared by every app).
+/// The first element is the cookie's own `name=value`, never an attribute.
 fn rewrite_set_cookie(h: &mut HeaderMap, prefix: &str) {
     if prefix.is_empty() || !h.contains_key(header::SET_COOKIE) {
         return;
@@ -1302,32 +1510,47 @@ fn rewrite_set_cookie(h: &mut HeaderMap, prefix: &str) {
         .get_all(header::SET_COOKIE)
         .iter()
         .map(|v| {
-            let Ok(s) = v.to_str() else {
-                return v.clone();
-            };
-            let rewritten: Vec<String> = s
-                .split(';')
-                .map(|attr| {
-                    let t = attr.trim();
-                    match t.split_once('=') {
-                        Some((k, p))
-                            if k.trim().eq_ignore_ascii_case("path")
-                                && p.starts_with('/')
-                                && !already_prefixed(p.as_bytes(), prefix.as_bytes()) =>
-                        {
-                            format!(" Path={prefix}{p}")
-                        }
-                        _ => attr.to_owned(),
-                    }
-                })
-                .collect();
-            HeaderValue::from_str(&rewritten.join(";")).unwrap_or_else(|_| v.clone())
+            v.to_str()
+                .ok()
+                .and_then(|s| HeaderValue::from_str(&scope_cookie(s, prefix)).ok())
+                .unwrap_or_else(|| v.clone())
         })
         .collect();
     h.remove(header::SET_COOKIE);
     for c in cookies {
         h.append(header::SET_COOKIE, c);
     }
+}
+
+fn scope_cookie(cookie: &str, prefix: &str) -> String {
+    let mut parts = cookie.split(';');
+    let mut out = vec![parts.next().unwrap_or_default().trim().to_owned()];
+    let mut has_path = false;
+    for attr in parts {
+        let t = attr.trim();
+        if t.is_empty() {
+            continue;
+        }
+        match t.split_once('=') {
+            Some((k, p)) if k.trim().eq_ignore_ascii_case("path") => {
+                has_path = true;
+                let p = p.trim();
+                if p.starts_with('/') && !already_prefixed(p.as_bytes(), prefix.as_bytes()) {
+                    out.push(format!("Path={prefix}{p}"));
+                } else if p.starts_with('/') {
+                    out.push(format!("Path={p}"));
+                } else {
+                    // Not a valid path: the browser would use its default.
+                    out.push(format!("Path={prefix}"));
+                }
+            }
+            _ => out.push(t.to_owned()),
+        }
+    }
+    if !has_path {
+        out.push(format!("Path={prefix}"));
+    }
+    out.join("; ")
 }
 
 fn is_plain_html(h: &HeaderMap) -> bool {
@@ -1358,7 +1581,8 @@ const SHIM: &str = r##"(function(){var P=__INGRESS_PATH__;if(!P)return;var O=loc
 function fix(u){if(typeof u!=="string")return u;if(u.indexOf(O+"/")===0)return O+fix(u.slice(O.length));
 if(u.charAt(0)!=="/"||u.charAt(1)==="/")return u;if(u===P||u.indexOf(P+"/")===0||u.indexOf(P+"?")===0||u.indexOf(P+"#")===0)return u;return P+u;}
 function fixAny(u){if(typeof URL!=="undefined"&&u instanceof URL){if(u.origin===O){var p=fix(u.pathname);if(p!==u.pathname){u=new URL(u.href);u.pathname=p;}}return u;}return fix(u);}
-function wsUrl(u){u=fixAny(u);if(typeof u==="string"&&u.charAt(0)==="/")return(location.protocol==="https:"?"wss://":"ws://")+location.host+u;return u;}
+function wsUrl(u){if(typeof URL!=="undefined"&&u instanceof URL)u=u.href;if(typeof u==="string"){var m=/^(wss?:)\/\/([^\/?#]*)(.*)$/i.exec(u);if(m){if(m[2]!==location.host)return u;var r=m[3]||"/";return m[1]+"//"+m[2]+fix(r.charAt(0)==="/"?r:"/"+r);}}
+u=fixAny(u);if(typeof u==="string"&&u.charAt(0)==="/")return(location.protocol==="https:"?"wss://":"ws://")+location.host+u;return u;}
 var F=window.fetch;if(F)window.fetch=function(i,o){if(typeof Request!=="undefined"&&i instanceof Request){var r=new URL(i.url);if(r.origin===O){var p=fix(r.pathname);if(p!==r.pathname){r.pathname=p;i=new Request(r.href,i);}}}else{i=fixAny(i);}return F.call(this,i,o);};
 var X=window.XMLHttpRequest&&XMLHttpRequest.prototype.open;if(X)XMLHttpRequest.prototype.open=function(){var a=Array.prototype.slice.call(arguments);a[1]=fixAny(a[1]);return X.apply(this,a);};
 function wrap(n,c){var C=window[n];if(!C||typeof Proxy==="undefined"||typeof Reflect==="undefined")return;window[n]=new Proxy(C,{construct:function(t,a,nt){a=Array.prototype.slice.call(a);if(a.length)a[0]=c(a[0]);return Reflect.construct(t,a,nt);}});}
@@ -1444,6 +1668,10 @@ if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",
 
 /// Directory of a request path (`/web/index.html` -> `/web/`).
 fn base_dir(path: &str) -> &str {
+    // rtbit serves the web UI at `/web` as well as `/web/`.
+    if path == "/web" {
+        return "/web/";
+    }
     path.rfind('/').and_then(|i| path.get(..=i)).unwrap_or("/")
 }
 
@@ -1511,7 +1739,39 @@ fn prefix_root_relative_attrs(html: &[u8], prefix: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(html.len() + 256);
     let mut copied = 0;
     let mut i = 0;
+    // Inline script and style bodies are code, not markup: `href="/x"` in a
+    // JavaScript string is left alone (the shim handles it at runtime).
+    let mut skip: Option<(usize, usize)> = None;
     while i < html.len() {
+        if let Some((from, to)) = skip
+            && i >= from
+        {
+            i = to.max(i + 1);
+            skip = None;
+            continue;
+        }
+        if skip.is_none() && html.get(i) == Some(&b'<') {
+            for tag in [&b"<script"[..], &b"<style"[..]] {
+                let opens = html
+                    .get(i..i + tag.len())
+                    .is_some_and(|w| w.eq_ignore_ascii_case(tag))
+                    && matches!(
+                        html.get(i + tag.len()),
+                        Some(b'>' | b' ' | b'\t' | b'\n' | b'\r' | b'/')
+                    );
+                if opens {
+                    // Attributes of the opening tag are still rewritten.
+                    let body = html
+                        .get(i..)
+                        .and_then(|r| r.iter().position(|&b| b == b'>'))
+                        .map_or(html.len(), |p| i + p + 1);
+                    let close: Vec<u8> = [&b"</"[..], tag.get(1..).unwrap_or_default()].concat();
+                    let end = find_ci(html, &close, body).unwrap_or(html.len());
+                    skip = Some((body, end));
+                    break;
+                }
+            }
+        }
         if html.get(i).is_some_and(u8::is_ascii_whitespace) {
             let rest = html.get(i + 1..).unwrap_or_default();
             let attr = URL_ATTRS.iter().find(|a| {
@@ -1824,6 +2084,12 @@ mod tests {
             ("set-cookie", "SID=abc; Path=/; HttpOnly; SameSite=Strict"),
             ("set-cookie", "other=1; path=/api/v2"),
             ("set-cookie", "x=1"),
+            // A cookie *named* path is not a Path attribute.
+            (
+                "set-cookie",
+                "path=/x;Secure;  Path=/api/hassio_ingress/AbC-123_x/web",
+            ),
+            ("set-cookie", "y=2; Path=relative"),
         ]);
         rewrite_set_cookie(&mut h, P);
         let all: Vec<&str> = h
@@ -1836,9 +2102,67 @@ mod tests {
             vec![
                 "SID=abc; Path=/api/hassio_ingress/AbC-123_x/; HttpOnly; SameSite=Strict",
                 "other=1; Path=/api/hassio_ingress/AbC-123_x/api/v2",
-                "x=1",
+                "x=1; Path=/api/hassio_ingress/AbC-123_x",
+                "path=/x; Secure; Path=/api/hassio_ingress/AbC-123_x/web",
+                "y=2; Path=/api/hassio_ingress/AbC-123_x",
             ]
         );
+    }
+
+    #[test]
+    fn only_html_capable_requests_lose_accept_encoding() {
+        for p in [
+            "/api/v2/torrents/info",
+            "/web/assets/index-abc.js",
+            "/web/a.CSS",
+        ] {
+            assert!(keeps_encoding(p), "{p}");
+        }
+        for p in [
+            "/web/",
+            "/web",
+            "/swagger/",
+            "/",
+            "/torrents",
+            "/web/index.html",
+        ] {
+            assert!(!keeps_encoding(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn inline_scripts_and_styles_are_not_rewritten() {
+        let html = br#"<script src="/a.js"></script><script>var u = ' href="/x"';</script><STYLE>a{x: ' src="/y"'}</STYLE><a href="/z">z</a>"#;
+        let out = String::from_utf8(prefix_root_relative_attrs(html, P.as_bytes())).unwrap();
+        assert!(
+            out.contains(&format!(r#"<script src="{P}/a.js">"#)),
+            "{out}"
+        );
+        assert!(out.contains(r#"' href="/x"'"#), "{out}");
+        assert!(out.contains(r#"' src="/y"'"#), "{out}");
+        assert!(out.contains(&format!(r#"<a href="{P}/z">"#)), "{out}");
+        // An unclosed script swallows the rest instead of rewriting it.
+        let open = br#"<script> x=' href="/q"'"#;
+        assert_eq!(
+            prefix_root_relative_attrs(open, P.as_bytes()),
+            open.to_vec()
+        );
+    }
+
+    #[test]
+    fn token_lifetimes_are_capped() {
+        let mut st = BearerState::default();
+        let token = store_tokens(
+            &mut st,
+            TokenResponse {
+                access_token: "t".into(),
+                refresh_token: None,
+                expires_in: Some(u64::MAX),
+            },
+        );
+        assert_eq!(token, "t");
+        let left = st.expires.unwrap() - Instant::now();
+        assert!(left <= MAX_TOKEN_LIFETIME, "{left:?}");
     }
 
     #[test]
@@ -1888,7 +2212,8 @@ mod tests {
         let cfg = ProxyConfig {
             listen: "0.0.0.0:8099".parse().unwrap(),
             upstream: "127.0.0.1:8080".parse().unwrap(),
-            allowed_peers: vec!["172.30.32.2/32".into(), "127.0.0.1/32".into()],
+            allowed_peers: vec!["172.30.32.2/32".into()],
+            health_only_peers: vec!["127.0.0.1/32".into()],
             username: "admin".into(),
             password: "pw".into(),
             log_level: LogLevel::Info,
@@ -1897,18 +2222,27 @@ mod tests {
         };
         assert!(!format!("{cfg:?}").contains("pw\""));
         let p = Proxy::new(&cfg).unwrap();
-        for (ip, ok) in [
-            ("172.30.32.2", true),
-            ("127.0.0.1", true),
-            ("::ffff:172.30.32.2", true),
-            ("172.30.32.3", false),
-            ("172.30.33.1", false),
-            ("127.0.0.2", false),
-            ("192.168.1.10", false),
-            ("::1", false),
+        for (ip, access) in [
+            ("172.30.32.2", Access::Full),
+            ("::ffff:172.30.32.2", Access::Full),
+            ("127.0.0.1", Access::HealthOnly),
+            ("::ffff:127.0.0.1", Access::HealthOnly),
+            ("172.30.32.3", Access::Denied),
+            ("172.30.33.1", Access::Denied),
+            ("127.0.0.2", Access::Denied),
+            ("192.168.1.10", Access::Denied),
+            ("::1", Access::Denied),
         ] {
-            assert_eq!(p.peer_allowed(ip.parse().unwrap()), ok, "{ip}");
+            assert_eq!(p.peer_access(ip.parse().unwrap()), access, "{ip}");
         }
+        // A peer on both lists stays health-only.
+        let mut both = cfg.clone();
+        both.allowed_peers.push("127.0.0.1/32".into());
+        let p = Proxy::new(&both).unwrap();
+        assert_eq!(
+            p.peer_access("127.0.0.1".parse().unwrap()),
+            Access::HealthOnly
+        );
         let mut bad = cfg.clone();
         bad.allowed_peers = vec!["nope".into()];
         assert!(Proxy::new(&bad).is_err());
@@ -2011,5 +2345,6 @@ mod tests {
         assert_eq!(base_dir("/web/index.html"), "/web/");
         assert_eq!(base_dir("/swagger/"), "/swagger/");
         assert_eq!(base_dir("/"), "/");
+        assert_eq!(base_dir("/web"), "/web/");
     }
 }

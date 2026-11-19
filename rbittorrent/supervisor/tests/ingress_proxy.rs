@@ -321,17 +321,24 @@ async fn start_proxy_with(
     speed_target: Option<SpeedTarget>,
     peering: Option<Vec<PeeringTarget>>,
 ) -> (SocketAddr, Arc<Proxy>) {
+    // These tests drive the proxy from loopback, so it gets full access here;
+    // production makes loopback health-only (see the test below).
     let cfg = ProxyConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         upstream,
         allowed_peers: vec!["172.30.32.2/32".into(), "127.0.0.1/32".into()],
+        health_only_peers: Vec::new(),
         username: "admin".into(),
         password: password.into(),
         log_level: LogLevel::Info,
         speed_target,
         peering,
     };
-    let proxy = Proxy::new(&cfg).unwrap();
+    start_proxy_cfg(&cfg).await
+}
+
+async fn start_proxy_cfg(cfg: &ProxyConfig) -> (SocketAddr, Arc<Proxy>) {
+    let proxy = Proxy::new(cfg).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(ingress::serve(listener, proxy.clone()));
@@ -1054,4 +1061,131 @@ async fn speed_test_without_the_supervisor_link_reports_why() {
     assert_eq!(status, StatusCode::OK, "{v}");
     assert!(v["hardware"].is_null());
     assert_eq!(v["hardware_error"], "not connected to the supervisor");
+}
+
+#[tokio::test]
+async fn loopback_may_only_read_health() {
+    let (up, mock) = start_mock().await;
+    let cfg = ProxyConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        upstream: up,
+        allowed_peers: vec!["172.30.32.2/32".into()],
+        health_only_peers: vec!["127.0.0.1/32".into()],
+        username: "admin".into(),
+        password: PASSWORD.into(),
+        log_level: LogLevel::Info,
+        speed_target: None,
+        peering: None,
+    };
+    let (proxy, state) = start_proxy_cfg(&cfg).await;
+    state.set_health(Health {
+        rtbit: true,
+        direct: true,
+        ..Health::default()
+    });
+    let (status, _, body) = body_of(send(proxy, get(ingress::HEALTH_PATH, &[])).await).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    for path in ["/web/", "/auth/status", "/torrents", "/api/v2/app/version"] {
+        let (status, _, body) = body_of(send(proxy, get(path, &[])).await).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        assert!(String::from_utf8_lossy(&body).contains("/__health"));
+    }
+    let (status, _, _) = body_of(
+        send(
+            proxy,
+            post_benchmark(&[("content-type", "application/json")]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "no speed test from loopback");
+    assert_eq!(mock.logins.load(Ordering::SeqCst), 0, "never signed in");
+    assert_eq!(mock.sid_logins.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_rtbit_restart_drops_the_cached_sessions() {
+    let (up, mock) = start_mock().await;
+    let (proxy, state) = start_proxy(up, PASSWORD).await;
+    state.set_health(Health {
+        rtbit: true,
+        direct: true,
+        generation: 1,
+        ..Health::default()
+    });
+    let (status, _, body) = body_of(send(proxy, get("/torrents", &[])).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["authorization"], "Bearer tok-1");
+
+    // rtbit restarted (a NAT-PMP port change): its tokens are gone. A POST
+    // with a body cannot be replayed, so it must go out with a fresh login.
+    mock.tokens.lock().unwrap().clear();
+    state.set_health(Health {
+        rtbit: true,
+        direct: true,
+        generation: 2,
+        ..Health::default()
+    });
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri("/torrents")
+        .body(full(pattern(6 << 20)))
+        .unwrap();
+    req.headers_mut()
+        .insert("x-ingress-path", HeaderValue::from_static(PREFIX));
+    let (status, _, body) = body_of(send(proxy, req).await).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(json(&body)["intact"], true);
+    assert_eq!(mock.logins.load(Ordering::SeqCst), 2, "signed in again");
+    assert_eq!(
+        mock.refreshes.load(Ordering::SeqCst),
+        0,
+        "old refresh token dropped"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_speed_test_keeps_its_lock_when_the_client_leaves() {
+    let (up, _mock) = start_mock().await;
+    let (proxy, state) = start_proxy(up, PASSWORD).await;
+    // VPN mode with the tunnel down: no network test, only the (slow) disk half.
+    state.set_health(Health::default());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    state.connect_supervisor(tx);
+    let link = state.clone();
+    tokio::spawn(async move {
+        while rx.recv().await.is_some() {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            link.deliver_hardware(benchmark::HardwareResult::default());
+        }
+    });
+
+    // Start a test and hang up before it answers.
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    s.write_all(
+        format!(
+            "POST {} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\
+             Content-Length: 2\r\n\r\n{{}}",
+            ingress::BENCHMARK_PATH
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(s);
+
+    let post = || post_benchmark(&[("content-type", "application/json")]);
+    let (status, _, body) = body_of(send(proxy, post()).await).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        String::from_utf8_lossy(&body).contains("already running"),
+        "{body:?}"
+    );
+
+    // Once the abandoned test ends, the cooldown applies.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let (status, _, body) = body_of(send(proxy, post()).await).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(String::from_utf8_lossy(&body).contains("wait"), "{body:?}");
 }

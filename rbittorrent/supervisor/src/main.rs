@@ -741,14 +741,13 @@ fn ingress_config_line(s: &Settings, password: &Secret) -> Result<String> {
     let cfg = ingress::ProxyConfig {
         listen: SocketAddr::from(([0, 0, 0, 0], s.ingress_port)),
         upstream: SocketAddr::from(([127, 0, 0, 1], s.webui_port)),
-        // Ingress and the watchdog always come from the Supervisor; loopback
-        // is for the Docker HEALTHCHECK. Other apps on 172.30.32.0/23 pass
-        // the firewall but are refused here: they must never inherit the
-        // automatic sign-in.
-        allowed_peers: vec![
-            format!("{}/32", ingress::SUPERVISOR_IP),
-            "127.0.0.1/32".to_owned(),
-        ],
+        // Ingress and the watchdog always come from the Supervisor. Other apps
+        // on 172.30.32.0/23 pass the firewall but are refused here: they must
+        // never inherit the automatic sign-in. Loopback (the Docker
+        // HEALTHCHECK) may only read /__health: rtbit shares this network
+        // namespace.
+        allowed_peers: vec![format!("{}/32", ingress::SUPERVISOR_IP)],
+        health_only_peers: vec!["127.0.0.1/32".to_owned()],
         username: s.webui_username.clone(),
         password: password.expose().to_owned(),
         log_level: s.log_level,
@@ -951,6 +950,8 @@ struct Session<'a, R: Runner> {
     /// qBittorrent import, for the banner.
     migration_status: String,
     health: &'a watch::Sender<Health>,
+    /// rtbit starts so far ([`Health::generation`]).
+    rtbit_starts: u64,
 }
 
 impl<R: Runner> Session<'_, R> {
@@ -960,7 +961,11 @@ impl<R: Runner> Session<'_, R> {
         }
         self.check_disk(true);
         match self.rtbit.spawn(self.listen_port) {
-            Ok(()) => self.respawn_at = None,
+            Ok(()) => {
+                self.respawn_at = None;
+                // The proxy drops its rtbit sessions when this changes.
+                self.rtbit_starts += 1;
+            }
             Err(e) => {
                 error!("{e:#}");
                 self.schedule_respawn();
@@ -987,6 +992,7 @@ impl<R: Runner> Session<'_, R> {
             detail: detail.into(),
             direct: self.direct,
             public_ip: self.public_ip,
+            generation: self.rtbit_starts,
         });
     }
 
@@ -1109,6 +1115,7 @@ async fn run_session(
         announced: false,
         migration_status: migration.status,
         health,
+        rtbit_starts: 0,
     };
     let _ = health.send(Health {
         tunnel: vpn.is_some(),
