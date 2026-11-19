@@ -28,6 +28,7 @@ Usage: sudo python3 e2e_netns.py --supervisor PATH [--keep]
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -51,6 +52,14 @@ INGRESS_PORT = 8099
 # Home Assistant's Supervisor (Ingress + watchdog) and another app's address.
 SUPERVISOR_IP, OTHER_APP_IP = "172.30.32.2", "172.30.32.3"
 DIRECT_LISTEN_PORT = 51413
+# A second address behind the tunnel: DNS to it must be refused (only the
+# configured tunnel DNS server may answer), plain TCP to it must work.
+OTHER_TUNNEL_HOST = "192.0.2.53"
+# IPv6 on the LAN link: the kill-switch must drop it, direct mode must not.
+CLI_V6, RTR_V6 = "fd99::2", "fd99::1"
+LAN6_PORT, APP6_PORT = 8083, 8084
+# Set in the supervisor's environment; must never reach rtbit or the proxy.
+E2E_SUPERVISOR_TOKEN = "e2e-supervisor-token-must-not-leak"
 PORT_A, PORT_B = 45678, 45679
 CANARY_TCP, CANARY_UDP = 8081, 53
 
@@ -105,9 +114,10 @@ def wait_for(pred, timeout, what, interval=0.5):
 
 
 def tcp_probe(ns, ip, port, timeout=3):
+    fam = "socket.AF_INET6" if ":" in ip else "socket.AF_INET"
     code = (
         "import socket,sys\n"
-        f"s=socket.socket();s.settimeout({timeout})\n"
+        f"s=socket.socket({fam});s.settimeout({timeout})\n"
         "try:\n"
         f"  s.connect(({ip!r},{port}));print('open')\n"
         "except Exception as e:\n"
@@ -153,11 +163,28 @@ def http_get(ns, src, ip, port, path, timeout=5):
         return None, head
 
 
-def proc_status_of(cmd_fragment):
-    """/proc/<pid>/status of the first process whose cmdline contains the fragment."""
+def app_processes():
+    """/proc entries of the processes inside the app's network namespace
+    (not the whole host: another job's processes must not match)."""
+    try:
+        app_ns = os.stat(f"/run/netns/{NS_CLI}").st_ino
+    except OSError:
+        return []
+    out = []
     for d in Path("/proc").iterdir():
         if not d.name.isdigit():
             continue
+        try:
+            if os.stat(d / "ns" / "net").st_ino == app_ns:
+                out.append(d)
+        except OSError:
+            continue
+    return out
+
+
+def proc_status_of(cmd_fragment):
+    """/proc/<pid>/status of the first app process whose cmdline contains the fragment."""
+    for d in app_processes():
         try:
             cmdline = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode()
             if cmd_fragment in cmdline:
@@ -165,6 +192,38 @@ def proc_status_of(cmd_fragment):
         except OSError:
             continue
     return ""
+
+
+def proc_environ_of(cmd_fragment):
+    """/proc/<pid>/environ of every app process whose cmdline contains the fragment."""
+    out = []
+    for d in app_processes():
+        try:
+            cmdline = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+            if cmd_fragment in cmdline:
+                out.append((d / "environ").read_bytes().decode(errors="replace"))
+        except OSError:
+            continue
+    return out
+
+
+def tcp_listener(ns, host, port):
+    """A background TCP listener that accepts and closes connections."""
+    fam = "socket.AF_INET6" if ":" in host else "socket.AF_INET"
+    code = (
+        "import socket\n"
+        f"s=socket.socket({fam});s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+        f"s.bind(({host!r},{port}));s.listen(8)\n"
+        "while True:\n  c,_=s.accept();c.close()\n"
+    )
+    return subprocess.Popen(["ip", "netns", "exec", ns, sys.executable, "-c", code])
+
+
+def leak_probe_count():
+    """Packets with the `leak` payload that reached the VPN server's port 51820."""
+    out = sh("nft", "list", "table", "inet", "e2e", ns=NS_INET).stdout
+    m = re.search(r'packets (\d+) bytes \d+ comment "leak-probe"', out)
+    return int(m.group(1)) if m else -1
 
 
 def wg_keypair():
@@ -280,6 +339,7 @@ def setup_network(cli_pub):
     sh("ip", "link", "set", "e2e-i", "name", "eth0", ns=NS_INET)
 
     sh("ip", "addr", "add", "10.99.0.2/24", "dev", "eth0", ns=NS_CLI)
+    sh("ip", "-6", "addr", "add", f"{CLI_V6}/64", "dev", "eth0", "nodad", ns=NS_CLI)
     sh("ip", "link", "set", "eth0", "up", ns=NS_CLI)
     sh("ip", "route", "add", "default", "via", "10.99.0.1", ns=NS_CLI)
 
@@ -287,6 +347,7 @@ def setup_network(cli_pub):
     # Stand-ins for Home Assistant's Supervisor and another app (172.30.32.0/23).
     for ip in (SUPERVISOR_IP, OTHER_APP_IP):
         sh("ip", "addr", "add", f"{ip}/32", "dev", "lan0", ns=NS_RTR)
+    sh("ip", "-6", "addr", "add", f"{RTR_V6}/64", "dev", "lan0", "nodad", ns=NS_RTR)
     sh("ip", "addr", "add", "198.51.100.254/24", "dev", "wan0", ns=NS_RTR)
     sh("ip", "link", "set", "lan0", "up", ns=NS_RTR)
     sh("ip", "link", "set", "wan0", "up", ns=NS_RTR)
@@ -304,7 +365,15 @@ def setup_network(cli_pub):
     sh("wg", "set", "wgs", "listen-port", "51820", "private-key", str(key_file),
        "peer", cli_pub, "allowed-ips", f"{CLIENT_TUNNEL_IP}/32", ns=NS_INET)
     sh("ip", "addr", "add", f"{TUNNEL_GW}/24", "dev", "wgs", ns=NS_INET)
+    sh("ip", "addr", "add", f"{OTHER_TUNNEL_HOST}/32", "dev", "wgs", ns=NS_INET)
     sh("ip", "link", "set", "wgs", "up", ns=NS_INET)
+    # Counts plain (unencrypted, unmarked) UDP that reaches the VPN server's
+    # port: WireGuard messages never start with "leak".
+    sh("nft", "-f", "-", ns=NS_INET, input_text=(
+        "table inet e2e {\n chain input {\n"
+        "  type filter hook input priority -10; policy accept;\n"
+        "  udp dport 51820 @th,64,32 0x6c65616b counter comment \"leak-probe\"\n"
+        " }\n}\n"))
     return srv_pub
 
 
@@ -425,18 +494,17 @@ Endpoint = {ENDPOINT_IP}:51820
         "enable_nat_pmp": True,
         "nat_pmp_gateway": TUNNEL_GW,
         "listen_port": 4240,
-        "local_allow_cidrs": ["10.99.0.0/24"],
+        # The default range 10.0.0.0/8 also covers the tunnel's 10.2.0.1
+        # (NAT-PMP, DNS): those must still go through wg0.
+        "local_allow_cidrs": ["10.0.0.0/8"],
         "enable_dht": False,
         "log_level": "debug",
     }
     (WORK / "data" / "options.json").write_text(json.dumps(options))
 
-    lan_service = subprocess.Popen(
-        ["ip", "netns", "exec", NS_RTR, sys.executable, "-c",
-         "import socket\ns=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
-         f"s.bind(('10.99.0.1',{LAN_SERVICE_PORT}));s.listen(8)\n"
-         "while True:\n  c,_=s.accept();c.close()\n"],
-    )
+    lan_service = tcp_listener(NS_RTR, "10.99.0.1", LAN_SERVICE_PORT)
+    lan6 = tcp_listener(NS_RTR, "::", LAN6_PORT)
+    app6 = tcp_listener(NS_CLI, "::", APP6_PORT)
     inet = subprocess.Popen(
         ["ip", "netns", "exec", NS_INET, sys.executable, str(Path(__file__).resolve()),
          "--role", "inet", "--state", str(WORK / "inet.json"),
@@ -453,6 +521,7 @@ Endpoint = {ENDPOINT_IP}:51820
         "RBITTORRENT_RESOLV_CONF": str(resolv),
         "RBITTORRENT_APP_CONFIGS": str(WORK / "app_configs"),
         "RBITTORRENT_SHARE": str(WORK / "share"),
+        "SUPERVISOR_TOKEN": E2E_SUPERVISOR_TOKEN,
     }
     sup = subprocess.Popen(
         ["ip", "netns", "exec", NS_CLI, str(supervisor)],
@@ -464,7 +533,8 @@ Endpoint = {ENDPOINT_IP}:51820
         if sup.poll() is None:
             sup.kill()
         inet.terminate()
-        lan_service.terminate()
+        for p in (lan_service, lan6, app6):
+            p.terminate()
         log.close()
         print("\n----- supervisor log -----")
         print(log_text())
@@ -494,6 +564,9 @@ def checks(sup, cli_priv, supervisor):
     secret_seen = any(cli_priv in v for v in env.values()) or any(cli_priv in a for a in first["argv"])
     check(not secret_seen, "WireGuard private key not in rtbit env/argv")
     check(cli_priv not in text, "WireGuard private key never logged")
+    check("SUPERVISOR_TOKEN" not in env and E2E_SUPERVISOR_TOKEN not in json.dumps(first),
+          "the Supervisor token never reaches rtbit")
+    check(E2E_SUPERVISOR_TOKEN not in text, "the Supervisor token is never logged")
     check(env.get("RTBIT_DHT_DISABLE") == "true", "enable_dht: false -> RTBIT_DHT_DISABLE=true")
     check("RUST_LOG" not in env, "log_level debug passes rtbit's full logs (no RUST_LOG filter)")
 
@@ -579,6 +652,8 @@ def checks(sup, cli_priv, supervisor):
     routes = sh("ip", "-4", "route", "show", ns=NS_CLI).stdout
     check("0.0.0.0/1 dev wg0" in routes and "128.0.0.0/1 dev wg0" in routes, "split default routes via wg0")
     check(f"{ENDPOINT_IP} via 10.99.0.1 dev eth0" in routes, "endpoint /32 via LAN gateway")
+    check("10.0.0.0/8 via 10.99.0.1 dev eth0" in routes and f"{TUNNEL_GW} dev wg0" in routes,
+          "the LAN range 10.0.0.0/8 goes to the LAN, the tunnel's own 10.2.0.1 stays in wg0")
     mtu = sh("ip", "link", "show", "wg0", ns=NS_CLI).stdout
     check("mtu 1420" in mtu, "wg0 MTU 1420")
     wgshow = sh("wg", "show", "wg0", ns=NS_CLI).stdout
@@ -597,17 +672,39 @@ def checks(sup, cli_priv, supervisor):
     check(not ok, f"new connections into the LAN are blocked ({out})")
     print("  info  UDP to public DNS:", udp_send(NS_CLI, ENDPOINT_IP, CANARY_UDP))
     udp_send(NS_CLI, TUNNEL_GW, CANARY_UDP)
+    print("  info  DNS to another server through the tunnel:",
+          udp_send(NS_CLI, OTHER_TUNNEL_HOST, CANARY_UDP))
     ok, out = tcp_probe(NS_CLI, TUNNEL_GW, CANARY_TCP)
     check(ok, "TCP through the tunnel works")
+    ok, out = tcp_probe(NS_CLI, OTHER_TUNNEL_HOST, CANARY_TCP)
+    check(ok, f"TCP to another host through the tunnel works ({out})")
     time.sleep(1)
     st = inet_state()
-    direct_tcp = [c for c in st["tcp"] if c["dst"] == ENDPOINT_IP]
+    direct_tcp = [c for c in st["tcp"] if c["src"] != CLIENT_TUNNEL_IP]
     tunnel_tcp = [c for c in st["tcp"] if c["src"] == CLIENT_TUNNEL_IP]
-    direct_udp = [c for c in st["udp"] if c["dst"] == ENDPOINT_IP]
+    direct_udp = [c for c in st["udp"] if c["src"] != CLIENT_TUNNEL_IP]
     tunnel_udp = [c for c in st["udp"] if c["src"] == CLIENT_TUNNEL_IP]
-    check(not direct_tcp, "no TCP leaked outside the tunnel (canary)")
-    check(not direct_udp, "no UDP/DNS leaked outside the tunnel (canary)")
+    check(all(c["dst"] != "?" for c in st["udp"]),
+          "the UDP canary knows every destination address (IP_PKTINFO)")
+    check(not direct_tcp, f"no TCP leaked outside the tunnel (canary: {direct_tcp})")
+    check(not direct_udp, f"no UDP/DNS leaked outside the tunnel (canary: {direct_udp})")
+    check({c["dst"] for c in tunnel_udp} == {TUNNEL_GW},
+          f"DNS through the tunnel only reaches the configured server {TUNNEL_GW} ({tunnel_udp})")
     check(bool(tunnel_tcp) and bool(tunnel_udp), "canaries do see tunnelled traffic (test is meaningful)")
+
+    step("unmarked UDP to the VPN server port and IPv6")
+    before = leak_probe_count()
+    print("  info  plain UDP to the endpoint port:", udp_send(NS_CLI, ENDPOINT_IP, 51820))
+    time.sleep(1)
+    check(before == 0 and leak_probe_count() == 0,
+          "plain UDP to the VPN server's port does not leave (only marked WireGuard packets do)")
+    udp_send(NS_RTR, ENDPOINT_IP, 51820)
+    time.sleep(1)
+    check(leak_probe_count() == 1, "the endpoint-port counter does count (test is meaningful)")
+    ok, out = tcp_probe(NS_CLI, RTR_V6, LAN6_PORT)
+    check(not ok, f"IPv6 out of the app is blocked ({out})")
+    ok, out = tcp_probe(NS_RTR, CLI_V6, APP6_PORT)
+    check(not ok, f"IPv6 into the app is blocked ({out})")
 
     step("inbound rules")
     ok, out = tcp_probe(NS_RTR, "10.99.0.2", 8080)
@@ -693,7 +790,11 @@ def checks(sup, cli_priv, supervisor):
     links = sh("ip", "link", "show", ns=NS_CLI).stdout
     check("wg0" not in links, "wg0 removed")
     text = log_text()
-    check(text.find("rtbit stopped") < text.find("shutdown complete"), "rtbit stopped before tunnel teardown")
+    i_stop = text.rfind("rtbit stopped")
+    i_wg = text.rfind("WireGuard interface removed")
+    i_done = text.rfind("shutdown complete")
+    check(-1 < i_stop < i_wg < i_done,
+          f"rtbit stopped before the tunnel was removed (offsets {i_stop}, {i_wg}, {i_done})")
 
 
 def run_direct_test(supervisor: Path):
@@ -741,7 +842,10 @@ def run_direct_test(supervisor: Path):
         "RBITTORRENT_RESOLV_CONF": str(resolv),
         "RBITTORRENT_APP_CONFIGS": str(WORK / "app_configs"),
         "RBITTORRENT_SHARE": str(WORK / "share"),
+        "SUPERVISOR_TOKEN": E2E_SUPERVISOR_TOKEN,
     }
+    lan6 = tcp_listener(NS_RTR, "::", LAN6_PORT)
+    app6 = tcp_listener(NS_CLI, "::", APP6_PORT)
     step("direct mode: start rbittorrent-supervisor without any VPN setup")
     sup = subprocess.Popen(
         ["ip", "netns", "exec", NS_CLI, str(sup_copy)],
@@ -757,7 +861,12 @@ def run_direct_test(supervisor: Path):
               f"rtbit listens on listen_port {DIRECT_LISTEN_PORT}")
         check("RTBIT_BIND_DEVICE" not in first["env"], "rtbit is not bound to wg0")
         check(first["env"].get("RTBIT_LISTEN_IP") == "0.0.0.0", "rtbit listens on all addresses")
-        check("SUPERVISOR_TOKEN" not in first["env"], "no Supervisor token in rtbit's environment")
+        check("SUPERVISOR_TOKEN" not in first["env"] and E2E_SUPERVISOR_TOKEN not in json.dumps(first),
+              "the Supervisor token never reaches rtbit")
+        proxies = proc_environ_of("ingress-proxy")
+        check(bool(proxies) and all(E2E_SUPERVISOR_TOKEN not in e for e in proxies),
+              f"the Supervisor token never reaches the Ingress proxy ({len(proxies)} found)")
+        check(E2E_SUPERVISOR_TOKEN not in log_text(), "the Supervisor token is never logged")
         tables = sh("nft", "list", "tables", ns=NS_CLI, check=False).stdout
         check("killswitch" not in tables, f"no kill-switch table in direct mode ({tables.strip()!r})")
         check("inet direct" in tables, f"direct-mode port rules installed ({tables.strip()!r})")
@@ -780,6 +889,11 @@ def run_direct_test(supervisor: Path):
         check(not ok, f"the Ingress port is closed to the internet ({out})")
         ok, out = tcp_probe(NS_RTR, "10.99.0.2", INGRESS_PORT)
         check(not ok, f"the Ingress port is closed to the LAN ({out})")
+        # Positive control for the VPN test's IPv6 checks: the link works.
+        ok, out = tcp_probe(NS_CLI, RTR_V6, LAN6_PORT)
+        check(ok, f"IPv6 works on a direct connection (so the VPN test is meaningful) ({out})")
+        ok, out = tcp_probe(NS_RTR, CLI_V6, APP6_PORT)
+        check(ok, f"IPv6 into the app works on a direct connection ({out})")
         status, body = wait_for(
             lambda: (lambda r: r if r[0] == 200 else None)(
                 http_get(NS_RTR, SUPERVISOR_IP, "10.99.0.2", INGRESS_PORT, "/__health")),
@@ -802,6 +916,8 @@ def run_direct_test(supervisor: Path):
         if sup.poll() is None:
             sup.kill()
         inet.terminate()
+        lan6.terminate()
+        app6.terminate()
         log.close()
         print("\n----- supervisor log (direct mode) -----")
         print(log_text())

@@ -4,6 +4,10 @@
 use anyhow::{Result, bail};
 
 const MAX_DEPTH: usize = 64;
+/// Values in one document. Each costs ~40 bytes, so a crafted 32 MiB file of
+/// empty lists cannot turn into gigabytes; real `.fastresume` files hold a
+/// few thousand.
+pub const MAX_VALUES: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value<'a> {
@@ -45,26 +49,32 @@ impl<'a> Value<'a> {
 /// Decodes one complete bencoded value; trailing bytes are an error.
 pub fn decode(input: &[u8]) -> Result<Value<'_>> {
     let mut pos = 0;
-    let v = value(input, &mut pos, 0)?;
+    let mut budget = MAX_VALUES;
+    let v = value(input, &mut pos, 0, &mut budget)?;
     if pos != input.len() {
         bail!("bencode: {} trailing bytes", input.len() - pos);
     }
     Ok(v)
 }
 
-fn value<'a>(input: &'a [u8], pos: &mut usize, depth: usize) -> Result<Value<'a>> {
+fn value<'a>(
+    input: &'a [u8],
+    pos: &mut usize,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<Value<'a>> {
     if depth > MAX_DEPTH {
         bail!("bencode: nested too deeply");
     }
+    *budget = budget
+        .checked_sub(1)
+        .ok_or_else(|| anyhow::anyhow!("bencode: more than {MAX_VALUES} values"))?;
     match input.get(*pos) {
         Some(b'i') => {
             *pos += 1;
             let end = find(input, *pos, b'e')?;
             let text = std::str::from_utf8(slice(input, *pos, end)?)?;
-            let valid = !text.is_empty()
-                && !text.starts_with("-0")
-                && !(text.len() > 1 && text.starts_with('0'));
-            if !valid {
+            if !canonical_int(text) {
                 bail!("bencode: malformed integer {text:?}");
             }
             *pos = end + 1;
@@ -74,7 +84,7 @@ fn value<'a>(input: &'a [u8], pos: &mut usize, depth: usize) -> Result<Value<'a>
             *pos += 1;
             let mut items = Vec::new();
             while input.get(*pos) != Some(&b'e') {
-                items.push(value(input, pos, depth + 1)?);
+                items.push(value(input, pos, depth + 1, budget)?);
             }
             *pos += 1;
             Ok(Value::List(items))
@@ -86,7 +96,7 @@ fn value<'a>(input: &'a [u8], pos: &mut usize, depth: usize) -> Result<Value<'a>
                 let Value::Bytes(key) = bytes(input, pos)? else {
                     unreachable!("bytes() only returns Value::Bytes")
                 };
-                items.push((key, value(input, pos, depth + 1)?));
+                items.push((key, value(input, pos, depth + 1, budget)?));
             }
             *pos += 1;
             Ok(Value::Dict(items))
@@ -97,9 +107,24 @@ fn value<'a>(input: &'a [u8], pos: &mut usize, depth: usize) -> Result<Value<'a>
     }
 }
 
+/// `0`, or digits without a leading zero, optionally negative (not `-0`).
+/// Rust's parser alone would also take `+5` and `007`.
+fn canonical_int(text: &str) -> bool {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    let all_digits = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+    all_digits && (digits == "0" && !text.starts_with('-') || !digits.starts_with('0'))
+}
+
 fn bytes<'a>(input: &'a [u8], pos: &mut usize) -> Result<Value<'a>> {
     let colon = find(input, *pos, b':')?;
-    let len: usize = std::str::from_utf8(slice(input, *pos, colon)?)?.parse()?;
+    let digits = std::str::from_utf8(slice(input, *pos, colon)?)?;
+    let canonical = !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'));
+    if !canonical {
+        bail!("bencode: malformed string length {digits:?}");
+    }
+    let len: usize = digits.parse()?;
     let start = colon + 1;
     let end = start
         .checked_add(len)
@@ -158,10 +183,26 @@ mod tests {
             b"",
             b"i1ei2e",
             b"99999999999999999999999:a",
+            b"i+5e",
+            b"i-e",
+            b"i1.5e",
+            b"+1:a",
+            b"01:a",
         ] {
             assert!(decode(bad).is_err(), "{:?}", String::from_utf8_lossy(bad));
         }
         let deep = "l".repeat(100) + &"e".repeat(100);
         assert!(decode(deep.as_bytes()).is_err());
+        assert_eq!(decode(b"i0e").unwrap(), Value::Int(0));
+        assert_eq!(decode(b"i-12e").unwrap(), Value::Int(-12));
+        assert_eq!(decode(b"0:").unwrap(), Value::Bytes(b""));
+    }
+
+    #[test]
+    fn the_number_of_values_is_capped() {
+        let many = |n: usize| format!("l{}e", "le".repeat(n));
+        assert!(decode(many(MAX_VALUES - 1).as_bytes()).is_ok());
+        let err = decode(many(MAX_VALUES).as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("more than"), "{err}");
     }
 }

@@ -90,6 +90,12 @@ const PMP_HINT_EVERY: Duration = Duration::from_secs(1800);
 const DISK_CHECK_EVERY: Duration = Duration::from_secs(600);
 const DISK_WARN_EVERY: Duration = Duration::from_secs(3600);
 const INGRESS_STOP_GRACE: Duration = Duration::from_secs(3);
+/// A proxy that does not take a status line within this time is stuck (or
+/// hostile) and is restarted, so PID 1 never blocks on its pipe.
+const INGRESS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Requests from the proxy are tiny JSON lines; anything longer ends the
+/// request channel instead of growing PID 1's memory.
+const MAX_PROXY_REQUEST_LINE: u64 = 4 << 10;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -624,13 +630,16 @@ async fn supervise_direct(
     result
 }
 
-async fn stop_ingress_task(stop: watch::Sender<bool>, task: tokio::task::JoinHandle<()>) {
+async fn stop_ingress_task(stop: watch::Sender<bool>, mut task: tokio::task::JoinHandle<()>) {
     let _ = stop.send(true);
-    if tokio::time::timeout(INGRESS_STOP_GRACE * 2, task)
+    if tokio::time::timeout(INGRESS_STOP_GRACE * 2, &mut task)
         .await
         .is_err()
     {
-        warn!("the Ingress proxy did not stop in time");
+        warn!("the Ingress proxy did not stop in time; stopping it");
+        // Dropping the task drops the child, which kills it.
+        task.abort();
+        let _ = task.await;
     }
 }
 
@@ -827,12 +836,18 @@ async fn supervise_ingress(
             }
         };
         let process::IngressPipes { mut stdin, stdout } = pipes;
-        let mut requests = tokio::io::BufReader::new(stdout).lines();
+        let (request_tx, mut requests) = tokio::sync::mpsc::channel::<String>(4);
+        let reader = tokio::spawn(read_proxy_requests(stdout, request_tx));
         let mut requests_open = true;
         let mut hardware_job: Option<tokio::task::JoinHandle<benchmark::HardwareResult>> = None;
         let current = health.borrow_and_update().clone();
-        send_line(&mut stdin, &health_line(&current)).await;
+        let mut stuck = !send_line(&mut stdin, &health_line(&current)).await;
         let status = loop {
+            if stuck {
+                warn!("the Ingress proxy stopped reading its status pipe; restarting it");
+                child.start_kill().ok();
+                stuck = false;
+            }
             tokio::select! {
                 status = child.wait() => break Some(status),
                 changed = health.changed(), if health_open => {
@@ -841,10 +856,10 @@ async fn supervise_ingress(
                         continue;
                     }
                     let h = health.borrow_and_update().clone();
-                    send_line(&mut stdin, &health_line(&h)).await;
+                    stuck = !send_line(&mut stdin, &health_line(&h)).await;
                 }
-                line = requests.next_line(), if requests_open => match line {
-                    Ok(Some(line)) => match serde_json::from_str::<ingress::ProxyRequest>(&line) {
+                line = requests.recv(), if requests_open => match line {
+                    Some(line) => match serde_json::from_str::<ingress::ProxyRequest>(&line) {
                         Ok(ingress::ProxyRequest::Hardware) if hardware_job.is_none() => {
                             let dir = download_dir.clone();
                             hardware_job = Some(tokio::task::spawn_blocking(move || {
@@ -856,7 +871,7 @@ async fn supervise_ingress(
                         }
                         Err(e) => debug!("ignoring an unknown request from the Ingress proxy: {e}"),
                     },
-                    Ok(None) | Err(_) => requests_open = false,
+                    None => requests_open = false,
                 },
                 result = async {
                     match hardware_job.as_mut() {
@@ -870,7 +885,7 @@ async fn supervise_ingress(
                             if let Some(e) = &r.disk_error {
                                 warn!("speed test: {e}");
                             }
-                            send_line(&mut stdin, &ingress::hardware_line(&r)).await;
+                            stuck = !send_line(&mut stdin, &ingress::hardware_line(&r)).await;
                         }
                         Err(e) => warn!("speed test: the disk test failed: {e}"),
                     }
@@ -878,6 +893,7 @@ async fn supervise_ingress(
                 () = stop_requested(&mut stop) => break None,
             }
         };
+        reader.abort();
         let Some(status) = status else {
             // EOF on its stdin makes the proxy exit by itself.
             drop(stdin);
@@ -914,15 +930,55 @@ fn health_line(h: &Health) -> String {
     serde_json::to_string(h).unwrap_or_default()
 }
 
-async fn send_line(stdin: &mut tokio::process::ChildStdin, line: &str) {
+/// Sends one line to the proxy. `false` when the proxy did not take it in
+/// time (a pipe it no longer reads): the caller restarts it.
+async fn send_line(stdin: &mut tokio::process::ChildStdin, line: &str) -> bool {
     if line.is_empty() {
-        return;
+        return true;
     }
     let mut buf = Vec::with_capacity(line.len() + 1);
     buf.extend_from_slice(line.as_bytes());
     buf.push(b'\n');
-    if let Err(e) = stdin.write_all(&buf).await {
-        debug!("cannot send a line to the Ingress proxy: {e}");
+    match tokio::time::timeout(INGRESS_SEND_TIMEOUT, stdin.write_all(&buf)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            // The proxy exited; `child.wait()` reports it.
+            debug!("cannot send a line to the Ingress proxy: {e}");
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Reads the proxy's request lines, each at most [`MAX_PROXY_REQUEST_LINE`]
+/// bytes. A longer line, or the end of the pipe, ends the channel.
+async fn read_proxy_requests(
+    stdout: tokio::process::ChildStdout,
+    tx: tokio::sync::mpsc::Sender<String>,
+) {
+    use tokio::io::AsyncReadExt as _;
+    let mut reader = tokio::io::BufReader::new(stdout);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match (&mut reader)
+            .take(MAX_PROXY_REQUEST_LINE)
+            .read_line(&mut line)
+            .await
+        {
+            Ok(0) | Err(_) => return,
+            Ok(_) if !line.ends_with('\n') => {
+                warn!(
+                    "the Ingress proxy sent an over-long request; ignoring its requests until it restarts"
+                );
+                return;
+            }
+            Ok(_) => {
+                if tx.send(line.trim_end().to_owned()).await.is_err() {
+                    return;
+                }
+            }
+        }
     }
 }
 

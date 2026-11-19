@@ -128,8 +128,31 @@ fn unreachable_child() -> ! {
 }
 
 impl Drop for TrackedChild {
+    /// The PID stays registered until the child is really reaped. Untracking
+    /// a live child first would let the orphan reaper collect it and the
+    /// kernel hand its PID to a new child, while tokio's own orphan queue
+    /// still waits on that number and could steal the new child's status.
     fn drop(&mut self) {
-        self.untrack();
+        let Some(mut child) = self.child.take() else {
+            self.untrack();
+            return;
+        };
+        let _ = child.start_kill();
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            self.untrack();
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            // No runtime left (process exit): nothing will reuse the PID.
+            return;
+        };
+        let pid = self.pid.take();
+        rt.spawn(async move {
+            let _ = child.wait().await;
+            if let Some(p) = pid {
+                registry().remove(&p);
+            }
+        });
     }
 }
 

@@ -26,7 +26,7 @@
 | `rbittorrent/rtbit/swagger-vendored.patch` | Build-only: Swagger UI from a checksum-pinned crate, no download from github.com |
 | `rbittorrent/supervisor/` | `rbittorrent-supervisor`, the Rust PID 1 (config, firewall, WireGuard, NAT-PMP, migration, process, Ingress, benchmark) |
 | `rbittorrent/tests/` | Kernel end-to-end leak test (network namespaces + real WireGuard) |
-| `.github/workflows/ci-release.yaml` | fmt, clippy, tests, live nftables, e2e (VPN + direct mode), native per-arch image builds and smoke tests, GHCR release |
+| `.github/workflows/ci-release.yaml` | fmt, clippy, tests, live nftables, e2e (VPN + direct mode), native per-arch image builds and smoke tests, GHCR publishing of the tested images |
 
 ## Development
 
@@ -38,6 +38,15 @@ cargo test
 NFT_LIVE_TEST=1 unshare -rn cargo test nft_live -- --nocapture   # needs nft
 sudo python3 ../tests/e2e_netns.py --supervisor target/release/rbittorrent-supervisor
 ```
+
+## Releases
+
+Pull requests build and test the images but publish nothing. A push to
+`main` publishes the tested images as `edge`. A release is a tag: set
+`version` in `rbittorrent/config.yaml` and the changelog, then push the tag
+`v<version>` (e.g. `v1.0.0`). CI checks that the tag matches `config.yaml`,
+refuses to overwrite a version that is already published, and pushes
+exactly the images it smoke-tested as `<version>` and `latest`.
 
 ## Credits
 

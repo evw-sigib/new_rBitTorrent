@@ -25,7 +25,8 @@ ARG RTBIT_REPO=https://github.com/TheDancingDeveloper-org/rustTorrent.git
 ARG RTBIT_TAG=v0.2.0-beta.4
 ARG RTBIT_COMMIT=be9bbfe5bb406575376a97e827212deff5fe5b8e
 # The same build dependencies as upstream's Dockerfile: npm builds the web
-# UI (embedded in the binary), OpenSSL is linked statically.
+# UI (embedded in the binary; `npm ci` against upstream's package-lock.json),
+# OpenSSL is linked statically.
 RUN apk add --no-cache clang lld git npm pkgconf musl-dev openssl-dev openssl-libs-static
 WORKDIR /src
 RUN git clone --depth 1 --branch "${RTBIT_TAG}" "${RTBIT_REPO}" . \
@@ -35,6 +36,7 @@ RUN git clone --depth 1 --branch "${RTBIT_TAG}" "${RTBIT_REPO}" . \
 # swagger-vendored.patch is build-only: Swagger UI (rtbit's /swagger page)
 # comes from a checksum-pinned crate instead of a curl download from
 # github.com inside build.rs.
+# The order matters: the later patches are made on top of mimalloc.patch.
 COPY rtbit/mimalloc.patch rtbit/auth-banner.patch rtbit/swagger-vendored.patch /tmp/
 RUN git apply --verbose /tmp/mimalloc.patch /tmp/auth-banner.patch /tmp/swagger-vendored.patch \
  && grep -q 'static GLOBAL: mimalloc::MiMalloc' crates/rtbit/src/main.rs \
@@ -72,10 +74,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # ---------------------------------------------------------------------------
 FROM alpine:${ALPINE_VERSION}
 
-ARG BUILD_ARCH=amd64
+# Set by CI per architecture. It must match the platform being built, so a
+# hand build cannot label an arm64 image as amd64 (checked at build time).
+ARG TARGETARCH
+ARG BUILD_ARCH
 ARG BUILD_VERSION=1.0.0
-ARG BUILD_REPOSITORY=evw-sigib/new_rbittorrent
+ARG BUILD_REPOSITORY=evw-sigib/new_rBitTorrent
 
+RUN case "${TARGETARCH}:${BUILD_ARCH}" in \
+      amd64:amd64|arm64:aarch64) ;; \
+      *) echo "BUILD_ARCH=${BUILD_ARCH:-<unset>} does not match the target platform ${TARGETARCH}"; exit 1 ;; \
+    esac
 # iproute2-minimal: full netlink `ip` (BusyBox ip cannot create WireGuard
 # links). wireguard-tools-wg: only the `wg` binary, no wg-quick.
 RUN apk add --no-cache \

@@ -217,9 +217,11 @@ also works. Peers then cannot connect to you, so downloads are slower.
 
 ## Setting up the VPN: three methods
 
-The app uses the **first** method that is present and ignores the others.
-The log names the method it chose: `VPN mode (...): WireGuard configuration
-from ...`.
+The configuration comes from the **first** method that is present. The
+fields of method 3 never override it: they only fill in values that file or
+paste lacks (for example `wg_dns` for a `.conf` without a `DNS =` line), and
+the log says when one is ignored. The log names the method it chose:
+`VPN mode (...): WireGuard configuration from ...`.
 
 ### Method 1: a `wg0.conf` file (recommended)
 
@@ -508,8 +510,11 @@ To check it yourself:
   log say `auth: enabled` for the login the supervisor stored (upstream
   printed "not set up" although the API was protected), and the build-only
   `rtbit/swagger-vendored.patch` takes the Swagger UI page from a
-  checksum-pinned crate, so the build downloads nothing that `Cargo.lock`
-  does not pin.
+  checksum-pinned crate. Everything the build downloads is pinned: crates
+  by `Cargo.lock`, and the Web UI's npm packages (rtbit's build runs
+  `npm ci`) by upstream's `package-lock.json`. The patches apply in this
+  order, as the Dockerfile does: `mimalloc`, `auth-banner`,
+  `swagger-vendored` (the last two expect the first one's changes).
 - Its SHA-1 piece hashing picks ARMv8 or SHA-NI instructions at runtime. No
   `target-cpu` flags are set, so it also runs on a Raspberry Pi 3 or 4.
 - The [speed test](#speed-test) costs nothing while idle: its threads and

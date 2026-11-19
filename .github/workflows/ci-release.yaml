@@ -128,9 +128,9 @@ jobs:
     # Both binaries (rtbit is compiled from source with mimalloc) build
     # natively on each architecture's own runner: no QEMU emulation.
     timeout-minutes: 120
+    # Builds and tests only; publishing (with write access) is its own job.
     permissions:
       contents: read
-      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -311,47 +311,43 @@ jobs:
             echo "| rtbit idle RSS (musl, amd64 runner) | ${idle} KiB |"
             echo "| rtbit RSS after setup + 3 logins | ${after} KiB |"
           } | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Log in to GHCR
+      - name: Keep the tested image for publishing
         if: github.event_name == 'push'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Push
+        run: docker save local/rbittorrent:test | gzip -1 > image-${{ matrix.arch }}.tar.gz
+      - uses: actions/upload-artifact@v4
         if: github.event_name == 'push'
-        uses: docker/build-push-action@v6
         with:
-          context: ${{ env.APP_DIR }}
-          platforms: ${{ matrix.platform }}
-          build-args: |
-            BUILD_ARCH=${{ matrix.arch }}
-            BUILD_VERSION=${{ steps.meta.outputs.version }}
-            BUILD_REPOSITORY=${{ github.repository }}
-          tags: |
-            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
-            ${{ steps.meta.outputs.image }}:latest
-          push: true
-          provenance: false
-          cache-from: type=gha,scope=${{ matrix.arch }}
+          name: image-${{ matrix.arch }}
+          path: image-${{ matrix.arch }}.tar.gz
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
 
-  manifest:
-    name: Multi-arch manifest
+  publish:
+    name: Publish (GHCR)
     runs-on: ubuntu-24.04
     needs: image
     if: github.event_name == 'push'
+    # One publish at a time: a commit and its tag pushed together queue up.
+    concurrency:
+      group: publish-${{ github.repository }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: image-*
+          merge-multiple: true
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Create ghcr.io/<owner>/rbittorrent (amd64 + arm64)
+      - name: Push the smoke-tested images and the multi-arch manifest
         run: |
           set -euo pipefail
           read -r version template < <(python3 -c '
@@ -359,9 +355,32 @@ jobs:
           c = yaml.safe_load(open("rbittorrent/config.yaml"))
           print(c["version"], c["image"])')
           multi="${template/\{arch\}-/}"
-          for tag in "$version" latest; do
-            docker buildx imagetools create -t "$multi:$tag" \
-              "${template/\{arch\}/amd64}:$version" \
-              "${template/\{arch\}/aarch64}:$version"
+          exists() { docker buildx imagetools inspect "$1" >/dev/null 2>&1; }
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            # A release: the tag must match config.yaml, and a published
+            # version is never overwritten.
+            if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+              echo "tag $GITHUB_REF_NAME does not match config.yaml version $version"; exit 1
+            fi
+            for ref in "$multi:$version" "${template/\{arch\}/amd64}:$version" "${template/\{arch\}/aarch64}:$version"; do
+              if exists "$ref"; then echo "$ref is already published; bump the version"; exit 1; fi
+            done
+            tags="$version latest"
+          else
+            # main: a rolling `edge` tag only; versions come from release tags.
+            tags="edge"
+          fi
+          for arch in amd64 aarch64; do
+            img="${template/\{arch\}/$arch}"
+            gunzip -c "image-$arch.tar.gz" | docker load
+            for t in $tags; do
+              docker tag local/rbittorrent:test "$img:$t"
+              docker push "$img:$t"
+            done
           done
-          docker buildx imagetools inspect "$multi:$version"
+          for t in $tags; do
+            docker buildx imagetools create -t "$multi:$t" \
+              "${template/\{arch\}/amd64}:$t" \
+              "${template/\{arch\}/aarch64}:$t"
+          done
+          docker buildx imagetools inspect "$multi:${tags%% *}"

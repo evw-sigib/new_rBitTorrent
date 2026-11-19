@@ -15,6 +15,7 @@ from pathlib import Path
 
 import yaml
 
+from supervisor.apps.options import AppOptions, UiOptions
 from supervisor.apps.validate import SCHEMA_APP_CONFIG, SCHEMA_APP_TRANSLATIONS
 
 FORBIDDEN_CAPS = {"SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_RAWIO", "BPF", "PERFMON"}
@@ -56,6 +57,17 @@ def main(app_dir: Path) -> int:
         optional = isinstance(typ, str) and typ.endswith("?")
         if not optional and key not in cfg["options"]:
             errors.append(f"required option '{key}' has no default")
+    # The Supervisor's own option validator, as on install. coresys is only
+    # needed for `device` options and `!secret` values, which none use.
+    try:
+        AppOptions(None, schema, cfg["name"], cfg["slug"], resolve_secrets=False)(
+            dict(cfg["options"]))
+    except Exception as e:  # voluptuous.Invalid
+        errors.append(f"default options do not satisfy the schema: {e}")
+    try:
+        UiOptions(None)(schema)
+    except Exception as e:
+        errors.append(f"the schema cannot be shown in the UI: {e}")
 
     for path in sorted((app_dir / "translations").glob("*.yaml")):
         data = yaml.safe_load(path.read_text())
