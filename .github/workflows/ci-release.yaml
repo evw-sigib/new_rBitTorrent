@@ -59,14 +59,15 @@ jobs:
       - name: Static musl cross-builds (zig cc)
         working-directory: ${{ env.CRATE_DIR }}
         run: |
-          echo "| target | rbittorrent-supervisor |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          # Sizes go to the job log as well as the step summary.
+          echo "| target | rbittorrent-supervisor |" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" | tee -a "$GITHUB_STEP_SUMMARY"
           for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             cargo zigbuild --locked --release --target "$t"
             f="target/$t/release/rbittorrent-supervisor"
             file "$f"
             file "$f" | grep -Eq 'statically linked|static-pie linked'
-            echo "| \`$t\` | $(stat -c %s "$f") bytes |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| \`$t\` | $(stat -c %s "$f") bytes |" | tee -a "$GITHUB_STEP_SUMMARY"
           done
           target/x86_64-unknown-linux-musl/release/rbittorrent-supervisor --version
 
@@ -260,7 +261,7 @@ jobs:
             echo "| image (uncompressed) | $((size / 1024 / 1024)) MiB |"
             echo "| rbittorrent-supervisor | $(stat -c %s rbittorrent-supervisor) bytes |"
             echo "| rtbit | $(stat -c %s rtbit) bytes |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: rtbit memory benchmark (native amd64 only)
         if: matrix.arch == 'amd64'
         env:
@@ -291,7 +292,7 @@ jobs:
           {
             echo "| rtbit idle RSS (musl, amd64 runner) | ${idle} KiB |"
             echo "| rtbit RSS after setup + 3 logins | ${after} KiB |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Log in to GHCR
         if: github.event_name == 'push'
         uses: docker/login-action@v3
