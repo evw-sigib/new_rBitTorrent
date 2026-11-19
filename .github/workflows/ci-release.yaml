@@ -46,7 +46,13 @@ jobs:
       - name: nftables ruleset in the real kernel (private netns)
         working-directory: ${{ env.CRATE_DIR }}
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq nftables
+          # Ubuntu's mirrors answer 503 now and then: retry before failing.
+          for i in 1 2 3 4; do
+            sudo apt-get -o Acquire::Retries=5 update -qq \
+              && sudo apt-get -o Acquire::Retries=5 install -y -qq nftables && break
+            [ "$i" = 4 ] && exit 1
+            sleep $((i * 15))
+          done
           # The library's unit-test binary (the only one with nft_live).
           BIN=$(cargo test --locked --lib --no-run --message-format=json \
             | jq -r 'select(.profile.test == true and .executable != null and .target.kind == ["lib"]) | .executable')
@@ -115,8 +121,14 @@ jobs:
         run: cargo build --locked --release
       - name: Install kernel tooling
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq wireguard-tools nftables iproute2
+          # Ubuntu's mirrors answer 503 now and then: retry before failing.
+          for i in 1 2 3 4; do
+            sudo apt-get -o Acquire::Retries=5 update -qq \
+              && sudo apt-get -o Acquire::Retries=5 install -y -qq \
+                wireguard-tools nftables iproute2 && break
+            [ "$i" = 4 ] && exit 1
+            sleep $((i * 15))
+          done
           sudo modprobe wireguard
       - name: Run end-to-end test in network namespaces
         run: sudo python3 "$APP_DIR/tests/e2e_netns.py" --supervisor "$CRATE_DIR/target/release/rbittorrent-supervisor"
