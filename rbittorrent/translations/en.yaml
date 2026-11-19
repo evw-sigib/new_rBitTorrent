@@ -118,7 +118,10 @@ configuration:
     description: >-
       Finished torrents are moved here. Must be below /media, /share or
       /config. Keep it on the same disk as the download folder (and as your
-      media library, for Sonarr/Radarr hardlinks).
+      media library, for Sonarr/Radarr hardlinks). Clear it to keep finished
+      torrents in the download folder, as qBittorrent does by default.
+      Torrents saved elsewhere (a category folder, a path Sonarr/Radarr
+      chose) are never moved.
   local_allow_cidrs:
     name: LAN networks allowed to reach port 8080
     description: >-
@@ -136,10 +139,10 @@ configuration:
   allow_unsandboxed:
     name: Allow running without the filesystem sandbox
     description: >-
-      Leave this off. With the VPN on, the app refuses to start when the
-      kernel cannot confine rtbit with Landlock, because rtbit could then
-      read your WireGuard key, the Web UI password and other apps' files.
-      Turn it on only to accept that risk on an old kernel.
+      Leave this off. The app refuses to start when neither its AppArmor
+      profile nor Landlock can confine rtbit, because rtbit could then read
+      your WireGuard key, the Web UI password and other apps' files. Turn it
+      on only to accept that risk on a host without either.
 network:
   8080/tcp: >-
     Web UI and qBittorrent-compatible API on qBittorrent's own default port,

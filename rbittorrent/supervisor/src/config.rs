@@ -106,7 +106,11 @@ pub struct Options {
     pub enable_nat_pmp: bool,
     pub listen_port: u16,
     pub download_dir: String,
-    pub completed_dir: String,
+    /// Where finished torrents are moved. Unset: they stay in `download_dir`
+    /// (qBittorrent's default, `TempPathEnabled=false`). A missing key means
+    /// unset, not the default folder, so the field has its own default.
+    #[serde(default)]
+    pub completed_dir: Option<String>,
     pub local_allow_cidrs: Vec<String>,
     pub log_level: LogLevel,
     pub webui_username: String,
@@ -136,7 +140,7 @@ impl Default for Options {
             enable_nat_pmp: true,
             listen_port: DEFAULT_LISTEN_PORT,
             download_dir: "/media/rbittorrent/downloads".to_owned(),
-            completed_dir: "/media/rbittorrent/completed".to_owned(),
+            completed_dir: Some("/media/rbittorrent/completed".to_owned()),
             local_allow_cidrs: vec![
                 "172.30.32.0/23".to_owned(),
                 "172.16.0.0/12".to_owned(),
@@ -904,7 +908,8 @@ pub struct Settings {
     /// NAT-PMP), or the fallback until NAT-PMP leases one.
     pub fallback_listen_port: u16,
     pub download_dir: PathBuf,
-    pub completed_dir: PathBuf,
+    /// `None`: finished torrents stay where they were downloaded.
+    pub completed_dir: Option<PathBuf>,
     /// `XDG_DATA_HOME` for rtbit (session, RSS, credentials, fast-resume).
     pub data_home: PathBuf,
     /// `XDG_CACHE_HOME` for rtbit (DHT routing table, rebuildable).
@@ -982,6 +987,20 @@ fn parse_ipv4_list(
 /// /media, /share or /config).
 pub fn validate_data_path(raw: &str) -> Result<PathBuf> {
     validate_data_dir("path", raw)
+}
+
+/// The folders rtbit may write (the Landlock policy's data folders): the
+/// shared storage, plus the download and completed folders when they lie
+/// elsewhere (below `/config`). Torrents and categories the qBittorrent
+/// import adds must save below one of these.
+pub fn writable_roots(download_dir: &Path, completed_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = vec![PathBuf::from("/media"), PathBuf::from("/share")];
+    for p in std::iter::once(download_dir).chain(completed_dir) {
+        if !roots.iter().any(|r| p.starts_with(r)) {
+            roots.push(p.to_path_buf());
+        }
+    }
+    roots
 }
 
 fn validate_data_dir(field: &str, raw: &str) -> Result<PathBuf> {
@@ -1347,17 +1366,22 @@ impl Settings {
         }
 
         let download_dir = validate_data_dir("download_dir", &opts.download_dir)?;
-        let completed_dir = validate_data_dir("completed_dir", &opts.completed_dir)?;
-        if download_dir == completed_dir {
-            bail!("`download_dir` and `completed_dir` must be different folders");
-        }
-        let mount_root = |p: &Path| p.components().nth(1).map(|c| c.as_os_str().to_owned());
-        if mount_root(&download_dir) != mount_root(&completed_dir) {
-            notes.push(
-                "download_dir and completed_dir are on different mounts; moving finished \
-                 torrents will copy the data instead of renaming it"
-                    .to_owned(),
-            );
+        let completed_dir = match opts.completed_dir.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(raw) => Some(validate_data_dir("completed_dir", raw)?),
+        };
+        if let Some(done) = &completed_dir {
+            if download_dir == *done {
+                bail!("`download_dir` and `completed_dir` must be different folders");
+            }
+            let mount_root = |p: &Path| p.components().nth(1).map(|c| c.as_os_str().to_owned());
+            if mount_root(&download_dir) != mount_root(done) {
+                notes.push(
+                    "download_dir and completed_dir are on different mounts; moving finished \
+                     torrents will copy the data instead of renaming it"
+                        .to_owned(),
+                );
+            }
         }
 
         let (webui_username, webui_password) = validate_webui_credentials(opts)?;
@@ -2093,7 +2117,22 @@ Endpoint = 190.2.131.156:51820\r\n";
         assert!(vpn(&s).nat_pmp.is_none(), "static port mode");
         assert_eq!(s.static_bt_ports(), vec![DEFAULT_LISTEN_PORT]);
         assert_eq!(s.download_dir, PathBuf::from("/share/rt/incomplete"));
+        assert_eq!(s.completed_dir, Some(PathBuf::from("/share/rt/done")));
         assert_eq!(s.data_home, PathBuf::from("/config/db"));
+        // No completed folder: the key removed, or left empty in the form.
+        // (Not the default folder: that would move finished torrents.)
+        for json in [
+            r#"{}"#,
+            r#"{"completed_dir": ""}"#,
+            r#"{"completed_dir": null}"#,
+        ] {
+            let o = Options::from_json(json).unwrap();
+            assert!(settings(&o).unwrap().completed_dir.is_none(), "{json}");
+        }
+        assert_eq!(
+            Options::default().completed_dir.as_deref(),
+            Some("/media/rbittorrent/completed")
+        );
         assert_eq!(s.cache_home, PathBuf::from("/config/cache"));
         let cidrs: Vec<String> = s
             .local_allow_cidrs
@@ -2106,6 +2145,19 @@ Endpoint = 190.2.131.156:51820\r\n";
         );
         assert!(Options::from_json("{not json").is_err());
         assert!(Options::from_json(r#"{"log_level": "loud"}"#).is_err());
+    }
+
+    #[test]
+    fn writable_roots_add_folders_outside_the_shared_storage() {
+        let p = PathBuf::from;
+        assert_eq!(
+            writable_roots(Path::new("/media/dl"), Some(Path::new("/share/done"))),
+            vec![p("/media"), p("/share")]
+        );
+        assert_eq!(
+            writable_roots(Path::new("/config/dl"), None),
+            vec![p("/media"), p("/share"), p("/config/dl")]
+        );
     }
 
     #[test]

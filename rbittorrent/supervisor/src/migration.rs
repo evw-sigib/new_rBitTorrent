@@ -99,7 +99,10 @@ pub struct LegacyInstall {
 
 impl LegacyInstall {
     fn is_useful(&self) -> bool {
-        self.conf.is_some()
+        // A walk cut short may have missed a WireGuard file: keep it, so the
+        // takeover fails closed instead of the install being ignored.
+        self.truncated
+            || self.conf.is_some()
             || self.categories.is_some()
             || self.bt_backup.is_some()
             || !self.wireguard.is_empty()
@@ -258,6 +261,9 @@ pub struct LegacyConf {
     pub temp_enabled: bool,
     pub username: Option<String>,
     pub webui_port: Option<u16>,
+    /// The network interface qBittorrent was bound to (`Session\Interface`),
+    /// e.g. `tun0` behind a VPN.
+    pub interface: Option<String>,
 }
 
 /// Parses the Qt INI file. `Session\...` (qBittorrent 4.4+) wins over the
@@ -287,7 +293,23 @@ pub fn parse_qbittorrent_conf(text: &str) -> LegacyConf {
         temp_enabled: bool_of(&["Session\\TempPathEnabled", "Downloads\\TempPathEnabled"]),
         username: get(&["WebUI\\Username"]),
         webui_port: get(&["WebUI\\Port"]).and_then(|p| p.parse().ok()),
+        interface: get(&[
+            "Session\\Interface",
+            "Connection\\Interface",
+            "Session\\InterfaceName",
+            "Connection\\InterfaceName",
+        ])
+        .map(|v| v.trim().to_owned()),
     }
+}
+
+/// Whether an interface name is a VPN's: OpenVPN (`tun*`, `tap*`),
+/// WireGuard (`wg*`), NordLynx, Proton, PPP-based VPNs.
+pub fn is_vpn_interface(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    ["tun", "tap", "wg", "nordlynx", "proton", "ppp", "vpn"]
+        .iter()
+        .any(|p| n.starts_with(p))
 }
 
 fn unquote(v: &str) -> String {
@@ -537,11 +559,16 @@ pub fn path_allowed(p: &str, roots: &[PathBuf]) -> bool {
 pub fn apply_record(o: &mut Options, rec: &Record) -> Vec<String> {
     let defaults = Options::default();
     let mut applied = Vec::new();
-    if let (Some(dl), Some(done)) = (&rec.download_dir, &rec.completed_dir) {
+    // `completed_dir: None` with a download folder: qBittorrent downloaded
+    // straight into its save path (no temporary folder), and so does rtbit.
+    if let Some(dl) = &rec.download_dir {
         if o.download_dir == defaults.download_dir && o.completed_dir == defaults.completed_dir {
             o.download_dir.clone_from(dl);
-            o.completed_dir.clone_from(done);
-            applied.push(format!("folders {done} (incomplete: {dl})"));
+            o.completed_dir.clone_from(&rec.completed_dir);
+            applied.push(match &rec.completed_dir {
+                Some(done) => format!("folders {done} (incomplete: {dl})"),
+                None => format!("folder {dl} (no separate completed folder)"),
+            });
         } else {
             debug!("download folders set in the options; the imported ones are not used");
         }
@@ -579,14 +606,19 @@ pub fn build_record(installs: &[LegacyInstall], now: u64) -> (Record, Vec<String
         .map(|t| parse_qbittorrent_conf(&t))
         .unwrap_or_default();
     if let Some(save) = conf.save_path.clone() {
+        // qBittorrent's default keeps no temporary folder: torrents download
+        // into the save path and stay there.
         let temp = conf
             .temp_path
             .clone()
-            .filter(|t| conf.temp_enabled && *t != save)
-            .unwrap_or_else(|| format!("{save}/incomplete"));
-        if data_path_ok(&save) && data_path_ok(&temp) {
-            rec.completed_dir = Some(save);
-            rec.download_dir = Some(temp);
+            .filter(|t| conf.temp_enabled && *t != save);
+        if data_path_ok(&save) && temp.as_deref().is_none_or(data_path_ok) {
+            if let Some(temp) = temp {
+                rec.completed_dir = Some(save);
+                rec.download_dir = Some(temp);
+            } else {
+                rec.download_dir = Some(save);
+            }
         } else {
             notes.push(format!(
                 "qBittorrent's save path {save} is outside /media, /share and /config; \
@@ -615,7 +647,12 @@ pub fn build_record(installs: &[LegacyInstall], now: u64) -> (Record, Vec<String
             config::WEBUI_PORT
         ));
     }
-    let default_save = rec.completed_dir.clone();
+    // qBittorrent's save path: categories without their own folder use
+    // `<save path>/<category>`.
+    let default_save = rec
+        .completed_dir
+        .clone()
+        .or_else(|| rec.download_dir.clone());
     for install in installs {
         let Some(text) = install
             .categories
@@ -756,7 +793,8 @@ pub fn prepare(o: &mut Options, roots: &Roots) -> Migration {
     // there). Same treatment: VPN mode stays on, so the start stops.
     if wireguard_options_empty(o)
         && !config::path_present(&wg0)
-        && let Some(reason) = openvpn_without_wireguard(&installs)
+        && let Some(reason) =
+            openvpn_without_wireguard(&installs).or_else(|| vpn_interface_binding(&installs))
     {
         error!("qBittorrent import: {reason}");
         error!(
@@ -836,6 +874,22 @@ fn take_over_wireguard(installs: &[LegacyInstall], wg0: &Path, rec: &mut Record)
     }
 }
 
+/// qBittorrent was bound to a VPN interface (and no WireGuard config was
+/// taken over): it only ever ran behind a VPN.
+fn vpn_interface_binding(installs: &[LegacyInstall]) -> Option<String> {
+    installs.iter().find_map(|i| {
+        let text = read_small(i.conf.as_deref()?, MAX_TEXT_FILE)?;
+        let iface = parse_qbittorrent_conf(&text).interface?;
+        is_vpn_interface(&iface).then(|| {
+            format!(
+                "qBittorrent ({}) was bound to the VPN interface `{iface}`, and no WireGuard \
+                 config was found to take over",
+                i.label()
+            )
+        })
+    })
+}
+
 /// The old app had OpenVPN profiles and no WireGuard config was taken over.
 fn openvpn_without_wireguard(installs: &[LegacyInstall]) -> Option<String> {
     let all: Vec<&PathBuf> = installs.iter().flat_map(|i| &i.openvpn).collect();
@@ -866,6 +920,8 @@ pub struct SeedReport {
     pub categories_created: usize,
     pub categories_existing: usize,
     pub category_errors: Vec<String>,
+    /// Categories created without their qBittorrent folder.
+    pub category_notes: Vec<String>,
     pub torrents_added: usize,
     pub torrents_skipped: Vec<String>,
     pub torrents_failed: Vec<String>,
@@ -909,7 +965,8 @@ pub struct SeedJob {
     pub username: String,
     pub password: Secret,
     pub config_root: PathBuf,
-    /// Save paths must lie below one of these ([`default_data_roots`]).
+    /// Save paths must lie below one of these: the folders rtbit's sandbox
+    /// lets it write ([`config::writable_roots`]).
     pub data_roots: Vec<PathBuf>,
     pub migration: Migration,
 }
@@ -930,7 +987,19 @@ pub async fn seed(job: SeedJob) -> Result<SeedReport> {
         && let Some(rec) = &m.record
     {
         for (name, path) in &rec.categories {
-            match api.create_category(name, path.as_deref()).await {
+            // A folder rtbit cannot write would fail every download in it.
+            let path = path.as_deref().filter(|p| {
+                let ok = path_allowed(p, &job.data_roots);
+                if !ok {
+                    report.category_notes.push(format!(
+                        "category `{name}`: {p} is outside the folders rtbit may write ({}); \
+                         it uses the default folder",
+                        roots_list(&job.data_roots)
+                    ));
+                }
+                ok
+            });
+            match api.create_category(name, path).await {
                 Ok(CategoryOutcome::Created) => report.categories_created += 1,
                 Ok(CategoryOutcome::AlreadyExists) => report.categories_existing += 1,
                 Err(e) => {
@@ -1010,6 +1079,14 @@ pub fn list_backup(dir: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
     Ok(out)
 }
 
+fn roots_list(roots: &[PathBuf]) -> String {
+    roots
+        .iter()
+        .map(|r| r.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Checks one torrent and turns it into an upload, or says why not.
 pub fn prepare_upload(
     torrent: &Path,
@@ -1024,7 +1101,10 @@ pub fn prepare_upload(
         bail!("no save path in its .fastresume");
     };
     if !path_allowed(save, data_roots) {
-        bail!("save path {save} is outside /media, /share and /config");
+        bail!(
+            "save path {save} is outside the folders rtbit may write ({})",
+            roots_list(data_roots)
+        );
     }
     if !Path::new(save).is_dir() {
         bail!("save path {save} does not exist (disk not mounted?)");
@@ -1085,6 +1165,9 @@ pub fn log_report(report: &SeedReport) {
     for e in &report.category_errors {
         let _ = write!(s, "\n  category error: {e}");
     }
+    for n in &report.category_notes {
+        let _ = write!(s, "\n  {n}");
+    }
     for e in report.torrents_skipped.iter().take(50) {
         let _ = write!(s, "\n  skipped: {e}");
     }
@@ -1100,6 +1183,7 @@ pub fn log_report(report: &SeedReport) {
         );
     }
     if report.category_errors.is_empty()
+        && report.category_notes.is_empty()
         && report.torrents_skipped.is_empty()
         && report.torrents_failed.is_empty()
     {
@@ -1145,6 +1229,7 @@ mod tests {
                 temp_enabled: true,
                 username: Some("homer".into()),
                 webui_port: Some(8081),
+                interface: None,
             }
         );
         let old = parse_qbittorrent_conf(
@@ -1285,8 +1370,9 @@ mod tests {
             std::fs::metadata(&wg0).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert_eq!(o.completed_dir, "/share/qBittorrent");
-        assert_eq!(o.download_dir, "/share/qBittorrent/incomplete");
+        // qBittorrent kept no temporary folder: neither does rtbit.
+        assert_eq!(o.download_dir, "/share/qBittorrent");
+        assert_eq!(o.completed_dir, None);
         assert_eq!(o.webui_username, "homer");
         let rec = m.record.clone().unwrap();
         assert_eq!(rec.categories.len(), 2);
@@ -1313,7 +1399,8 @@ mod tests {
         let mut o2 = Options::default();
         let m2 = prepare(&mut o2, &r);
         assert!(!m2.fresh && m2.torrents_from.is_none());
-        assert_eq!(o2.completed_dir, "/share/qBittorrent");
+        assert_eq!(o2.download_dir, "/share/qBittorrent");
+        assert_eq!(o2.completed_dir, None);
         assert!(m2.status.starts_with("done earlier"));
         // Turning on the torrent import later still works.
         let mut o3 = Options {
@@ -1334,7 +1421,7 @@ mod tests {
         let mut o = Options {
             wireguard_conf: Some(WG.into()),
             download_dir: "/media/dl".into(),
-            completed_dir: "/media/done".into(),
+            completed_dir: Some("/media/done".into()),
             webui_username: "marge".into(),
             ..Options::default()
         };
@@ -1346,7 +1433,7 @@ mod tests {
         assert_eq!(
             (
                 o.download_dir.as_str(),
-                o.completed_dir.as_str(),
+                o.completed_dir.as_deref().unwrap_or_default(),
                 o.webui_username.as_str()
             ),
             ("/media/dl", "/media/done", "marge")
@@ -1546,6 +1633,67 @@ mod tests {
         assert!(base.join("config/wg0.conf").exists(), "{}", m.status);
         assert!(!m.status.starts_with("stopped:"), "{}", m.status);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_vpn_interface_binding_without_wireguard_keeps_vpn_mode_on() {
+        for iface in ["tun0", "wg0", "tap1", "nordlynx", "proton0", "ppp0"] {
+            assert!(is_vpn_interface(iface), "{iface}");
+        }
+        for iface in ["eth0", "enp3s0", "wlan0", "br0", "lo"] {
+            assert!(!is_vpn_interface(iface), "{iface}");
+        }
+        let conf = parse_qbittorrent_conf(
+            "[BitTorrent]\nSession\\Interface=tun0\nSession\\InterfaceName=tun0\n",
+        );
+        assert_eq!(conf.interface.as_deref(), Some("tun0"));
+        let old = parse_qbittorrent_conf("[Preferences]\nConnection\\Interface=wg0\n");
+        assert_eq!(old.interface.as_deref(), Some("wg0"));
+
+        let base = tmp("iface-fail-closed");
+        let r = roots(&base);
+        let app = legacy(&base);
+        // The VPN ran outside the app (another container, the router): no
+        // WireGuard or OpenVPN files, only the binding in qBittorrent.conf.
+        std::fs::remove_dir_all(app.join("wireguard")).unwrap();
+        let conf = app.join("qBittorrent/qBittorrent.conf");
+        let text = std::fs::read_to_string(&conf).unwrap();
+        std::fs::write(
+            &conf,
+            text.replace("[BitTorrent]\n", "[BitTorrent]\nSession\\Interface=tun0\n"),
+        )
+        .unwrap();
+        let mut o = Options::default();
+        let m = prepare(&mut o, &r);
+        assert!(o.vpn_enabled, "VPN mode must stay on");
+        assert!(m.status.contains("`tun0`"), "{}", m.status);
+        assert!(m.status.starts_with("stopped:"), "{}", m.status);
+        assert!(m.record.is_none() && !base.join("config/.migrated").exists());
+        // Bound to the LAN interface: an ordinary import.
+        std::fs::write(
+            &conf,
+            text.replace("[BitTorrent]\n", "[BitTorrent]\nSession\\Interface=eth0\n"),
+        )
+        .unwrap();
+        let mut o = Options::default();
+        let m = prepare(&mut o, &r);
+        assert!(
+            !o.vpn_enabled && !m.status.starts_with("stopped:"),
+            "{}",
+            m.status
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_truncated_scan_is_never_dropped() {
+        let cut = LegacyInstall {
+            root: "/share/qbittorrent".into(),
+            truncated: true,
+            ..LegacyInstall::default()
+        };
+        assert!(cut.is_useful());
+        assert!(!LegacyInstall::default().is_useful());
     }
 
     #[test]

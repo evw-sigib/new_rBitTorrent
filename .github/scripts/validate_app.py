@@ -10,13 +10,17 @@ repository's security policy.
 """
 
 import logging
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import yaml
 
 from supervisor.apps.options import AppOptions, UiOptions
 from supervisor.apps.validate import SCHEMA_APP_CONFIG, SCHEMA_APP_TRANSLATIONS
+from supervisor.utils.apparmor import adjust_profile, get_profile_name
 
 FORBIDDEN_CAPS = {"SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_RAWIO", "BPF", "PERFMON"}
 FORBIDDEN_TRUE = ("full_access", "host_network", "host_pid", "docker_api", "kernel_modules",
@@ -33,6 +37,38 @@ class Collect(logging.Handler):
 
     def emit(self, record):
         self.records.append(record.getMessage())
+
+
+def check_apparmor(profile: Path, slug: str) -> list:
+    """apparmor.txt as the Supervisor loads it: exactly one top-level
+    profile, renamed to the app's slug, with the rtbit and ingress child
+    profiles the supervisor verifies at runtime."""
+    errors = []
+    print(f"apparmor.txt: profile {get_profile_name(profile)!r}")
+    text = profile.read_text()
+    for child in ("rtbit", "ingress"):
+        if f"profile {child} " not in text or f"cx -> {child}," not in text:
+            errors.append(f"apparmor.txt has no child profile `{child}` with a cx transition")
+    with tempfile.TemporaryDirectory() as tmp:
+        adjusted = Path(tmp) / "profile"
+        adjust_profile(slug, profile, adjusted)
+        if get_profile_name(adjusted) != slug:
+            errors.append(f"the Supervisor's rename does not yield profile {slug!r}")
+        parser = shutil.which("apparmor_parser")
+        if parser is None:
+            print("apparmor.txt: apparmor_parser not installed, compile check skipped")
+            return errors
+        # -N: the names of the profiles the file defines (no kernel needed).
+        out = subprocess.run([parser, "-Q", "-K", "-T", "-N", str(adjusted)],
+                             capture_output=True, text=True)
+        names = set(out.stdout.split())
+        want = {slug, f"{slug}//rtbit", f"{slug}//ingress"}
+        if out.returncode != 0 or names != want:
+            errors.append(f"apparmor_parser: {out.stderr.strip() or sorted(names)} "
+                          f"(want {sorted(want)})")
+        else:
+            print(f"apparmor.txt: compiles to {', '.join(sorted(names))}")
+    return errors
 
 
 def main(app_dir: Path) -> int:
@@ -90,8 +126,17 @@ def main(app_dir: Path) -> int:
     for key in FORBIDDEN_TRUE:
         if cfg.get(key):
             errors.append(f"'{key}: true' is forbidden")
-    if cfg.get("devices") != ["/dev/net/tun"]:
-        errors.append(f"devices must be exactly [/dev/net/tun], got {cfg.get('devices')}")
+    # Kernel WireGuard needs no device node (/dev/net/tun is for userspace VPNs).
+    if cfg.get("devices"):
+        errors.append(f"no devices may be mapped, got {cfg.get('devices')}")
+    # The AppArmor profile is the filesystem sandbox on Home Assistant OS.
+    if cfg.get("apparmor") is False:
+        errors.append("apparmor must not be disabled (apparmor.txt confines rtbit)")
+    profile = app_dir / "apparmor.txt"
+    if not profile.is_file():
+        errors.append("apparmor.txt is missing")
+    else:
+        errors += check_apparmor(profile, f"local_{cfg['slug']}")
     if cfg.get("init") is not False:
         errors.append("init must be false (the supervisor is PID 1)")
     maps = {str(m["type"]) for m in cfg["map"]}
@@ -112,8 +157,8 @@ def main(app_dir: Path) -> int:
     for e in errors:
         print(f"ERROR: {e}")
     if not errors:
-        print("policy: ok (NET_ADMIN only, /dev/net/tun only, no full_access/host_network, "
-              "app configs read-only, default Supervisor role)")
+        print("policy: ok (NET_ADMIN only, no devices, AppArmor profile, no "
+              "full_access/host_network, app configs read-only, default Supervisor role)")
     return 1 if errors else 0
 
 

@@ -59,6 +59,53 @@ impl std::fmt::Debug for SupervisorApi {
     }
 }
 
+/// The token, once [`take_token_from_env`] moved it out of the environment.
+static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// The variables Home Assistant puts the Supervisor token in.
+const TOKEN_VARS: [&str; 2] = ["SUPERVISOR_TOKEN", "HASSIO_TOKEN"];
+
+/// Moves the Supervisor token out of the process environment. Call it first
+/// in `main`, before any thread or child exists.
+///
+/// `/proc/<pid>/environ` is the environment block `execve` set up, not the
+/// `environ` array, so `unsetenv` alone would leave the token readable to any
+/// process allowed to read PID 1's environment. The token is copied, its
+/// bytes in that block are overwritten with NULs, and the variables are
+/// removed.
+pub fn take_token_from_env() {
+    TOKEN.get_or_init(scrub_token);
+}
+
+fn scrub_token() -> Option<String> {
+    let mut token = None;
+    for name in TOKEN_VARS {
+        let Ok(c_name) = std::ffi::CString::new(name) else {
+            continue;
+        };
+        // SAFETY: called once at startup, before any other thread exists;
+        // getenv returns a pointer into the environment block or NULL.
+        let value = unsafe { libc::getenv(c_name.as_ptr()) };
+        if value.is_null() {
+            continue;
+        }
+        // SAFETY: a NUL-terminated string in the environment block.
+        let len = unsafe { libc::strlen(value) };
+        // SAFETY: `len` bytes starting at `value` are that string.
+        let bytes = unsafe { std::slice::from_raw_parts(value.cast::<u8>(), len) };
+        let v = String::from_utf8_lossy(bytes).trim().to_owned();
+        if token.is_none() && !v.is_empty() {
+            token = Some(v);
+        }
+        // SAFETY: overwrites exactly the value's own bytes (writable: the
+        // block lives on the initial stack); its terminating NUL stays.
+        unsafe { std::ptr::write_bytes(value, 0, len) };
+        // SAFETY: still single-threaded (see above).
+        unsafe { std::env::remove_var(name) };
+    }
+    token
+}
+
 impl SupervisorApi {
     pub fn new(addr: SocketAddr, token: String) -> Self {
         Self { addr, token }
@@ -66,10 +113,11 @@ impl SupervisorApi {
 
     /// `SUPERVISOR_TOKEN` is only set inside a Home Assistant app.
     pub async fn from_env() -> Option<Self> {
-        let token = std::env::var("SUPERVISOR_TOKEN")
-            .or_else(|_| std::env::var("HASSIO_TOKEN"))
-            .ok()
-            .filter(|t| !t.trim().is_empty())?;
+        let token = match TOKEN.get() {
+            Some(t) => t.clone(),
+            None => TOKEN_VARS.iter().find_map(|v| std::env::var(v).ok()),
+        }
+        .filter(|t| !t.trim().is_empty())?;
         let addr = match tokio::time::timeout(TIMEOUT, tokio::net::lookup_host(("supervisor", 80)))
             .await
         {

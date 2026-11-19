@@ -21,10 +21,10 @@ stage: experimental
 
 # Kernel WireGuard + nftables need NET_ADMIN only. No SYS_ADMIN, no
 # SYS_MODULE, no full_access, no host_network.
+# Kernel WireGuard needs no /dev/net/tun. apparmor.txt confines rtbit and the
+# Ingress proxy (Home Assistant OS has no Landlock).
 privileged:
   - NET_ADMIN
-devices:
-  - /dev/net/tun
 
 # Default role only (no hassio_role): used to warn about a qBittorrent app
 # that is still running and to offer the qBittorrent integration through
@@ -122,7 +122,7 @@ schema:
   nat_pmp_gateway: str
   listen_port: port
   download_dir: str
-  completed_dir: str
+  completed_dir: str?
   local_allow_cidrs:
     - str
   log_level: list(trace|debug|info|warn|error)

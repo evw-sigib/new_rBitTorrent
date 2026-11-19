@@ -36,18 +36,26 @@ RUN git clone --depth 1 --branch "${RTBIT_TAG}" "${RTBIT_REPO}" . \
 # swagger-vendored.patch is build-only: Swagger UI (rtbit's /swagger page)
 # comes from a checksum-pinned crate instead of a curl download from
 # github.com inside build.rs.
-# ipv4-fallback.patch: the DHT and the UDP tracker client open [::] sockets
-# even with RTBIT_IPV4_ONLY, so a host booted with ipv6.disable=1 made rtbit
-# exit at once; they now fall back to 0.0.0.0.
-# The order matters: the later patches are made on top of mimalloc.patch.
-COPY rtbit/mimalloc.patch rtbit/auth-banner.patch rtbit/swagger-vendored.patch rtbit/ipv4-fallback.patch /tmp/
+# ipv4-fallback.patch: with RTBIT_IPV4_ONLY the DHT and the UDP tracker
+# client open 0.0.0.0 instead of [::] (upstream ignored the flag there), and
+# without it they fall back to 0.0.0.0 when the kernel has no IPv6
+# (ipv6.disable=1 made upstream exit at once).
+# completed-move.patch: only torrents still in the download folder are moved
+# to the completed folder. Upstream also moved torrents saved elsewhere and,
+# on every restart, flattened finished multi-file torrents into it.
+# The order matters: auth-banner and swagger-vendored are made on top of
+# mimalloc.patch, completed-move on top of ipv4-fallback.
+COPY rtbit/mimalloc.patch rtbit/auth-banner.patch rtbit/swagger-vendored.patch \
+     rtbit/ipv4-fallback.patch rtbit/completed-move.patch /tmp/
 RUN git apply --verbose /tmp/mimalloc.patch /tmp/auth-banner.patch /tmp/swagger-vendored.patch \
-      /tmp/ipv4-fallback.patch \
+      /tmp/ipv4-fallback.patch /tmp/completed-move.patch \
  && grep -q 'static GLOBAL: mimalloc::MiMalloc' crates/rtbit/src/main.rs \
  && grep -q 'store.username()' crates/rtbit/src/main.rs \
  && grep -q '"vendored"' crates/librtbit/Cargo.toml \
  && grep -q 'UDP trackers: cannot open' crates/librtbit-tracker-comms/src/tracker_comms_udp.rs \
- && grep -q 'DHT: cannot open' crates/librtbit-dht/src/dht.rs
+ && grep -q 'DHT: cannot open' crates/librtbit-dht/src/dht.rs \
+ && grep -q 'new_with_ipv4_only' crates/librtbit/src/session/mod.rs \
+ && grep -q 'outside the download folder, not moving it' crates/librtbit/src/session/mod.rs
 ENV OPENSSL_STATIC=1 \
     CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
     CARGO_PROFILE_RELEASE_OPT_LEVEL=3 \

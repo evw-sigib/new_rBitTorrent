@@ -1,0 +1,35 @@
+diff --git a/crates/librtbit/src/session/mod.rs b/crates/librtbit/src/session/mod.rs
+index a867d34..262e3ca 100644
+--- a/crates/librtbit/src/session/mod.rs
++++ b/crates/librtbit/src/session/mod.rs
+@@ -1786,9 +1786,27 @@ impl Session {
+         let category = handle.shared().category.read().clone();
+         let session_output =
+             expand_folder_template(&self.output_folder.read().clone(), category.as_deref());
+-        let relative_path = current_output
+-            .strip_prefix(&session_output)
+-            .unwrap_or(Path::new(""));
++        // Only torrents still in the session's download folder are moved. A
++        // torrent saved elsewhere (a category or custom save path, an
++        // imported torrent) stays where it is, and one that is already in the
++        // completed folder is not moved again when it is restored on the next
++        // start (strip_prefix would fail and flatten it into the target).
++        let Ok(relative_path) = current_output.strip_prefix(&session_output) else {
++            debug!(
++                id,
++                ?current_output,
++                "torrent is outside the download folder, not moving it"
++            );
++            return Ok(());
++        };
++        if current_output.starts_with(&target_folder) && target_folder.starts_with(&session_output)
++        {
++            debug!(
++                id,
++                "torrent is already in the completed folder, skipping move"
++            );
++            return Ok(());
++        }
+ 
+         let dest_base = if relative_path == Path::new("") {
+             target_folder.clone()

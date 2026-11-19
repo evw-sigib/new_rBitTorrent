@@ -385,14 +385,31 @@ pub fn render_direct_ruleset(spec: &DirectSpec) -> Result<String> {
         "\t\ttype filter hook input priority filter; policy accept;"
     );
     let _ = writeln!(s, "\t\tiifname \"lo\" accept");
+    let _ = writeln!(s, "\t\t{DIRECT_NO_IPV6}");
     let _ = writeln!(s, "\t\ttcp dport {ingress} ip saddr {ingress_src} accept");
     let _ = writeln!(s, "\t\ttcp dport {webui} ip saddr @{LAN_SET} accept");
-    // IPv6 never matches the IPv4 rules above, so it is dropped here too.
     let _ = writeln!(s, "\t\ttcp dport {{ {webui}, {ingress} }} drop");
     let _ = writeln!(s, "\t}}");
+    // IPv6 is dropped on every hook, as with the VPN on: the app is
+    // IPv4-only, and the docs promise that no IPv6 leaves it.
+    for (chain, iface) in [("forward", "iifname"), ("output", "oifname")] {
+        let _ = writeln!(s, "\tchain {chain} {{");
+        let _ = writeln!(
+            s,
+            "\t\ttype filter hook {chain} priority filter; policy accept;"
+        );
+        if chain == "output" {
+            let _ = writeln!(s, "\t\t{iface} \"lo\" accept");
+        }
+        let _ = writeln!(s, "\t\t{DIRECT_NO_IPV6}");
+        let _ = writeln!(s, "\t}}");
+    }
     let _ = writeln!(s, "}}");
     Ok(s)
 }
+
+/// The direct-mode IPv6 drop rule (after loopback).
+const DIRECT_NO_IPV6: &str = "meta nfproto ipv6 counter drop comment \"no IPv6\"";
 
 /// Installs the direct-mode table and reads it back.
 pub async fn install_direct(runner: &impl Runner, spec: &DirectSpec) -> Result<()> {
@@ -422,6 +439,16 @@ pub fn verify_direct_listing(listing: &str, spec: &DirectSpec) -> Result<()> {
     });
     if !has_input || !drops {
         bail!("direct-mode rules incomplete: no input rule dropping the Web UI and Ingress ports");
+    }
+    let ipv6_drops = listing
+        .lines()
+        .filter(|l| l.contains("meta nfproto ipv6") && l.contains("drop"))
+        .count();
+    if ipv6_drops < 3 {
+        bail!(
+            "direct-mode rules incomplete: IPv6 is not dropped on input, forward and output \
+             ({ipv6_drops} of 3 rules)"
+        );
     }
     Ok(())
 }
@@ -469,9 +496,25 @@ mod tests {
             vec![
                 "type filter hook input priority filter; policy accept;",
                 "iifname \"lo\" accept",
+                DIRECT_NO_IPV6,
                 "tcp dport 8099 ip saddr 172.30.32.0/23 accept",
                 "tcp dport 8080 ip saddr @lan_cidrs accept",
                 "tcp dport { 8080, 8099 } drop",
+            ]
+        );
+        assert_eq!(
+            chain(&r, "output"),
+            vec![
+                "type filter hook output priority filter; policy accept;",
+                "oifname \"lo\" accept",
+                DIRECT_NO_IPV6,
+            ]
+        );
+        assert_eq!(
+            chain(&r, "forward"),
+            vec![
+                "type filter hook forward priority filter; policy accept;",
+                DIRECT_NO_IPV6,
             ]
         );
         // Same port: no NAT chain at all.
@@ -482,19 +525,41 @@ mod tests {
         assert!(render_direct_ruleset(&direct_spec(0)).is_err());
     }
 
+    /// `nft list table inet direct` of a complete direct-mode table.
+    const DIRECT_LISTING: &str = "table inet direct {
+\tchain input {
+\t\ttype filter hook input priority filter; policy accept;
+\t\tiifname \"lo\" accept
+\t\tmeta nfproto ipv6 counter packets 0 bytes 0 drop comment \"no IPv6\"
+\t\ttcp dport { 8080, 8099 } drop
+\t}
+\tchain forward {
+\t\ttype filter hook forward priority filter; policy accept;
+\t\tmeta nfproto ipv6 counter packets 0 bytes 0 drop comment \"no IPv6\"
+\t}
+\tchain output {
+\t\ttype filter hook output priority filter; policy accept;
+\t\toifname \"lo\" accept
+\t\tmeta nfproto ipv6 counter packets 0 bytes 0 drop comment \"no IPv6\"
+\t}
+}
+";
+
     #[test]
     fn direct_mode_verification_fails_closed() {
         let sp = direct_spec(4240);
         assert!(verify_direct_listing("", &sp).is_err());
         assert!(verify_direct_listing("table inet direct {\n}\n", &sp).is_err());
-        let ok = "table inet direct {\n\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n\t\ttcp dport { 8080, 8099 } drop\n\t}\n}\n";
-        assert!(verify_direct_listing(ok, &sp).is_ok());
+        assert!(verify_direct_listing(DIRECT_LISTING, &sp).is_ok());
+        // Without the IPv6 drops it is incomplete.
+        let v4_only = "table inet direct {\n\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n\t\ttcp dport { 8080, 8099 } drop\n\t}\n}\n";
+        assert!(verify_direct_listing(v4_only, &sp).is_err());
     }
 
     #[tokio::test]
     async fn direct_install_pipes_the_script_and_reads_it_back() {
         let sp = direct_spec(51413);
-        let listing = "table inet direct {\n\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n\t\ttcp dport { 8080, 8099 } drop\n\t}\n}\n";
+        let listing = DIRECT_LISTING;
         let runner = FakeRunner::default();
         runner.respond("nft list table", listing);
         install_direct(&runner, &sp).await.unwrap();

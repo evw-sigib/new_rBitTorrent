@@ -45,9 +45,9 @@ or C NAT-PMP library.
 - **Home Assistant OS** (or Supervised) on aarch64 (Raspberry Pi 4/5, ...) or
   amd64. WireGuard is built into the HAOS kernel; the app never loads kernel
   modules.
-- A host booted with `ipv6.disable=1` works too: rtbit then opens IPv4
-  sockets only. IPv6 *traffic* is dropped either way, see
-  [Leak protection](#leak-protection).
+- rBittorrent is IPv4-only: all IPv6 traffic is dropped, with the VPN on
+  or off (see [Leak protection](#leak-protection)), and rtbit opens IPv4
+  sockets only. A host booted with `ipv6.disable=1` works too.
 
 ## Moving from qBittorrent
 
@@ -84,8 +84,8 @@ It never changes or deletes anything there.
 | What | From | When |
 |---|---|---|
 | WireGuard file | `wireguard/*.conf` or any `wg0.conf` in the profile | Only if this app has no `wg0.conf` and the VPN options are empty. Copied to `/config/wg0.conf` (mode 0600) and used as [method 1](#method-1-a-wg0conf-file-recommended). |
-| Completed folder | `Session\DefaultSavePath` in `qBittorrent.conf` | Only while `download_dir` and `completed_dir` are both at their defaults. |
-| Download folder | `Session\TempPath`, if the temp folder was enabled; otherwise `<save path>/incomplete` | As above. |
+| Download folder | `Session\TempPath` if qBittorrent's temp folder was enabled, otherwise its save path (`Session\DefaultSavePath`) | Only while `download_dir` and `completed_dir` are both at their defaults. |
+| Completed folder | The save path, if the temp folder was enabled; otherwise none, so torrents stay where they downloaded, as in qBittorrent | As above. |
 | Web UI user name | `WebUI\Username` | Only while `webui_username` is `admin`. |
 | Categories | `categories.json`, with their save paths | Always; existing categories are left alone. |
 | Torrents | `BT_backup/*.torrent` + `.fastresume` (save path, category, layout, paused state) | Only with `import_active_torrents` on. |
@@ -109,8 +109,16 @@ It never changes or deletes anything there.
   so nothing starts on your real IP address. Get a WireGuard config from your
   provider (Proton: [Proton VPN setup](#proton-vpn-setup)) and put it in
   `/config/wg0.conf`, or turn off **Import from qBittorrent**.
-- The same applies to WireGuard files that cannot be used: the import never
-  falls back to the direct connection.
+- The same applies when qBittorrent was bound to a VPN interface
+  (`Session\Interface` is `tun0`, `wg0`, `tap0`, `nordlynx`, `proton0`, ...)
+  and there is no WireGuard file, e.g. a VPN that ran in another container:
+  the log says `was bound to the VPN interface`.
+- And to WireGuard files that cannot be used, or an app folder too large to
+  scan completely: the import never falls back to the direct connection.
+- Category and torrent folders must be ones rtbit may write: below `/media`
+  or `/share`, or `download_dir` / `completed_dir` themselves. A category
+  elsewhere uses the default folder; such a torrent is skipped (both listed
+  in the log).
 
 ### Running it once, and again
 
@@ -180,8 +188,9 @@ On a direct connection, the log shows this at every start:
   UPnP stays off: the app never opens router ports by itself.
 - The Web UI and API port (8080) still only answers `local_allow_cidrs` and
   Home Assistant's own network; the Ingress port (8099) only answers Home
-  Assistant. A small nftables table (`inet direct`) enforces this; if it
-  cannot be loaded, the app stops instead of starting with the Web UI open.
+  Assistant. A small nftables table (`inet direct`) enforces this and drops
+  all IPv6, in and out; if it cannot be loaded, the app stops instead of
+  starting with the Web UI open.
 
 ## Proton VPN setup
 
@@ -378,10 +387,10 @@ page. Clear it to close the port. Inside the container it stays 8080.
 | `nat_pmp_gateway` | `10.2.0.1` | NAT-PMP gateway inside the tunnel (Proton's). |
 | `listen_port` | `4240` | BitTorrent port: the direct connection's port, the provider's fixed port with NAT-PMP off, or the port used until the first NAT-PMP lease. |
 | `download_dir` | `/media/rbittorrent/downloads` | Incomplete downloads. Below `/media`, `/share` or `/config`. |
-| `completed_dir` | `/media/rbittorrent/completed` | Finished torrents. Same rules. |
+| `completed_dir` | `/media/rbittorrent/completed` | Finished torrents are moved here. Same rules. Optional: clear it to keep them in `download_dir`. Only torrents directly in `download_dir` are moved; category folders and paths a client chose stay put. |
 | `local_allow_cidrs` | `172.30.32.0/23`, `172.16.0.0/12`, `192.168.0.0/16`, `10.0.0.0/8` | Networks that may reach port 8080. Private IPv4 ranges only; `172.30.32.0/23` is always added. |
 | `log_level` | `info` | `trace`, `debug`, `info`, `warn`, `error`. |
-| `allow_unsandboxed` | off (optional) | Start the VPN mode even if the kernel cannot sandbox rtbit, see [Filesystem sandbox](#filesystem-sandbox). Leave it off. |
+| `allow_unsandboxed` | off (optional) | Start even if neither AppArmor nor Landlock can sandbox rtbit, see [Filesystem sandbox](#filesystem-sandbox). Leave it off. |
 
 Notes:
 - **USB disk or SSD:** mount it in Home Assistant (*Settings* → *System* →
@@ -485,10 +494,10 @@ Routing:
 
 rtbit itself runs without any network capability and with `no_new_privs`;
 it keeps only the four file capabilities root needs on shared storage
-(`CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_FSETID`). A Landlock
-filesystem sandbox limits it to `/media`, `/share`, its download folders and
-its own state: `/data`, `/app_configs` and the WireGuard key in `/config` are
-out of reach. Its UPnP, LSD and IPv6 are off. (rtbit remembers a download
+(`CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_FSETID`). A
+[filesystem sandbox](#filesystem-sandbox) (AppArmor, plus Landlock where the
+kernel has it) limits it to `/media`, `/share` and its own state: `/data`,
+`/app_configs` and the WireGuard key in `/config` are out of reach. Its UPnP, LSD and IPv6 are off. (rtbit remembers a download
 folder chosen in its own Web UI, and that choice wins over `download_dir`;
 keep it under `/media` or `/share`, or the sandbox refuses the writes.) If the tunnel goes down, traffic stops: nothing falls back
 to your normal connection.
@@ -519,14 +528,19 @@ To check it yourself:
   log say `auth: enabled` for the login the supervisor stored (upstream
   printed "not set up" although the API was protected), and the build-only
   `rtbit/swagger-vendored.patch` takes the Swagger UI page from a
-  checksum-pinned crate. `rtbit/ipv4-fallback.patch` lets the DHT and the
-  UDP tracker client fall back to IPv4 sockets when the kernel has no IPv6
-  (`ipv6.disable=1`); upstream exited at once. Everything the build
-  downloads is pinned: crates by `Cargo.lock`, and the Web UI's npm
-  packages (rtbit's build runs `npm ci`) by upstream's `package-lock.json`.
-  The patches apply in this order, as the Dockerfile does: `mimalloc`,
-  `auth-banner`, `swagger-vendored`, `ipv4-fallback` (the middle two expect
-  the first one's changes).
+  checksum-pinned crate. `rtbit/ipv4-fallback.patch` makes rtbit's
+  IPv4-only mode open IPv4 sockets for the DHT and the UDP tracker client
+  (upstream opened `[::]` and exited at once on a host booted with
+  `ipv6.disable=1`). `rtbit/completed-move.patch` moves a finished torrent
+  to `completed_dir` only when it lies in `download_dir`: upstream also
+  moved torrents saved elsewhere (category folders, imported torrents,
+  paths Sonarr/Radarr chose) and flattened them into `completed_dir`, again
+  at every restart. Everything the build downloads is pinned: crates by
+  `Cargo.lock`, and the Web UI's npm packages (rtbit's build runs `npm ci`)
+  by upstream's `package-lock.json`. The patches apply in this order, as
+  the Dockerfile does: `mimalloc`, `auth-banner`, `swagger-vendored`,
+  `ipv4-fallback`, `completed-move` (each later one expects the earlier
+  ones' changes).
 - Its SHA-1 piece hashing picks ARMv8 or SHA-NI instructions at runtime. No
   `target-cpu` flags are set, so it also runs on a Raspberry Pi 3 or 4.
 - The [speed test](#speed-test) costs nothing while idle: its threads and
@@ -549,18 +563,22 @@ To check it yourself:
   warning and discovery. The Supervisor token never reaches rtbit.
 - **Other apps' folders:** mapped read-only (`all_app_configs`), only to find
   a qBittorrent profile.
-- **`/dev/net/tun`:** mapped as the app policy requires; kernel WireGuard
-  does not use it.
+- **Devices:** none. Kernel WireGuard does not need `/dev/net/tun`.
+- **AppArmor:** the app's own profile confines rtbit and the Ingress proxy,
+  see [Filesystem sandbox](#filesystem-sandbox).
 - **Secrets:** the WireGuard private key goes to `wg` on stdin only, never on
   a command line, in the environment or in the log. The Web UI password
   follows the same rule.
 - **Processes:** rtbit has no network capability, only the four file
   capabilities listed above; the proxy runs as uid 65534 with none at all.
   Both run with `no_new_privs`.
-- **Filesystem sandbox:** rtbit may write only to `/media`, `/share`, its
-  download folders and its own state, and the Ingress proxy may write
-  nowhere. With the VPN on, the app does not start without the sandbox, see
-  [Filesystem sandbox](#filesystem-sandbox).
+- **Filesystem sandbox:** rtbit may write only to `/media`, `/share` and its
+  own state, and the Ingress proxy may write nowhere. The app does not start
+  without the sandbox, see [Filesystem sandbox](#filesystem-sandbox).
+- **The supervisor's secrets:** the Supervisor token is wiped from the
+  process environment at start, and the supervisor is not dumpable, so rtbit
+  (root, but without `CAP_SYS_PTRACE`) cannot read its environment or
+  memory.
 - **Direct connection:** without a VPN, the app runs without a kill-switch
   and says so in the log and the sidebar. Any WireGuard setup switches the
   VPN on, and from then on it never falls back.
@@ -572,34 +590,53 @@ To check it yourself:
 
 rtbit runs as root with `CAP_DAC_OVERRIDE` so it can manage files other apps
 wrote to `/media` and `/share`. File permissions alone therefore cannot keep
-it away from your secrets. Landlock confines it by path instead:
+it away from your secrets. Two kernel features confine it by path instead,
+and the app uses every one the kernel has:
 
-- read and write: `/media`, `/share`, its download and completed folders,
-  and its own database and cache in `/config/db` and `/config/cache`;
+- **AppArmor** (Home Assistant OS, and Supervised installs on Debian). The
+  app ships its own profile, `apparmor.txt`, which Home Assistant loads for
+  it. rtbit and the Ingress proxy switch to child profiles of it when they
+  start. Home Assistant OS kernels have AppArmor but no Landlock, so this is
+  the sandbox there.
+- **Landlock** (Linux 5.19 or newer with Landlock among the kernel's security
+  modules, as on most current desktop and server distributions). It narrows
+  rtbit to the exact folders it was given.
+
+What rtbit can reach:
+
+- read and write: `/media`, `/share` and its own database and cache in
+  `/config/db` and `/config/cache` (with Landlock: only `/media`, `/share`,
+  its download and completed folders, and the database and cache);
 - read only: `/etc`, `/proc`, `/sys`, `/dev` and the system folders it
   starts from;
 - nothing else. `/config/wg0.conf`, `/config/.webui-password`,
-  `/data/options.json` and every other app's folder in `/app_configs` are out
-  of reach, even for root.
+  `/data/options.json`, every other app's folder in `/app_configs`, and the
+  supervisor's memory and environment are out of reach, even for root.
 
-The Ingress proxy gets a stricter policy: it may write nowhere.
+The Ingress proxy gets a stricter policy: it may write nowhere, and AppArmor
+also keeps it off the network except for TCP and UDP.
 
-Landlock needs Linux 5.19 or newer with Landlock in the kernel's list of
-security modules. The log line `rtbit filesystem sandbox active (Landlock
-ABI ...)` confirms it at every start, and `/__health` reports
-`"fs_sandbox": true`. A download folder you pick in rtbit's own Web UI must
-stay below `/media` or `/share`, or rtbit cannot write to it.
+The supervisor checks every start: it reads the label of each child it
+started and stops the child if it is not in its child profile. The log says
+which sandbox is active:
 
-**Fails closed with the VPN on.** On a kernel without Landlock (or with a
-seccomp profile that blocks it) the VPN mode refuses to start and says why:
-the point of the VPN mode is privacy, and the WireGuard key would be
-readable. If you accept the risk, enable *Show unused optional configuration
-options*, set `allow_unsandboxed: true` and start the app again.
+```text
+AppArmor profile `<slug>` confines the app; rtbit and the Ingress proxy start in its child profiles
+rtbit filesystem sandbox active (AppArmor `<slug>//rtbit`): ...
+```
 
-On a direct connection (VPN off) the app starts without the sandbox and warns
-instead. Either way, an unsandboxed rtbit is logged at every start and the
-sidebar's status bar shows **⚠ No filesystem sandbox** (it cannot be
-dismissed).
+With Landlock as well, the second line reads `(AppArmor ... + Landlock ABI
+N)`. `/__health` reports `"fs_sandbox": true`. A download folder you pick in
+rtbit's own Web UI must stay below `/media` or `/share`, or rtbit cannot
+write to it.
+
+**Fails closed.** When neither AppArmor nor Landlock can confine rtbit (for
+example a Supervised install whose host has AppArmor off, or a kernel without
+Landlock), the app refuses to start and says why, with the VPN on or off.
+If you accept the risk, enable *Show unused optional configuration options*,
+set `allow_unsandboxed: true` and start the app again. An unsandboxed rtbit
+is then logged at every start, and the sidebar's status bar shows
+**⚠ No filesystem sandbox** (it cannot be dismissed).
 
 ## Troubleshooting
 
@@ -611,11 +648,13 @@ dismissed).
 | `VPN OFF: rBittorrent uses your normal internet connection` | No WireGuard setup was found. See [Proton VPN setup](#proton-vpn-setup). |
 | `qBittorrent is still running` | Stop the old app and turn off its *Start on boot*. |
 | `qBittorrent import: ... is outside /media, /share and /config` | Set `download_dir` / `completed_dir` yourself. |
+| `... is outside the folders rtbit may write` | A qBittorrent category or torrent used a folder the sandbox does not allow (below `/config`, but not `download_dir` or `completed_dir`). The category uses the default folder; the torrent is skipped. Move the data below `/media` or `/share`. |
 | `rtbit refused the Web UI login` | The import retries on the next start. Check `webui_username` / `webui_password`. |
 | `no WireGuard handshake with ...` | Wrong key or endpoint, or the configuration was revoked in your Proton account. Generate a new one. |
 | `has not answered for 10 minutes` | The Proton server is down or your key was revoked. Restart the app, or use another server. |
 | `Proton VPN did not grant a forwarded port` | See [Port forwarding](#port-forwarding-nat-pmp). |
-| `the filesystem sandbox is not available` | The kernel has no Landlock (or blocks it). With the VPN on, the app stops. See [Filesystem sandbox](#filesystem-sandbox). |
+| `the filesystem sandbox is not available` | Neither the app's AppArmor profile nor Landlock is active, so the app stops. See [Filesystem sandbox](#filesystem-sandbox). |
+| `rtbit is not confined` / `the Ingress proxy is not confined` | The child did not switch to its AppArmor child profile (an outdated or edited `apparmor.txt`). Rebuild or update the app. |
 | `LOW DISK SPACE` | See [Disk space guard](#disk-space-guard). |
 | Sidebar shows *rBittorrent is starting...* for minutes | rtbit keeps exiting. Check the log, e.g. for a folder on a missing disk. |
 | Sonarr gets `401` / `403` | Wrong user name or password, or Sonarr's IP is not in `local_allow_cidrs`. |

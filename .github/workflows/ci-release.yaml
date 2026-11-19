@@ -279,27 +279,36 @@ jobs:
           grep -q '"vpn":false' health.json
           grep -q '"port":4240' health.json
           grep -q '"fs_sandbox":true' health.json
+          # PID 1 is not dumpable: root without CAP_SYS_PTRACE (docker exec,
+          # like rtbit) cannot read its environment.
+          if docker exec direct cat /proc/1/environ >/dev/null 2>&1; then
+            echo "PID 1's environment is readable"; exit 1
+          fi
           docker stop -t 30 direct
           test "$(docker inspect -f '{{.State.ExitCode}}' direct)" -eq 0
           logs=$(docker logs direct 2>&1)
           grep -q 'shutdown complete' <<<"$logs"
           docker rm direct >/dev/null
           echo "::endgroup::"
-          echo "::group::fail-closed: no Landlock (blocked by seccomp)"
-          # Everything allowed except Landlock, which answers EPERM.
+          echo "::group::fail-closed: no sandbox at all (Docker's profile, Landlock blocked)"
+          # Everything allowed except Landlock, which answers EPERM. Docker's
+          # own AppArmor profile is not the app's, so nothing confines rtbit.
           printf '%s' '{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["landlock_create_ruleset","landlock_add_rule","landlock_restrict_self"],"action":"SCMP_ACT_ERRNO","errnoRet":1}]}' > no-landlock.json
           nolandlock=(--security-opt "seccomp=$PWD/no-landlock.json")
           wg='"wg_private_key": "aGVsbG8taGVsbG8taGVsbG8taGVsbG8taGVsbG8tISE=", "wg_public_key": "d29ybGQtd29ybGQtd29ybGQtd29ybGQtd29ybGQtISE=", "wg_endpoint": "203.0.113.1:51820", "wg_address": "10.2.0.2/32", "wg_dns": "10.2.0.1"'
           echo "{$wg}" > vpn.json
-          # VPN on: refuses before rtbit (or its auth helper) ever runs.
-          set +e
-          out=$(run "${nolandlock[@]}" -v "$PWD/vpn.json:/data/options.json:ro" "$IMG" 2>&1); code=$?
-          set -e
-          echo "$out" | tail -n 20
-          test "$code" -eq 1
-          grep -q 'the filesystem sandbox is not available: Landlock is blocked' <<<"$out"
-          grep -q 'allow_unsandboxed' <<<"$out"
-          if grep -q 'reset-password\|auth: enabled' <<<"$out"; then echo "rtbit ran without a sandbox"; exit 1; fi
+          # VPN on or off: refuses before rtbit (or its auth helper) ever runs.
+          for opts in vpn.json direct.json; do
+            set +e
+            out=$(run --cap-add NET_ADMIN "${nolandlock[@]}" -v "$PWD/$opts:/data/options.json:ro" "$IMG" 2>&1); code=$?
+            set -e
+            echo "$out" | tail -n 20
+            test "$code" -eq 1
+            grep -q 'the filesystem sandbox is not available' <<<"$out"
+            grep -q 'Landlock is blocked' <<<"$out"
+            grep -q 'allow_unsandboxed' <<<"$out"
+            if grep -q 'reset-password\|auth: enabled' <<<"$out"; then echo "rtbit ran without a sandbox"; exit 1; fi
+          done
           # The explicit opt-out gets past the check (and then stops at the
           # firewall here: no NET_ADMIN).
           echo "{$wg, \"allow_unsandboxed\": true}" > vpn-unsandboxed.json
@@ -308,9 +317,11 @@ jobs:
           set -e
           echo "$out" | tail -n 20
           grep -q 'running without it because `allow_unsandboxed` is on' <<<"$out"
-          # Direct connection: starts, warns, and the status bar data says so.
+          # Direct connection with the opt-out: starts, warns, and the status
+          # bar data says so.
+          echo '{"allow_unsandboxed": true}' > direct-unsandboxed.json
           docker run -d --name nosb --platform "$PLATFORM" --cap-add NET_ADMIN "${nolandlock[@]}" \
-            -v "$PWD/direct.json:/data/options.json:ro" "$IMG"
+            -v "$PWD/direct-unsandboxed.json:/data/options.json:ro" "$IMG"
           ok=0
           for i in $(seq 1 90); do
             if docker exec nosb /usr/local/bin/rbittorrent-supervisor healthcheck; then ok=1; break; fi
@@ -319,10 +330,73 @@ jobs:
           logs=$(docker logs nosb 2>&1)
           tail -n 30 <<<"$logs"
           test "$ok" -eq 1
-          grep -q 'the filesystem sandbox is not available' <<<"$logs"
+          grep -q 'running without it because `allow_unsandboxed` is on' <<<"$logs"
           docker exec nosb /bin/sh -c 'wget -qO- http://127.0.0.1:8099/__health' | tee health.json
           grep -q '"fs_sandbox":false' health.json
           docker rm -f nosb >/dev/null
+          echo "::endgroup::"
+          echo "::group::AppArmor: the app's own profile, as Home Assistant OS loads it"
+          # Home Assistant OS kernels have AppArmor and no Landlock. The
+          # Supervisor renames the profile to the app's slug and runs the
+          # container with it; the same here, with Landlock blocked.
+          if ! command -v aa-exec >/dev/null || ! file -L /bin/busybox 2>/dev/null | grep -q 'statically linked\|static-pie'; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq apparmor-utils busybox-static >/dev/null
+          fi
+          sed 's/^profile rbittorrent /profile local_rbittorrent /' "$APP_DIR/apparmor.txt" > aa-local.txt
+          sudo apparmor_parser -r -W aa-local.txt
+          loaded=$(sudo grep -cE '^local_rbittorrent(//(rtbit|ingress))? \(enforce\)$' /sys/kernel/security/apparmor/profiles)
+          test "$loaded" -eq 3
+          # The child profiles themselves, on the host, with a static busybox
+          # standing in for the confined binary (root, all capabilities).
+          sudo mkdir -p /config/db /config/wireguard /data /app_configs/other /media/rbt-aa
+          for f in /config/wg0.conf /config/.webui-password /config/wireguard/x.conf /data/options.json /app_configs/other/options.json; do
+            echo secret | sudo tee "$f" >/dev/null
+          done
+          echo db | sudo tee /config/db/session.json >/dev/null
+          confined() { sudo aa-exec -p "local_rbittorrent//$1" -- /bin/busybox "${@:2}"; }
+          confined rtbit cat /config/db/session.json
+          confined rtbit sh -c 'echo ok > /media/rbt-aa/written'
+          test "$(cat /media/rbt-aa/written)" = ok
+          for f in /config/wg0.conf /config/.webui-password /config/wireguard/x.conf /data/options.json /app_configs/other/options.json /proc/1/environ; do
+            if confined rtbit cat "$f" >/dev/null 2>&1; then echo "rtbit's profile lets it read $f"; exit 1; fi
+          done
+          for f in /config/wg0.conf /config/.webui-password /config/.migrated; do
+            if confined rtbit sh -c "echo x > $f" 2>/dev/null; then echo "rtbit's profile lets it write $f"; exit 1; fi
+          done
+          if confined rtbit ls /app_configs/other >/dev/null 2>&1; then echo "rtbit's profile lists /app_configs"; exit 1; fi
+          confined ingress cat /etc/hostname
+          if confined ingress sh -c 'echo x > /media/rbt-aa/ingress' 2>/dev/null; then echo "the Ingress profile can write"; exit 1; fi
+          if confined ingress cat /config/db/session.json >/dev/null 2>&1; then echo "the Ingress profile reads /config"; exit 1; fi
+          # The app under it: AppArmor alone confines both children.
+          docker run -d --name aa --platform "$PLATFORM" --cap-add NET_ADMIN \
+            --security-opt apparmor=local_rbittorrent "${nolandlock[@]}" \
+            -v "$PWD/direct.json:/data/options.json:ro" "$IMG"
+          ok=0
+          for i in $(seq 1 90); do
+            if docker exec aa /usr/local/bin/rbittorrent-supervisor healthcheck; then ok=1; break; fi
+            sleep 1
+          done
+          logs=$(docker logs aa 2>&1)
+          tail -n 40 <<<"$logs"
+          sudo dmesg | grep 'apparmor="DENIED"' | tail -n 40 || true
+          test "$ok" -eq 1
+          grep -q 'AppArmor profile `local_rbittorrent` confines the app' <<<"$logs"
+          grep -q 'rtbit filesystem sandbox active (AppArmor `local_rbittorrent//rtbit`)' <<<"$logs"
+          grep -q 'Ingress proxy filesystem sandbox active (AppArmor `local_rbittorrent//ingress`)' <<<"$logs"
+          grep -q 'AppArmor `local_rbittorrent//rtbit (enforce)`' <<<"$logs"
+          grep -q 'AppArmor `local_rbittorrent//ingress (enforce)`' <<<"$logs"
+          grep -q 'auth: enabled (user "admin")' <<<"$logs"
+          label=$(docker exec aa /bin/sh -c 'cat /proc/$(pidof rtbit)/attr/current')
+          test "$label" = "local_rbittorrent//rtbit (enforce)"
+          docker exec aa /bin/sh -c 'wget -qO- http://127.0.0.1:8099/__health' | tee health.json
+          grep -q '"fs_sandbox":true' health.json
+          if docker exec aa cat /proc/1/environ >/dev/null 2>&1; then
+            echo "PID 1's environment is readable"; exit 1
+          fi
+          docker stop -t 30 aa
+          test "$(docker inspect -f '{{.State.ExitCode}}' aa)" -eq 0
+          docker rm aa >/dev/null
           echo "::endgroup::"
           size=$(docker image inspect -f '{{.Size}}' "$IMG")
           {

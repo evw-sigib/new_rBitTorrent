@@ -207,6 +207,18 @@ def proc_environ_of(cmd_fragment):
     return out
 
 
+def supervisor_environ(supervisor):
+    """/proc/<pid>/environ of the supervisor itself (read as root), or None."""
+    for d in app_processes():
+        try:
+            argv = (d / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+            if len(argv) == 1 and argv[0].decode() == str(supervisor):
+                return (d / "environ").read_bytes().decode(errors="replace")
+        except OSError:
+            continue
+    return None
+
+
 def tcp_listener(ns, host, port):
     """A background TCP listener that accepts and closes connections."""
     fam = "socket.AF_INET6" if ":" in host else "socket.AF_INET"
@@ -561,6 +573,7 @@ def checks(sup, cli_priv, supervisor):
     check(env.get("RTBIT_LSD_DISABLE") == "true", "LSD disabled")
     check(env.get("XDG_DATA_HOME", "").endswith("/config/db"), "XDG_DATA_HOME=/config/db")
     check(env.get("XDG_CACHE_HOME", "").endswith("/config/cache"), "XDG_CACHE_HOME=/config/cache")
+    check(env.get("HOME", "").endswith("/config/db"), "HOME=/config/db (inside the sandbox)")
     secret_seen = any(cli_priv in v for v in env.values()) or any(cli_priv in a for a in first["argv"])
     check(not secret_seen, "WireGuard private key not in rtbit env/argv")
     check(cli_priv not in text, "WireGuard private key never logged")
@@ -648,6 +661,11 @@ def checks(sup, cli_priv, supervisor):
               f"Landlock: rtbit cannot reach {name} ({probes.get(name)})")
     check(probes.get("write-db") == "writable", "Landlock: rtbit can write its database folder")
     check(not (WORK / "config" / "planted").exists(), "Landlock: nothing planted in /config")
+    check(probes.get("supervisor-environ") == "denied",
+          f"rtbit cannot read the supervisor's environment ({probes.get('supervisor-environ')})")
+    sup_env = supervisor_environ(supervisor)
+    check(sup_env is not None and E2E_SUPERVISOR_TOKEN not in sup_env,
+          "the Supervisor token is wiped from the supervisor's own environment block")
 
     step("routes, tunnel and firewall state")
     routes = sh("ip", "-4", "route", "show", ns=NS_CLI).stdout
@@ -848,6 +866,13 @@ def run_direct_test(supervisor: Path):
     }
     lan6 = tcp_listener(NS_RTR, "::", LAN6_PORT)
     app6 = tcp_listener(NS_CLI, "::", APP6_PORT)
+    # Positive control for every IPv6 check (VPN and direct): before the
+    # supervisor runs, IPv6 works both ways.
+    step("IPv6 works before the app starts (positive control)")
+    wait_for(lambda: tcp_probe(NS_CLI, RTR_V6, LAN6_PORT)[0], 15, "IPv6 out of e2e-cli")
+    check(True, "IPv6 out of the app's namespace works without the app")
+    wait_for(lambda: tcp_probe(NS_RTR, CLI_V6, APP6_PORT)[0], 15, "IPv6 into e2e-cli")
+    check(True, "IPv6 into the app's namespace works without the app")
     step("direct mode: start rbittorrent-supervisor without any VPN setup")
     sup = subprocess.Popen(
         ["ip", "netns", "exec", NS_CLI, str(sup_copy)],
@@ -891,11 +916,11 @@ def run_direct_test(supervisor: Path):
         check(not ok, f"the Ingress port is closed to the internet ({out})")
         ok, out = tcp_probe(NS_RTR, "10.99.0.2", INGRESS_PORT)
         check(not ok, f"the Ingress port is closed to the LAN ({out})")
-        # Positive control for the VPN test's IPv6 checks: the link works.
+        # The app is IPv4-only on a direct connection too.
         ok, out = tcp_probe(NS_CLI, RTR_V6, LAN6_PORT)
-        check(ok, f"IPv6 works on a direct connection (so the VPN test is meaningful) ({out})")
+        check(not ok, f"IPv6 out of the app is dropped on a direct connection ({out})")
         ok, out = tcp_probe(NS_RTR, CLI_V6, APP6_PORT)
-        check(ok, f"IPv6 into the app works on a direct connection ({out})")
+        check(not ok, f"IPv6 into the app is dropped on a direct connection ({out})")
         status, body = wait_for(
             lambda: (lambda r: r if r[0] == 200 else None)(
                 http_get(NS_RTR, SUPERVISOR_IP, "10.99.0.2", INGRESS_PORT, "/__health")),

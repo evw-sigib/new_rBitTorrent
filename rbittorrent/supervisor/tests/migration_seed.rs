@@ -299,8 +299,9 @@ async fn qbittorrent_takeover_seeds_categories_and_torrents_once() {
     let m = migration::prepare(&mut o, &roots);
     assert!(m.fresh && m.has_work(), "{m:?}");
     assert_eq!(o.webui_username, USER);
-    assert_eq!(o.completed_dir, "/share/qBittorrent");
-    assert_eq!(o.download_dir, "/share/qBittorrent/incomplete");
+    // TempPathEnabled=false: straight into the save path, no completed folder.
+    assert_eq!(o.download_dir, "/share/qBittorrent");
+    assert_eq!(o.completed_dir, None);
 
     // Phase 2 against the mock rtbit.
     let (addr, log) = serve(rtbit_handler("radarr")).await;
@@ -309,10 +310,14 @@ async fn qbittorrent_takeover_seeds_categories_and_torrents_once() {
         username: o.webui_username.clone(),
         password: Secret::new(PASS.into()),
         config_root: roots.config.clone(),
-        data_roots: vec![base.join("media")],
+        // The test's own media folder stands in for /media, so the `lidarr`
+        // category (/media/music) is outside what rtbit could write.
+        data_roots: vec![base.join("media"), PathBuf::from("/share")],
         migration: m,
     };
     let report = migration::seed(job).await.unwrap();
+    assert_eq!(report.category_notes.len(), 1, "{report:?}");
+    assert!(report.category_notes[0].contains("`lidarr`: /media/music is outside"));
     assert_eq!(report.categories_created, 2, "{report:?}");
     assert_eq!(report.categories_existing, 1);
     assert_eq!(report.torrents_added, 1);
@@ -329,6 +334,11 @@ async fn qbittorrent_takeover_seeds_categories_and_torrents_once() {
     assert_eq!(cats.len(), 3);
     let tv = cats.iter().find(|c| c["category"] == "tv-sonarr").unwrap();
     assert_eq!(tv["savePath"], "/share/qBittorrent/tv");
+    let lidarr = cats.iter().find(|c| c["category"] == "lidarr").unwrap();
+    assert!(
+        lidarr.get("savePath").is_none_or(String::is_empty),
+        "{lidarr:?}"
+    );
     let adds: Vec<&Seen> = seen
         .iter()
         .filter(|r| r.path == "/api/v2/torrents/add")
@@ -373,7 +383,8 @@ async fn qbittorrent_takeover_seeds_categories_and_torrents_once() {
     let m = migration::prepare(&mut o, &roots);
     assert!(!m.has_work(), "{m:?}");
     assert_eq!(o.webui_username, USER);
-    assert_eq!(o.completed_dir, "/share/qBittorrent");
+    assert_eq!(o.download_dir, "/share/qBittorrent");
+    assert_eq!(o.completed_dir, None);
     let _ = std::fs::remove_dir_all(base);
 }
 

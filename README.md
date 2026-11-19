@@ -24,7 +24,9 @@
 | `rbittorrent/rtbit/mimalloc.patch` | mimalloc as rtbit's global allocator |
 | `rbittorrent/rtbit/auth-banner.patch` | rtbit's startup log reports the stored Web UI login as `auth: enabled` |
 | `rbittorrent/rtbit/swagger-vendored.patch` | Build-only: Swagger UI from a checksum-pinned crate, no download from github.com |
-| `rbittorrent/rtbit/ipv4-fallback.patch` | The DHT and UDP tracker sockets fall back to IPv4 on hosts booted with `ipv6.disable=1` |
+| `rbittorrent/rtbit/ipv4-fallback.patch` | IPv4-only mode opens IPv4 DHT and UDP tracker sockets (hosts booted with `ipv6.disable=1`) |
+| `rbittorrent/rtbit/completed-move.patch` | Only torrents in the download folder move to the completed folder; others stay put |
+| `rbittorrent/apparmor.txt` | AppArmor profile: rtbit and the Ingress proxy run in confined child profiles (the sandbox on Home Assistant OS) |
 | `rbittorrent/supervisor/` | `rbittorrent-supervisor`, the Rust PID 1 (config, firewall, WireGuard, NAT-PMP, migration, process, Ingress, benchmark) |
 | `rbittorrent/tests/` | Kernel end-to-end leak test (network namespaces + real WireGuard) |
 | `.github/workflows/ci-release.yaml` | fmt, clippy, tests, live nftables, e2e (VPN + direct mode), native per-arch image builds and smoke tests, GHCR publishing of the tested images |

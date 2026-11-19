@@ -35,10 +35,10 @@ index 17f1c90..69e1e22 100644
              let listen_addr = socket.bind_addr();
              info!("DHT listening on {:?}", listen_addr);
 diff --git a/crates/librtbit-dht/src/persistence.rs b/crates/librtbit-dht/src/persistence.rs
-index 73fbc4a..7e0947d 100644
+index 73fbc4a..4ee0a34 100644
 --- a/crates/librtbit-dht/src/persistence.rs
 +++ b/crates/librtbit-dht/src/persistence.rs
-@@ -154,7 +154,11 @@ impl PersistentDht {
+@@ -154,9 +154,16 @@ impl PersistentDht {
                  if let Some(ref mut addr) = listen_addr {
                      addr.set_port(port);
                  } else {
@@ -50,15 +50,21 @@ index 73fbc4a..7e0947d 100644
 +                    });
                  }
              }
++            if config.ipv4_only && listen_addr.is_none() {
++                listen_addr = Some(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
++            }
              let peer_id = routing_table.as_ref().map(|r| r.id());
+ 
+             let dht_config = DhtConfig {
 diff --git a/crates/librtbit-tracker-comms/src/tracker_comms_udp.rs b/crates/librtbit-tracker-comms/src/tracker_comms_udp.rs
-index c74a0e2..b840d61 100644
+index c74a0e2..3fcf330 100644
 --- a/crates/librtbit-tracker-comms/src/tracker_comms_udp.rs
 +++ b/crates/librtbit-tracker-comms/src/tracker_comms_udp.rs
-@@ -308,14 +308,21 @@ impl UdpTrackerClient {
+@@ -307,15 +307,36 @@ impl UdpTrackerClient {
+         cancel_token: CancellationToken,
          bind_device: Option<&BindDevice>,
      ) -> anyhow::Result<Self> {
-         let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+-        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
 -        let sock = UdpSocket::bind_udp(
 -            addr,
 -            librqbit_dualstack_sockets::BindOpts {
@@ -67,6 +73,20 @@ index c74a0e2..b840d61 100644
 -            },
 -        )
 -        .with_context(|| format!("error creating UDP socket at {addr}"))?;
++        Self::new_with_ipv4_only(cancel_token, bind_device, false).await
++    }
++
++    /// `ipv4_only`: one IPv4 socket, never [::].
++    pub async fn new_with_ipv4_only(
++        cancel_token: CancellationToken,
++        bind_device: Option<&BindDevice>,
++        ipv4_only: bool,
++    ) -> anyhow::Result<Self> {
++        let addr = if ipv4_only {
++            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
++        } else {
++            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
++        };
 +        let opts = librqbit_dualstack_sockets::BindOpts {
 +            device: bind_device,
 +            ..Default::default()
@@ -75,13 +95,50 @@ index c74a0e2..b840d61 100644
 +            Ok(sock) => sock,
 +            // No IPv6 socket family (a kernel booted with ipv6.disable=1):
 +            // IPv4 trackers still work over an IPv4 socket.
-+            Err(e) => {
++            Err(e) if addr.is_ipv6() => {
 +                let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 +                warn!("UDP trackers: cannot open {addr} ({e:#}), using {v4}");
 +                UdpSocket::bind_udp(v4, opts)
 +                    .with_context(|| format!("error creating UDP socket at {v4}"))?
 +            }
++            Err(e) => return Err(e).with_context(|| format!("error creating UDP socket at {addr}")),
 +        };
  
          let client = Self {
              state: Arc::new(ClientShared {
+diff --git a/crates/librtbit/src/session/mod.rs b/crates/librtbit/src/session/mod.rs
+index 523f011..a867d34 100644
+--- a/crates/librtbit/src/session/mod.rs
++++ b/crates/librtbit/src/session/mod.rs
+@@ -296,12 +296,17 @@ impl Session {
+                         bootstrap_addrs: opts.dht_bootstrap_addrs.clone(),
+                         cancellation_token: Some(token.child_token()),
+                         bind_device: bind_device.as_ref(),
++                        // IPv4-only sessions never open [::] sockets.
++                        listen_addr: opts
++                            .ipv4_only
++                            .then(|| SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))),
+                         ..Default::default()
+                     })
+                     .await
+                     .context("error initializing DHT")?
+                 } else {
+-                    let pdht_config = opts.dht_config.take().unwrap_or_default();
++                    let mut pdht_config = opts.dht_config.take().unwrap_or_default();
++                    pdht_config.ipv4_only |= opts.ipv4_only;
+                     PersistentDht::create(
+                         Some(pdht_config),
+                         Some(token.clone()),
+@@ -472,7 +477,11 @@ impl Session {
+                 None
+             } else {
+                 Some(
+-                    UdpTrackerClient::new(token.clone(), bind_device.as_ref())
++                    UdpTrackerClient::new_with_ipv4_only(
++                        token.clone(),
++                        bind_device.as_ref(),
++                        opts.ipv4_only,
++                    )
+                         .await
+                         .context("error creating UDP tracker client")?,
+                 )

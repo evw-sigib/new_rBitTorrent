@@ -14,7 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -362,102 +362,141 @@ pub fn parse_uid(status: &str) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
-// Filesystem sandbox (Landlock)
+// Filesystem sandbox (AppArmor child profiles, Landlock)
 // ---------------------------------------------------------------------------
 
 static RTBIT_FS_ANNOUNCED: AtomicBool = AtomicBool::new(false);
 static PROXY_FS_ANNOUNCED: AtomicBool = AtomicBool::new(false);
-/// Set only by [`check_fs_sandbox`] when running without Landlock is
-/// acceptable (direct mode, or `allow_unsandboxed`). Until then every
-/// sandboxed child refuses to start without its ruleset.
+/// Set only by [`check_fs_sandbox`] when the user allowed running without
+/// any sandbox (`allow_unsandboxed`). Until then every sandboxed child
+/// refuses to start without one.
 static FS_SANDBOX_OPTIONAL: AtomicBool = AtomicBool::new(false);
+/// The app's AppArmor profile, when it confines this process: the children
+/// must then run in its child profiles (checked after each start).
+static APPARMOR_PROFILE: OnceLock<String> = OnceLock::new();
 
-/// What a child loses without Landlock, for the refusal and the warning.
-const UNSANDBOXED_RISK: &str = "rtbit runs as root with CAP_DAC_OVERRIDE, so without the \
-    sandbox it could read the Web UI password, /data/options.json, every other app's folder in \
+/// What a child can reach without a sandbox, for the refusal and the warning.
+const UNSANDBOXED_RISK: &str = "rtbit runs as root with CAP_DAC_OVERRIDE, so without a sandbox \
+    it could read the Web UI password, /data/options.json, every other app's folder in \
     /app_configs and, with the VPN on, /config/wg0.conf";
 
-/// Checks, before any child starts, that the kernel can confine rtbit with
-/// Landlock (ABI 2+: Linux 5.19 or newer, Landlock in the kernel's LSM list,
-/// not blocked by seccomp). With the VPN on this fails closed unless the user
-/// set `allow_unsandboxed`; a direct connection only warns. Returns whether
-/// the sandbox is active.
-pub fn check_fs_sandbox(policy: &FsPolicy, vpn: bool, allow_unsandboxed: bool) -> Result<bool> {
-    let why = match landlock::build(policy) {
-        Ok(_) => {
-            FS_SANDBOX_OPTIONAL.store(false, Ordering::Relaxed);
-            return Ok(true);
+/// Checks, before any child starts, that the children can be confined: by
+/// the app's AppArmor profile (`apparmor.txt`, loaded by the Supervisor;
+/// the only option on Home Assistant OS, whose kernels have no Landlock)
+/// and/or by Landlock (ABI 2+). Neither is a fatal error unless the user set
+/// `allow_unsandboxed`. Returns whether a sandbox is active.
+pub fn check_fs_sandbox(policy: &FsPolicy, allow_unsandboxed: bool) -> Result<bool> {
+    let landlock = landlock::build(policy).map(|rs| rs.abi);
+    let apparmor = crate::apparmor::own_profile();
+    if let (Err(aa), Err(ll)) = (&apparmor, &landlock) {
+        if !allow_unsandboxed {
+            bail!(
+                "the filesystem sandbox is not available: {aa}, and {ll}. {UNSANDBOXED_RISK}. \
+                 Keep AppArmor on for the app (Home Assistant loads its profile, \
+                 apparmor.txt) or run a kernel with Landlock (Linux 5.19 or newer). Refusing \
+                 to start; set `allow_unsandboxed: true` (Configuration, show unused optional \
+                 options) to run without it at your own risk"
+            );
         }
-        Err(why) => why,
-    };
-    if vpn && !allow_unsandboxed {
-        bail!(
-            "the filesystem sandbox is not available: {why}. {UNSANDBOXED_RISK}. It needs Linux \
-             5.19 or newer with Landlock enabled. Refusing to start with the VPN on; set \
-             `allow_unsandboxed: true` (Configuration, show unused optional options) to run \
-             without it at your own risk"
-        );
-    }
-    FS_SANDBOX_OPTIONAL.store(true, Ordering::Relaxed);
-    if vpn {
+        FS_SANDBOX_OPTIONAL.store(true, Ordering::Relaxed);
         warn!(
-            "the filesystem sandbox is not available ({why}); running without it because \
+            "the filesystem sandbox is not available ({aa}; {ll}); running without it because \
              `allow_unsandboxed` is on. {UNSANDBOXED_RISK}"
         );
-    } else {
-        warn!(
-            "the filesystem sandbox is not available ({why}): {UNSANDBOXED_RISK}. With the VPN \
-             on, the app refuses to start without it unless `allow_unsandboxed` is set"
-        );
+        return Ok(false);
     }
-    Ok(false)
+    FS_SANDBOX_OPTIONAL.store(false, Ordering::Relaxed);
+    if let Ok(profile) = apparmor {
+        info!(
+            "AppArmor profile `{profile}` confines the app; rtbit and the Ingress proxy start \
+             in its child profiles"
+        );
+        // Set once per process; a second check finds the same profile.
+        let _ = APPARMOR_PROFILE.set(profile);
+    }
+    if let Err(why) = landlock {
+        info!("Landlock is not available ({why}); AppArmor is the filesystem sandbox");
+    }
+    Ok(true)
 }
 
-/// The Landlock ruleset for a child. Without one, the child runs only when
+/// A child's sandbox, decided before `fork`.
+enum FsSandbox {
+    /// Landlock (applied before `execve`) and/or the AppArmor child profile
+    /// (switched to by `execve`, verified after the start).
+    Confined { landlock: Option<Arc<Ruleset>> },
+    /// No sandbox at all, and [`check_fs_sandbox`] allowed that.
+    Allowed,
+    /// No sandbox, not allowed: the child must never run.
+    Refused,
+}
+
+/// The sandbox for a child. Without one, the child runs only when
 /// [`check_fs_sandbox`] allowed that; otherwise it refuses to `execve` (see
 /// [`apply_fs_sandbox`]).
-fn fs_sandbox(who: &str, policy: &FsPolicy, announced: &AtomicBool) -> FsSandbox {
-    match landlock::build(policy) {
-        Ok(rs) => {
-            if !announced.swap(true, Ordering::Relaxed) {
+fn fs_sandbox(who: &str, child: &str, policy: &FsPolicy, announced: &AtomicBool) -> FsSandbox {
+    let apparmor = APPARMOR_PROFILE.get();
+    let first = !announced.swap(true, Ordering::Relaxed);
+    match (landlock::build(policy), apparmor) {
+        (Ok(rs), aa) => {
+            if first {
+                let aa = aa.map_or_else(String::new, |p| format!("AppArmor `{p}//{child}` + "));
                 info!(
-                    "{who} filesystem sandbox active (Landlock ABI {}): {}; everything else, \
-                     including /data, /app_configs and the secrets in /config, is out of reach",
+                    "{who} filesystem sandbox active ({aa}Landlock ABI {}): {}; everything \
+                     else, including /data, /app_configs and the secrets in /config, is out of \
+                     reach",
                     rs.abi,
                     policy.describe()
                 );
             }
-            FsSandbox::Active(Arc::new(rs))
+            FsSandbox::Confined {
+                landlock: Some(Arc::new(rs)),
+            }
         }
-        Err(why) if FS_SANDBOX_OPTIONAL.load(Ordering::Relaxed) => {
-            if !announced.swap(true, Ordering::Relaxed) {
+        (Err(_), Some(p)) => {
+            if first {
+                info!(
+                    "{who} filesystem sandbox active (AppArmor `{p}//{child}`): /data, \
+                     /app_configs and the secrets in /config are out of reach"
+                );
+            }
+            FsSandbox::Confined { landlock: None }
+        }
+        (Err(why), None) if FS_SANDBOX_OPTIONAL.load(Ordering::Relaxed) => {
+            if first {
                 warn!("{who} runs without a filesystem sandbox: {why}");
             }
             FsSandbox::Allowed
         }
-        Err(why) => {
+        (Err(why), None) => {
             error!("{who} cannot be sandboxed ({why}); refusing to start it");
             FsSandbox::Refused
         }
     }
 }
 
-/// A child's Landlock state, decided before `fork`.
-enum FsSandbox {
-    Active(Arc<Ruleset>),
-    /// No Landlock, and [`check_fs_sandbox`] allowed that.
-    Allowed,
-    /// No Landlock, not allowed: the child must never run.
-    Refused,
-}
-
 /// Runs in the forked child right before `execve` (async-signal-safe: one
 /// syscall, or an error built from an errno without allocating).
 fn apply_fs_sandbox(fs: &FsSandbox) -> io::Result<()> {
     match fs {
-        FsSandbox::Active(rs) => rs.restrict_self(),
-        FsSandbox::Allowed => Ok(()),
+        FsSandbox::Confined { landlock: Some(rs) } => rs.restrict_self(),
+        FsSandbox::Confined { landlock: None } | FsSandbox::Allowed => Ok(()),
         FsSandbox::Refused => Err(io::Error::from_raw_os_error(libc::EPERM)),
+    }
+}
+
+/// When the app's AppArmor profile is active: whether the running child
+/// `pid` is in the child profile `child`. `Ok(None)` without AppArmor.
+fn verify_apparmor_child(pid: u32, child: &str) -> std::result::Result<Option<String>, String> {
+    let Some(profile) = APPARMOR_PROFILE.get() else {
+        return Ok(None);
+    };
+    match crate::apparmor::label_of(Path::new(&format!("/proc/{pid}"))) {
+        Some(l) if crate::apparmor::is_child(&l, profile, child) => Ok(Some(l.to_string())),
+        Some(l) => Err(format!(
+            "it runs under the AppArmor label `{l}`, not `{profile}//{child} (enforce)`"
+        )),
+        None => Err("its AppArmor label cannot be read".to_owned()),
     }
 }
 
@@ -497,6 +536,7 @@ pub fn ingress_command(exe: &Path, sandbox: bool) -> Command {
         let all: Vec<u32> = (0..=last_cap()).collect();
         let fs = fs_sandbox(
             "Ingress proxy",
+            crate::apparmor::INGRESS_CHILD,
             &ingress_fs_policy(exe),
             &PROXY_FS_ANNOUNCED,
         );
@@ -558,7 +598,17 @@ pub async fn spawn_ingress(
                 "the Ingress proxy is not sandboxed (uid {uid:?}, CapEff {eff:?}); refusing to run it"
             );
         }
-        info!(pid, "Ingress proxy started (uid {NOBODY}, no capabilities)");
+        let profile = match verify_apparmor_child(pid, crate::apparmor::INGRESS_CHILD) {
+            Ok(p) => p.map_or_else(String::new, |p| format!(", AppArmor `{p}`")),
+            Err(why) => {
+                child.start_kill().ok();
+                bail!("the Ingress proxy is not confined: {why}; refusing to run it");
+            }
+        };
+        info!(
+            pid,
+            "Ingress proxy started (uid {NOBODY}, no capabilities{profile})"
+        );
     }
     Ok((child, IngressPipes { stdin, stdout }))
 }
@@ -575,7 +625,8 @@ pub struct RtbitSpec {
     pub data_home: PathBuf,
     pub cache_home: PathBuf,
     pub download_dir: PathBuf,
-    pub completed_dir: PathBuf,
+    /// `RTBIT_COMPLETED_FOLDER`; `None` leaves finished torrents in place.
+    pub completed_dir: Option<PathBuf>,
     pub webui_port: u16,
     /// `Some("wg0")` in VPN mode; `None` on a direct connection.
     pub bind_device: Option<String>,
@@ -626,7 +677,6 @@ impl RtbitSpec {
             // refuses every change), so this only matters from beta.5 on.
             ("RTBIT_IGNORE_SAVED_NETWORK".into(), "true".into()),
             ("RTBIT_DOWNLOAD_FOLDER".into(), path(&self.download_dir)),
-            ("RTBIT_COMPLETED_FOLDER".into(), path(&self.completed_dir)),
             ("RTBIT_FASTRESUME".into(), "true".into()),
             (
                 "RTBIT_SHUTDOWN_TIMEOUT".into(),
@@ -637,6 +687,9 @@ impl RtbitSpec {
                 self.log_level.as_str().into(),
             ),
         ];
+        if let Some(done) = &self.completed_dir {
+            env.push(("RTBIT_COMPLETED_FOLDER".into(), path(done)));
+        }
         if let Some(dev) = &self.bind_device {
             env.push(("RTBIT_BIND_DEVICE".into(), dev.clone()));
         }
@@ -724,17 +777,10 @@ impl RtbitSpec {
     pub fn fs_policy(&self) -> FsPolicy {
         let mut read_exec = landlock::system_read_exec();
         read_exec.push(self.binary.clone());
-        let mut read_write = vec![
-            PathBuf::from("/media"),
-            PathBuf::from("/share"),
-            PathBuf::from("/dev/null"),
-        ];
-        for p in [
-            &self.download_dir,
-            &self.completed_dir,
-            &self.data_home,
-            &self.cache_home,
-        ] {
+        let mut read_write =
+            crate::config::writable_roots(&self.download_dir, self.completed_dir.as_deref());
+        read_write.push(PathBuf::from("/dev/null"));
+        for p in [&self.data_home, &self.cache_home] {
             if !read_write.iter().any(|r| p.starts_with(r)) {
                 read_write.push(p.clone());
             }
@@ -759,7 +805,12 @@ impl RtbitSpec {
             .kill_on_drop(true);
         if self.sandbox {
             let drop = caps_to_drop(last_cap());
-            let fs = fs_sandbox("rtbit", &self.fs_policy(), &RTBIT_FS_ANNOUNCED);
+            let fs = fs_sandbox(
+                "rtbit",
+                crate::apparmor::RTBIT_CHILD,
+                &self.fs_policy(),
+                &RTBIT_FS_ANNOUNCED,
+            );
             // SAFETY: the closure only performs async-signal-safe syscalls on
             // pre-allocated data (see `drop_privileges`); `no_new_privs` is
             // set before Landlock is applied.
@@ -897,7 +948,18 @@ impl Rtbit {
                 "rtbit still holds network-admin capabilities (CapEff={eff:#x} CapBnd={bnd:#x}); refusing to run it"
             );
         }
-        info!("rtbit sandbox active: CapEff={eff:#x}, no NET_ADMIN/NET_RAW, no_new_privs");
+        let profile = match verify_apparmor_child(pid, crate::apparmor::RTBIT_CHILD) {
+            Ok(p) => p.map_or_else(String::new, |p| format!(", AppArmor `{p}`")),
+            Err(why) => {
+                if let Some(c) = self.child.as_mut() {
+                    c.start_kill().ok();
+                }
+                bail!("rtbit is not confined: {why}; refusing to run it");
+            }
+        };
+        info!(
+            "rtbit privileges dropped: CapEff={eff:#x}, no NET_ADMIN/NET_RAW, no_new_privs{profile}"
+        );
         Ok(())
     }
 
@@ -980,7 +1042,7 @@ mod tests {
             data_home: "/config/db".into(),
             cache_home: "/config/cache".into(),
             download_dir: "/media/rbittorrent/downloads".into(),
-            completed_dir: "/media/rbittorrent/completed".into(),
+            completed_dir: Some("/media/rbittorrent/completed".into()),
             webui_port: 8080,
             bind_device: Some("wg0".into()),
             listen_ip: Some(Ipv4Addr::new(10, 2, 0, 2)),

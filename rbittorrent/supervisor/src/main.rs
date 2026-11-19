@@ -32,7 +32,7 @@
 //! sizes its own multi-threaded runtime to all available cores.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -116,6 +116,20 @@ fn main() -> ExitCode {
             eprintln!("rbittorrent-supervisor: unknown argument `{other}` (try --help)");
             return ExitCode::from(2);
         }
+    }
+
+    // PID 1's secrets: the Supervisor token leaves the environment block,
+    // and the process is not dumpable, so no other process without
+    // CAP_SYS_PTRACE (rtbit runs as uid 0 without it) can open
+    // /proc/1/environ or /proc/1/mem.
+    ha_supervisor::take_token_from_env();
+    // SAFETY: plain prctl, no pointers.
+    let undumpable = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } == 0;
+    if !undumpable {
+        eprintln!(
+            "rbittorrent-supervisor: cannot clear the dumpable flag: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -367,19 +381,20 @@ async fn preflight(runner: &impl Runner, vpn: bool) -> Result<()> {
 }
 
 fn prepare_dirs(s: &Settings) -> Result<()> {
-    for dir in [
-        &s.data_home,
-        &s.cache_home,
-        &s.download_dir,
-        &s.completed_dir,
-    ] {
+    for dir in [&s.data_home, &s.cache_home, &s.download_dir]
+        .into_iter()
+        .chain(&s.completed_dir)
+    {
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     }
     info!(
         db = %s.data_home.display(),
         cache = %s.cache_home.display(),
         downloads = %s.download_dir.display(),
-        completed = %s.completed_dir.display(),
+        completed = %s
+            .completed_dir
+            .as_deref()
+            .map_or_else(|| "none (finished torrents stay in place)".into(), |p| p.display().to_string()),
         "storage ready"
     );
     Ok(())
@@ -420,13 +435,9 @@ async fn supervise(
     preflight(&runner, s.vpn.is_some()).await?;
     prepare_dirs(s)?;
     // Before the first rtbit command (even `auth`): no child runs without
-    // Landlock unless that was allowed here.
+    // a sandbox (AppArmor or Landlock) unless that was allowed here.
     let rtbit_spec = rtbit_spec(s);
-    let sandboxed = process::check_fs_sandbox(
-        &rtbit_spec.fs_policy(),
-        s.vpn.is_some(),
-        s.allow_unsandboxed,
-    )?;
+    let sandboxed = process::check_fs_sandbox(&rtbit_spec.fs_policy(), s.allow_unsandboxed)?;
     FS_SANDBOX_ACTIVE.store(sandboxed, Ordering::Relaxed);
     host::raise_udp_buffer_limits();
     // Supervisor API: before the kill-switch (it uses the normal network).
@@ -462,7 +473,7 @@ async fn supervise(
             username: s.webui_username.clone(),
             password: password.clone(),
             config_root: s.config_root.clone(),
-            data_roots: migration::default_data_roots(),
+            data_roots: config::writable_roots(&s.download_dir, s.completed_dir.as_deref()),
             migration,
         }),
     };
@@ -761,10 +772,9 @@ fn health_base() -> Health {
 fn rtbit_spec(s: &Settings) -> RtbitSpec {
     RtbitSpec {
         binary: env_path("RBITTORRENT_RTBIT", DEFAULT_RTBIT_BINARY),
-        home: s
-            .data_home
-            .parent()
-            .map_or_else(|| s.data_home.clone(), Path::to_path_buf),
+        // Inside the sandbox's writable folders (with Landlock, /config
+        // itself is out of reach).
+        home: s.data_home.clone(),
         data_home: s.data_home.clone(),
         cache_home: s.cache_home.clone(),
         download_dir: s.download_dir.clone(),

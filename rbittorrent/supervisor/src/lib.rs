@@ -5,6 +5,7 @@
 //! tests in `tests/` can drive the real components (e.g. the Ingress proxy
 //! against a mock rtbit).
 
+pub mod apparmor;
 pub mod benchmark;
 pub mod bencode;
 pub mod cidr;

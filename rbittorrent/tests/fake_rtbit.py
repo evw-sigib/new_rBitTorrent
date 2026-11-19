@@ -73,6 +73,14 @@ def sandbox_probes():
         probes["write-config"] = "writable"
     except OSError:
         probes["write-config"] = "denied"
+    # The supervisor (its parent, PID 1 in the container) is not dumpable,
+    # so rtbit, root without CAP_SYS_PTRACE, cannot read its environment.
+    try:
+        with open(f"/proc/{os.getppid()}/environ", "rb") as f:
+            f.read(1)
+        probes["supervisor-environ"] = "readable"
+    except OSError:
+        probes["supervisor-environ"] = "denied"
     try:
         with open(os.path.join(DATA, "probe"), "w", encoding="ascii") as f:
             f.write("ok")
