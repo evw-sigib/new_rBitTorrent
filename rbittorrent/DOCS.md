@@ -536,8 +536,8 @@ To check it yourself:
 
 - The supervisor and the Ingress proxy each use a single-threaded runtime
   and about 4 MiB of RAM (resident, measured in CI on aarch64 and amd64).
-  rtbit itself uses 21 to 24 MiB idle and 32 to 38 MiB with 30 paused
-  torrents.
+  rtbit itself uses about 21 to 26 MiB idle and 32 to 38 MiB with 30
+  paused torrents.
 - rtbit yields to Home Assistant: it runs at `nice` 10 and the lowest
   best-effort I/O priority, so hashing and peer I/O on a Pi never starve
   Core or the supervisor's health checks. Its limits follow the board:
