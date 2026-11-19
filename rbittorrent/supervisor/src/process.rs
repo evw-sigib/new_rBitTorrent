@@ -13,7 +13,8 @@ use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output};
-use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -23,6 +24,7 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::config::{LogLevel, Secret};
+use crate::landlock::{self, FsPolicy, Ruleset};
 
 // ---------------------------------------------------------------------------
 // Child registry + orphan reaping
@@ -337,6 +339,49 @@ pub fn parse_uid(status: &str) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// Filesystem sandbox (Landlock)
+// ---------------------------------------------------------------------------
+
+static RTBIT_FS_ANNOUNCED: AtomicBool = AtomicBool::new(false);
+static PROXY_FS_ANNOUNCED: AtomicBool = AtomicBool::new(false);
+
+/// The Landlock ruleset for a child, or `None` (logged once per kind of
+/// child) when the kernel cannot provide one.
+fn fs_sandbox(who: &str, policy: &FsPolicy, announced: &AtomicBool) -> Option<Arc<Ruleset>> {
+    match landlock::build(policy) {
+        Ok(rs) => {
+            if !announced.swap(true, Ordering::Relaxed) {
+                info!(
+                    "{who} filesystem sandbox active (Landlock ABI {}): {}; everything else, \
+                     including /data, /app_configs and the secrets in /config, is out of reach",
+                    rs.abi,
+                    policy.describe()
+                );
+            }
+            Some(Arc::new(rs))
+        }
+        Err(why) => {
+            if !announced.swap(true, Ordering::Relaxed) {
+                warn!("{who} runs without a filesystem sandbox: {why}");
+            }
+            None
+        }
+    }
+}
+
+/// What the Ingress proxy may touch: its own binary and system files to
+/// start, `/etc` for name resolution, nothing writable.
+pub fn ingress_fs_policy(exe: &Path) -> FsPolicy {
+    let mut read_exec = landlock::system_read_exec();
+    read_exec.push(exe.to_path_buf());
+    FsPolicy {
+        read_exec,
+        read_only: vec![PathBuf::from("/etc")],
+        read_write: Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Ingress proxy child
 // ---------------------------------------------------------------------------
 
@@ -358,9 +403,20 @@ pub fn ingress_command(exe: &Path, sandbox: bool) -> Command {
     }
     if sandbox {
         let all: Vec<u32> = (0..=last_cap()).collect();
+        let fs = fs_sandbox(
+            "Ingress proxy",
+            &ingress_fs_policy(exe),
+            &PROXY_FS_ANNOUNCED,
+        );
         // SAFETY: async-signal-safe syscalls on pre-allocated data only.
         unsafe {
-            cmd.pre_exec(move || drop_to_nobody(&all));
+            cmd.pre_exec(move || {
+                drop_to_nobody(&all)?;
+                match &fs {
+                    Some(rs) => rs.restrict_self(),
+                    None => Ok(()),
+                }
+            });
         }
     }
     cmd
@@ -397,10 +453,17 @@ pub async fn spawn_ingress(
         .await
         .context("cannot send the Ingress proxy its configuration")?;
     if sandbox && let Some(pid) = child.pid() {
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        // Fail closed: a status that cannot be read is not proof either.
+        let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            Ok(s) => s,
+            Err(e) => {
+                child.start_kill().ok();
+                bail!("cannot verify the Ingress proxy's sandbox ({e}); refusing to run it");
+            }
+        };
         let uid = parse_uid(&status);
         let eff = parse_cap_mask(&status, "CapEff");
-        if !status.is_empty() && (uid != Some(NOBODY) || eff != Some(0)) {
+        if uid != Some(NOBODY) || eff != Some(0) {
             child.start_kill().ok();
             bail!(
                 "the Ingress proxy is not sandboxed (uid {uid:?}, CapEff {eff:?}); refusing to run it"
@@ -450,6 +513,8 @@ impl RtbitSpec {
             ("XDG_DATA_HOME".into(), path(&self.data_home)),
             ("XDG_CONFIG_HOME".into(), path(&self.data_home)),
             ("XDG_CACHE_HOME".into(), path(&self.cache_home)),
+            // Temporary files stay inside the sandbox's writable folders.
+            ("TMPDIR".into(), path(&self.cache_home)),
             (
                 "RTBIT_HTTP_API_LISTEN_ADDR".into(),
                 format!("0.0.0.0:{}", self.webui_port),
@@ -561,6 +626,38 @@ impl RtbitSpec {
         Ok(())
     }
 
+    /// What rtbit may touch: shared storage (/media, /share), its download
+    /// and completed folders, its database and cache; system folders and its
+    /// own binary to start; /etc, /proc, /sys and /dev read-only. Not
+    /// /data, not /app_configs, not the rest of /config.
+    pub fn fs_policy(&self) -> FsPolicy {
+        let mut read_exec = landlock::system_read_exec();
+        read_exec.push(self.binary.clone());
+        let mut read_write = vec![
+            PathBuf::from("/media"),
+            PathBuf::from("/share"),
+            PathBuf::from("/dev/null"),
+        ];
+        for p in [
+            &self.download_dir,
+            &self.completed_dir,
+            &self.data_home,
+            &self.cache_home,
+        ] {
+            if !read_write.iter().any(|r| p.starts_with(r)) {
+                read_write.push(p.clone());
+            }
+        }
+        FsPolicy {
+            read_exec,
+            read_only: ["/etc", "/proc", "/sys", "/dev"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            read_write,
+        }
+    }
+
     fn base_command(&self, listen_port: u16) -> Command {
         let mut cmd = Command::new(&self.binary);
         cmd.env_clear()
@@ -571,10 +668,18 @@ impl RtbitSpec {
             .kill_on_drop(true);
         if self.sandbox {
             let drop = caps_to_drop(last_cap());
+            let fs = fs_sandbox("rtbit", &self.fs_policy(), &RTBIT_FS_ANNOUNCED);
             // SAFETY: the closure only performs async-signal-safe syscalls on
-            // pre-allocated data (see `drop_privileges`).
+            // pre-allocated data (see `drop_privileges`); `no_new_privs` is
+            // set before Landlock is applied.
             unsafe {
-                cmd.pre_exec(move || drop_privileges(&drop));
+                cmd.pre_exec(move || {
+                    drop_privileges(&drop)?;
+                    match &fs {
+                        Some(rs) => rs.restrict_self(),
+                        None => Ok(()),
+                    }
+                });
             }
         }
         cmd
@@ -677,9 +782,20 @@ impl Rtbit {
         let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
             Ok(s) => s,
             Err(e) => {
-                // Already exited: the exit path will report it.
-                debug!("cannot read rtbit status: {e}");
-                return Ok(());
+                let exited = self
+                    .child
+                    .as_mut()
+                    .is_some_and(|c| matches!(c.inner_mut().try_wait(), Ok(Some(_))));
+                if exited {
+                    // The exit path reports why it stopped.
+                    debug!("rtbit exited before its sandbox could be checked: {e}");
+                    return Ok(());
+                }
+                // Fail closed: still running, but nothing proves the sandbox.
+                if let Some(c) = self.child.as_mut() {
+                    c.start_kill().ok();
+                }
+                bail!("cannot verify rtbit's sandbox ({e}); refusing to run it");
             }
         };
         let eff = parse_cap_mask(&status, "CapEff").unwrap_or(u64::MAX);

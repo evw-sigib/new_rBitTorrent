@@ -14,6 +14,7 @@ pub mod firewall;
 pub mod ha_supervisor;
 pub mod host;
 pub mod ingress;
+pub mod landlock;
 pub mod migration;
 pub mod natpmp;
 pub mod process;

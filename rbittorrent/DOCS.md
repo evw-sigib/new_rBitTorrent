@@ -167,8 +167,13 @@ On a direct connection, the log shows this at every start:
 - There is no kill-switch and no tunnel. rtbit listens on `listen_port`
   (default 4240), TCP and UDP.
 - For inbound peers, map port 4240 in the app's *Network* section and
-  forward it on your router. Keep `listen_port` and the mapping the same.
+  forward it on your router. Inside the container, port 4240 is redirected
+  to `listen_port`, so the mapping works whatever `listen_port` is.
   UPnP stays off: the app never opens router ports by itself.
+- The Web UI and API port (8080) still only answers `local_allow_cidrs` and
+  Home Assistant's own network; the Ingress port (8099) only answers Home
+  Assistant. A small nftables table (`inet direct`) enforces this; if it
+  cannot be loaded, the app stops instead of starting with the Web UI open.
 
 ## Proton VPN setup
 
@@ -467,8 +472,12 @@ Routing:
 - Everything else goes through `wg0`, as two `/1` routes.
 - rtbit starts only after a WireGuard handshake is verified.
 
-rtbit itself runs without capabilities and with `no_new_privs`. Its UPnP, LSD
-and IPv6 are off. If the tunnel goes down, traffic stops: nothing falls back
+rtbit itself runs without any network capability and with `no_new_privs`;
+it keeps only the four file capabilities root needs on shared storage
+(`CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_FSETID`). A Landlock
+filesystem sandbox limits it to `/media`, `/share`, its download folders and
+its own state: `/data`, `/app_configs` and the WireGuard key in `/config` are
+out of reach. Its UPnP, LSD and IPv6 are off. If the tunnel goes down, traffic stops: nothing falls back
 to your normal connection.
 
 To check it yourself:
@@ -526,8 +535,14 @@ To check it yourself:
 - **Secrets:** the WireGuard private key goes to `wg` on stdin only, never on
   a command line, in the environment or in the log. The Web UI password
   follows the same rule.
-- **Processes:** the proxy, rtbit and the helpers run without capabilities.
-  The proxy also runs as uid 65534.
+- **Processes:** rtbit has no network capability, only the four file
+  capabilities listed above; the proxy runs as uid 65534 with none at all.
+  Both run with `no_new_privs`.
+- **Filesystem sandbox:** where the kernel supports Landlock (ABI 2 or
+  newer, Linux 5.19+), rtbit may write only to `/media`, `/share`, its
+  download folders and its own state, and the Ingress proxy may write
+  nowhere. The log says at start whether the sandbox is active. Older
+  kernels run without it and the log says so.
 - **Direct connection:** without a VPN, the app runs without a kill-switch
   and says so in the log and the sidebar. Any WireGuard setup switches the
   VPN on, and from then on it never falls back.

@@ -299,11 +299,219 @@ pub async fn set_bt_ports(runner: &impl Runner, ports: &[u16]) -> Result<()> {
         .context("cannot update the forwarded-port firewall set")
 }
 
+// ---------------------------------------------------------------------------
+// Direct connection (VPN off)
+// ---------------------------------------------------------------------------
+
+/// The direct-mode table: no kill-switch, but the Web UI and Ingress ports
+/// keep the access rules the app promises, and the published BitTorrent port
+/// reaches rtbit whatever `listen_port` is.
+pub const DIRECT_TABLE: &str = "direct";
+
+#[derive(Debug, Clone)]
+pub struct DirectSpec {
+    /// LAN ranges allowed to reach the Web UI/API (`local_allow_cidrs`).
+    pub lan_cidrs: Vec<Ipv4Cidr>,
+    pub webui_port: u16,
+    pub ingress_port: u16,
+    /// Home Assistant's internal network (Ingress, the watchdog).
+    pub ingress_sources: Ipv4Cidr,
+    /// The container port Home Assistant publishes for BitTorrent (4240).
+    pub published_bt_port: u16,
+    /// The port rtbit listens on (`listen_port`).
+    pub listen_port: u16,
+}
+
+/// Renders the direct-mode table. Only the Web UI and Ingress ports are
+/// filtered (input policy stays accept); when `listen_port` differs from
+/// the published port, TCP and UDP to the published port are redirected to
+/// it, so `host:<mapped> -> container:4240` still lands on rtbit.
+pub fn render_direct_ruleset(spec: &DirectSpec) -> Result<String> {
+    let ports = [
+        spec.webui_port,
+        spec.ingress_port,
+        spec.published_bt_port,
+        spec.listen_port,
+    ];
+    if ports.contains(&0) {
+        bail!("firewall ports must be non-zero");
+    }
+    if spec.webui_port == spec.ingress_port {
+        bail!("the Web UI and Ingress ports must differ");
+    }
+    if [spec.webui_port, spec.ingress_port].contains(&spec.listen_port) {
+        bail!("listen_port must differ from the Web UI and Ingress ports");
+    }
+    let webui = spec.webui_port;
+    let ingress = spec.ingress_port;
+    let ingress_src = spec.ingress_sources.network();
+    let mut lan_cidrs = spec.lan_cidrs.clone();
+    lan_cidrs.push(ingress_src);
+    let lan_elems = crate::cidr::collapse(&lan_cidrs)
+        .iter()
+        .map(|c| c.network().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut s = String::with_capacity(1024);
+    let _ = writeln!(s, "#!/usr/sbin/nft -f");
+    let _ = writeln!(
+        s,
+        "# rbittorrent direct connection: port access rules (generated, do not edit)"
+    );
+    let _ = writeln!(s, "add table {TABLE_FAMILY} {DIRECT_TABLE}");
+    let _ = writeln!(s, "delete table {TABLE_FAMILY} {DIRECT_TABLE}");
+    let _ = writeln!(s, "table {TABLE_FAMILY} {DIRECT_TABLE} {{");
+    let _ = writeln!(s, "\tset {LAN_SET} {{");
+    let _ = writeln!(s, "\t\ttype ipv4_addr");
+    let _ = writeln!(s, "\t\tflags interval");
+    let _ = writeln!(s, "\t\telements = {{ {lan_elems} }}");
+    let _ = writeln!(s, "\t}}");
+    if spec.listen_port != spec.published_bt_port {
+        let from = spec.published_bt_port;
+        let to = spec.listen_port;
+        let _ = writeln!(s, "\tchain prerouting {{");
+        let _ = writeln!(
+            s,
+            "\t\ttype nat hook prerouting priority dstnat; policy accept;"
+        );
+        let _ = writeln!(s, "\t\ttcp dport {from} redirect to :{to}");
+        let _ = writeln!(s, "\t\tudp dport {from} redirect to :{to}");
+        let _ = writeln!(s, "\t}}");
+    }
+    let _ = writeln!(s, "\tchain input {{");
+    let _ = writeln!(
+        s,
+        "\t\ttype filter hook input priority filter; policy accept;"
+    );
+    let _ = writeln!(s, "\t\tiifname \"lo\" accept");
+    let _ = writeln!(s, "\t\ttcp dport {ingress} ip saddr {ingress_src} accept");
+    let _ = writeln!(s, "\t\ttcp dport {webui} ip saddr @{LAN_SET} accept");
+    // IPv6 never matches the IPv4 rules above, so it is dropped here too.
+    let _ = writeln!(s, "\t\ttcp dport {{ {webui}, {ingress} }} drop");
+    let _ = writeln!(s, "\t}}");
+    let _ = writeln!(s, "}}");
+    Ok(s)
+}
+
+/// Installs the direct-mode table and reads it back.
+pub async fn install_direct(runner: &impl Runner, spec: &DirectSpec) -> Result<()> {
+    let script = render_direct_ruleset(spec)?;
+    apply_script(runner, &script)
+        .await
+        .context("cannot load the direct-mode port rules (does the app have NET_ADMIN?)")?;
+    let listing = runner
+        .run("nft", &["list", "table", TABLE_FAMILY, DIRECT_TABLE], None)
+        .await
+        .context("cannot read back the direct-mode port rules")?;
+    verify_direct_listing(&listing.stdout, spec)
+}
+
+/// Fail-closed check: the table, its input hook and the drop rule for the
+/// Web UI and Ingress ports are there.
+pub fn verify_direct_listing(listing: &str, spec: &DirectSpec) -> Result<()> {
+    let header = format!("table {TABLE_FAMILY} {DIRECT_TABLE}");
+    if !listing.contains(&header) {
+        bail!("direct-mode rules missing: `nft list table` did not show `{header}`");
+    }
+    let has_input = listing.lines().any(|l| l.contains("hook input "));
+    let drops = listing.lines().any(|l| {
+        l.contains("drop")
+            && l.contains(&spec.webui_port.to_string())
+            && l.contains(&spec.ingress_port.to_string())
+    });
+    if !has_input || !drops {
+        bail!("direct-mode rules incomplete: no input rule dropping the Web UI and Ingress ports");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::exec::fake::FakeRunner;
     use std::net::Ipv4Addr;
+
+    fn direct_spec(listen_port: u16) -> DirectSpec {
+        DirectSpec {
+            lan_cidrs: vec!["192.168.0.0/16".parse().unwrap()],
+            webui_port: 8080,
+            ingress_port: 8099,
+            ingress_sources: "172.30.32.0/23".parse().unwrap(),
+            published_bt_port: 4240,
+            listen_port,
+        }
+    }
+
+    #[test]
+    fn direct_mode_filters_the_ui_ports_and_redirects_the_published_port() {
+        let r = render_direct_ruleset(&direct_spec(51413)).unwrap();
+        assert!(
+            r.contains("add table inet direct\ndelete table inet direct\n"),
+            "{r}"
+        );
+        assert!(
+            r.contains("elements = { 172.30.32.0/23, 192.168.0.0/16 }"),
+            "{r}"
+        );
+        let pre = chain(&r, "prerouting");
+        assert_eq!(
+            pre,
+            vec![
+                "type nat hook prerouting priority dstnat; policy accept;",
+                "tcp dport 4240 redirect to :51413",
+                "udp dport 4240 redirect to :51413",
+            ]
+        );
+        let input = chain(&r, "input");
+        assert_eq!(
+            input,
+            vec![
+                "type filter hook input priority filter; policy accept;",
+                "iifname \"lo\" accept",
+                "tcp dport 8099 ip saddr 172.30.32.0/23 accept",
+                "tcp dport 8080 ip saddr @lan_cidrs accept",
+                "tcp dport { 8080, 8099 } drop",
+            ]
+        );
+        // Same port: no NAT chain at all.
+        let same = render_direct_ruleset(&direct_spec(4240)).unwrap();
+        assert!(!same.contains("prerouting"), "{same}");
+        // Nonsense is refused.
+        assert!(render_direct_ruleset(&direct_spec(8080)).is_err());
+        assert!(render_direct_ruleset(&direct_spec(0)).is_err());
+    }
+
+    #[test]
+    fn direct_mode_verification_fails_closed() {
+        let sp = direct_spec(4240);
+        assert!(verify_direct_listing("", &sp).is_err());
+        assert!(verify_direct_listing("table inet direct {\n}\n", &sp).is_err());
+        let ok = "table inet direct {\n\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n\t\ttcp dport { 8080, 8099 } drop\n\t}\n}\n";
+        assert!(verify_direct_listing(ok, &sp).is_ok());
+    }
+
+    #[tokio::test]
+    async fn direct_install_pipes_the_script_and_reads_it_back() {
+        let sp = direct_spec(51413);
+        let listing = "table inet direct {\n\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n\t\ttcp dport { 8080, 8099 } drop\n\t}\n}\n";
+        let runner = FakeRunner::default();
+        runner.respond("nft list table", listing);
+        install_direct(&runner, &sp).await.unwrap();
+        let calls = runner.calls();
+        assert_eq!(calls[0].line(), "nft -f -");
+        assert!(
+            calls[0]
+                .stdin
+                .as_deref()
+                .unwrap()
+                .contains("redirect to :51413")
+        );
+        assert_eq!(calls[1].line(), "nft list table inet direct");
+        // Without a listing (nft printed nothing), it fails closed.
+        let empty = FakeRunner::default();
+        assert!(install_direct(&empty, &sp).await.is_err());
+    }
 
     fn spec() -> RulesetSpec {
         RulesetSpec {
@@ -651,6 +859,23 @@ mod tests {
         assert!(!out.contains("41000"), "{out}");
         runner
             .run("nft", &["delete", "table", "inet", "killswitch"], None)
+            .await
+            .unwrap();
+
+        // Direct mode: the access rules and the port redirect load as well.
+        let direct = direct_spec(51413);
+        install_direct(&runner, &direct).await.unwrap();
+        install_direct(&runner, &direct).await.unwrap();
+        let out = runner
+            .run("nft", &["list", "table", "inet", "direct"], None)
+            .await
+            .unwrap()
+            .stdout;
+        eprintln!("{out}");
+        assert!(out.contains("redirect to :51413"), "{out}");
+        assert_eq!(out.matches("hook input").count(), 1, "{out}");
+        runner
+            .run("nft", &["delete", "table", "inet", "direct"], None)
             .await
             .unwrap();
     }

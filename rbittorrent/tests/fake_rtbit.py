@@ -44,6 +44,44 @@ def status_fields():
     return fields
 
 
+def sandbox_probes():
+    """What a compromised rtbit could reach: the app's secrets and the other
+    apps' configs (derived from XDG_DATA_HOME = <config>/db)."""
+    config = os.path.dirname(DATA.rstrip("/"))
+    work = os.path.dirname(config)
+    probes = {}
+    for name, path in [
+        ("wg0.conf", os.path.join(config, "wg0.conf")),
+        ("webui-password", os.path.join(config, ".webui-password")),
+        ("options.json", os.path.join(work, "data", "options.json")),
+        ("app_configs", os.path.join(work, "app_configs")),
+    ]:
+        try:
+            if os.path.isdir(path):
+                os.listdir(path)
+            else:
+                with open(path, "rb") as f:
+                    f.read(1)
+            probes[name] = "readable"
+        except FileNotFoundError:
+            probes[name] = "missing"
+        except OSError:
+            probes[name] = "denied"
+    try:
+        fd = os.open(os.path.join(config, "planted"), os.O_WRONLY | os.O_CREAT, 0o600)
+        os.close(fd)
+        probes["write-config"] = "writable"
+    except OSError:
+        probes["write-config"] = "denied"
+    try:
+        with open(os.path.join(DATA, "probe"), "w", encoding="ascii") as f:
+            f.write("ok")
+        probes["write-db"] = "writable"
+    except OSError:
+        probes["write-db"] = "denied"
+    return probes
+
+
 def read_request(conn):
     """(method, path, headers, body) of one HTTP/1.1 request, or None."""
     data = b""
@@ -200,6 +238,7 @@ def main():
         "argv": sys.argv[1:],
         "env": env,
         "status": status_fields(),
+        "probes": sandbox_probes(),
         "time": time.time(),
     })
 

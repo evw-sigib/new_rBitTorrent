@@ -44,7 +44,7 @@ use tracing::{debug, error, info, warn};
 
 use rbittorrent_supervisor::config::{Options, Paths, Secret, Settings, VpnSettings};
 use rbittorrent_supervisor::exec::{Runner, SystemRunner};
-use rbittorrent_supervisor::firewall::RulesetSpec;
+use rbittorrent_supervisor::firewall::{DirectSpec, RulesetSpec};
 use rbittorrent_supervisor::host::{self, PortState};
 use rbittorrent_supervisor::ingress::{self, Health};
 use rbittorrent_supervisor::migration::{self, SeedJob};
@@ -563,6 +563,35 @@ async fn supervise_direct(
     ingress_line: String,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    // Fail closed: without these rules the Web UI would be open to anyone
+    // who can reach the container, so rtbit does not start.
+    let rules = DirectSpec {
+        lan_cidrs: s.local_allow_cidrs.clone(),
+        webui_port: s.webui_port,
+        ingress_port: s.ingress_port,
+        ingress_sources: config::HASSIO_NETWORK,
+        published_bt_port: config::DEFAULT_LISTEN_PORT,
+        listen_port: s.fallback_listen_port,
+    };
+    firewall::install_direct(runner, &rules).await?;
+    let cidrs: Vec<String> = s
+        .local_allow_cidrs
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    info!(
+        "direct connection: LAN [{}] may reach port {}, Home Assistant {} may reach Ingress port {}",
+        cidrs.join(", "),
+        s.webui_port,
+        config::HASSIO_NETWORK,
+        s.ingress_port
+    );
+    if rules.listen_port != rules.published_bt_port {
+        info!(
+            "direct connection: container port {} (TCP+UDP) is redirected to listen_port {}",
+            rules.published_bt_port, rules.listen_port
+        );
+    }
     let (health, health_rx) = watch::channel(Health {
         direct: true,
         port: Some(s.fallback_listen_port),

@@ -10,7 +10,7 @@
 
 1. In Home Assistant, go to *Settings* → *Apps* → *App store* → ⋮ →
    *Repositories*.
-2. Add `https://github.com/evw-sigib/new_rbittorrent`.
+2. Add `https://github.com/evw-sigib/new_rBitTorrent`.
 3. Install **rBittorrent** and read its *Documentation* tab. Moving from
    qBittorrent: stop that app first, then start rBittorrent. It takes over
    the VPN file, folders and categories by itself.
@@ -47,4 +47,4 @@ patches in `rbittorrent/rtbit/`: the mimalloc allocator, a startup-log fix
 and a build-only Swagger UI change.
 
 [repo-badge]: https://img.shields.io/badge/Add%20repository-Home%20Assistant-41BDF5?logo=home-assistant
-[repo-add]: https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fevw-sigib%2Fnew_rbittorrent
+[repo-add]: https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fevw-sigib%2Fnew_rBitTorrent

@@ -50,6 +50,7 @@ LAN_SERVICE_PORT = 8082
 INGRESS_PORT = 8099
 # Home Assistant's Supervisor (Ingress + watchdog) and another app's address.
 SUPERVISOR_IP, OTHER_APP_IP = "172.30.32.2", "172.30.32.3"
+DIRECT_LISTEN_PORT = 51413
 PORT_A, PORT_B = 45678, 45679
 CANARY_TCP, CANARY_UDP = 8081, 53
 
@@ -564,6 +565,15 @@ def checks(sup, cli_priv, supervisor):
           f"no NET_ADMIN/NET_RAW/SYS_ADMIN (CapEff={eff:#x})")
     check(int(st["CapAmb"], 16) == 0 and int(st["CapInh"], 16) == 0, "no ambient/inheritable caps")
     check(st.get("NoNewPrivs") == "1", "no_new_privs set")
+    probes = first.get("probes", {})
+    if "rtbit filesystem sandbox active" in log_text():
+        for name in ("wg0.conf", "webui-password", "options.json", "app_configs", "write-config"):
+            check(probes.get(name) == "denied",
+                  f"Landlock: rtbit cannot reach {name} ({probes.get(name)})")
+        check(probes.get("write-db") == "writable", "Landlock: rtbit can write its database folder")
+        check(not (WORK / "config" / "planted").exists(), "Landlock: nothing planted in /config")
+    else:
+        print(f"  info  Landlock unavailable on this kernel; rtbit probes: {probes}")
 
     step("routes, tunnel and firewall state")
     routes = sh("ip", "-4", "route", "show", ns=NS_CLI).stdout
@@ -707,7 +717,9 @@ def run_direct_test(supervisor: Path):
     resolv = WORK / "resolv.conf"
     resolv.write_text("nameserver 8.8.8.8\n")
     options = {
-        "listen_port": 4240,
+        # Not 4240: Home Assistant publishes container port 4240, so the
+        # direct-mode table must redirect it to listen_port.
+        "listen_port": DIRECT_LISTEN_PORT,
         "download_dir": str(MEDIA / "downloads"),
         "completed_dir": str(MEDIA / "completed"),
         "local_allow_cidrs": ["10.99.0.0/24"],
@@ -741,23 +753,38 @@ def run_direct_test(supervisor: Path):
         text = log_text()
         check("VPN OFF" in text, "loud warning: the connection is unprotected")
         check("real IP address" in text, "the warning says peers see the real IP address")
-        check(first["env"].get("RTBIT_LISTEN_PORT") == "4240", "rtbit listens on listen_port 4240")
+        check(first["env"].get("RTBIT_LISTEN_PORT") == str(DIRECT_LISTEN_PORT),
+              f"rtbit listens on listen_port {DIRECT_LISTEN_PORT}")
         check("RTBIT_BIND_DEVICE" not in first["env"], "rtbit is not bound to wg0")
         check(first["env"].get("RTBIT_LISTEN_IP") == "0.0.0.0", "rtbit listens on all addresses")
         check("SUPERVISOR_TOKEN" not in first["env"], "no Supervisor token in rtbit's environment")
         tables = sh("nft", "list", "tables", ns=NS_CLI, check=False).stdout
         check("killswitch" not in tables, f"no kill-switch table in direct mode ({tables.strip()!r})")
+        check("inet direct" in tables, f"direct-mode port rules installed ({tables.strip()!r})")
+        rules = sh("nft", "list", "table", "inet", "direct", ns=NS_CLI, check=False).stdout
+        check(f"udp dport 4240 redirect to :{DIRECT_LISTEN_PORT}" in rules,
+              "UDP to the published port 4240 is redirected to listen_port")
         links = sh("ip", "link", "show", ns=NS_CLI).stdout
         check("wg0" not in links, "no wg0 in direct mode")
         check(resolv.read_text() == "nameserver 8.8.8.8\n", "resolv.conf untouched")
         check(not inet_state()["pmp"], "no NAT-PMP requests")
         ok, out = tcp_probe(NS_RTR, "10.99.0.2", 4240)
-        check(ok, f"peers can reach listen_port 4240 directly ({out})")
+        check(ok, f"peers reach rtbit through the published port 4240 ({out})")
+        ok, out = tcp_probe(NS_RTR, "10.99.0.2", DIRECT_LISTEN_PORT)
+        check(ok, f"peers reach listen_port {DIRECT_LISTEN_PORT} directly ({out})")
+        ok, out = tcp_probe(NS_RTR, "10.99.0.2", 8080)
+        check(ok, f"the LAN (local_allow_cidrs) reaches the Web UI ({out})")
+        ok, out = tcp_probe(NS_INET, "10.99.0.2", 8080)
+        check(not ok, f"the Web UI is closed to addresses outside local_allow_cidrs ({out})")
+        ok, out = tcp_probe(NS_INET, "10.99.0.2", INGRESS_PORT)
+        check(not ok, f"the Ingress port is closed to the internet ({out})")
+        ok, out = tcp_probe(NS_RTR, "10.99.0.2", INGRESS_PORT)
+        check(not ok, f"the Ingress port is closed to the LAN ({out})")
         status, body = wait_for(
             lambda: (lambda r: r if r[0] == 200 else None)(
                 http_get(NS_RTR, SUPERVISOR_IP, "10.99.0.2", INGRESS_PORT, "/__health")),
             60, "watchdog /__health = 200 in direct mode")
-        check('"vpn":false' in body and '"port":4240' in body,
+        check('"vpn":false' in body and f'"port":{DIRECT_LISTEN_PORT}' in body,
               f"/__health reports the direct connection for the status bar ({body})")
         status, body = http_get(NS_RTR, OTHER_APP_IP, "10.99.0.2", INGRESS_PORT, "/__health")
         check(status == 403, f"the Ingress proxy still refuses other apps ({status})")

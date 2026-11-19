@@ -111,7 +111,7 @@ const BENCHMARK_COOLDOWN: Duration = Duration::from_secs(10);
 const HARDWARE_TIMEOUT: Duration = Duration::from_secs(20);
 /// The setup guides the status bar links to.
 pub const DOCS_URL: &str =
-    "https://github.com/evw-sigib/new_rbittorrent/blob/main/rbittorrent/DOCS.md";
+    "https://github.com/evw-sigib/new_rBitTorrent/blob/main/rbittorrent/DOCS.md";
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// Body type used for every request and response the proxy produces.

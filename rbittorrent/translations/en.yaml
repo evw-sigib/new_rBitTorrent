@@ -140,9 +140,9 @@ network:
     qBittorrent integration (password-protected). The sidebar does not need
     this port.
   4240/tcp: >-
-    BitTorrent peers on a direct connection (VPN off) only. Keep it equal to
-    the listen port. Unused with the VPN on: the tunnel carries all torrent
-    traffic.
+    BitTorrent peers on a direct connection (VPN off) only. The app forwards
+    it to the listen port inside the container. Unused with the VPN on: the
+    tunnel carries all torrent traffic.
   4240/udp: >-
     BitTorrent peers (uTP) and DHT on a direct connection (VPN off) only.
-    Keep it equal to the listen port.
+    The app forwards it to the listen port inside the container.

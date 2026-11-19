@@ -47,9 +47,15 @@ jobs:
         working-directory: ${{ env.CRATE_DIR }}
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq nftables
-          BIN=$(cargo test --locked --no-run --message-format=json \
-            | jq -r 'select(.profile.test == true and .executable != null) | .executable' | head -n1)
-          sudo NFT_LIVE_TEST=1 unshare -n "$BIN" nft_live --nocapture
+          # The library's unit-test binary (the only one with nft_live).
+          BIN=$(cargo test --locked --lib --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .executable != null and .target.kind == ["lib"]) | .executable')
+          test "$(wc -l <<<"$BIN")" -eq 1
+          out=$(sudo NFT_LIVE_TEST=1 unshare -n "$BIN" nft_live --nocapture 2>&1)
+          echo "$out"
+          # A filter that matches nothing also "passes": require the test ran.
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out"
+          if grep -q 'skipped (set NFT_LIVE_TEST' <<<"$out"; then exit 1; fi
       # mimalloc is C, so the musl targets need a cross C compiler: zig.
       - uses: actions/setup-python@v5
         with:
@@ -226,7 +232,15 @@ jobs:
           echo "::endgroup::"
           echo "::group::direct mode: fresh install without a VPN"
           echo '{}' > direct.json
-          docker run -d --name direct --platform "$PLATFORM" \
+          # Without NET_ADMIN the Web UI port rules cannot be loaded, so the
+          # app must stop instead of exposing 8080 to everyone.
+          set +e
+          out=$(run -v "$PWD/direct.json:/data/options.json:ro" "$IMG" 2>&1); code=$?
+          set -e
+          echo "$out" | tail -n 20
+          test "$code" -eq 1
+          grep -q 'direct-mode port rules' <<<"$out"
+          docker run -d --name direct --platform "$PLATFORM" --cap-add NET_ADMIN \
             -v "$PWD/direct.json:/data/options.json:ro" "$IMG"
           ok=0
           for i in $(seq 1 90); do
@@ -237,6 +251,10 @@ jobs:
           tail -n 60 <<<"$logs"
           test "$ok" -eq 1
           grep -q 'VPN OFF' <<<"$logs"
+          grep -q 'direct connection: LAN \[' <<<"$logs"
+          # Landlock depends on the runner's kernel: report it, never require it.
+          grep -E 'filesystem sandbox' <<<"$logs" || echo "no filesystem sandbox line"
+          docker exec direct nft list table inet direct
           # The supervisor stores the Web UI account before rtbit's first
           # start: the API on 8080 is never open, even on a fresh install.
           grep -q 'auth: enabled (user "admin")' <<<"$logs"
