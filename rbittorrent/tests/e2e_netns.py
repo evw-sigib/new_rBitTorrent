@@ -500,7 +500,12 @@ Endpoint = {ENDPOINT_IP}:51820
 """
     write_legacy_qbittorrent(WORK / "app_configs" / LEGACY_SLUG, conf)
     # No VPN options, default folders and user: everything comes from qBittorrent.
+    # The Supervisor writes every option config.yaml gives a default, so the
+    # default folders are in options.json (a missing `completed_dir` means
+    # the user cleared it, and then the imported folders are not used).
     options = {
+        "download_dir": "/media/rbittorrent/downloads",
+        "completed_dir": "/media/rbittorrent/completed",
         "import_from_qbittorrent": True,
         "import_active_torrents": True,
         "enable_nat_pmp": True,

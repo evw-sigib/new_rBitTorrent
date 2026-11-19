@@ -1462,6 +1462,30 @@ mod tests {
     }
 
     #[test]
+    fn imported_folders_replace_only_the_default_folders() {
+        let rec = Record {
+            download_dir: Some("/media/qbt/incomplete".into()),
+            completed_dir: Some("/media/qbt".into()),
+            ..Record::default()
+        };
+        // What the Supervisor writes for an untouched install: every default.
+        let mut o: Options = serde_json::from_str(
+            r#"{"download_dir": "/media/rbittorrent/downloads",
+                "completed_dir": "/media/rbittorrent/completed"}"#,
+        )
+        .unwrap();
+        assert_eq!(apply_record(&mut o, &rec).len(), 1);
+        assert_eq!(o.download_dir, "/media/qbt/incomplete");
+        assert_eq!(o.completed_dir.as_deref(), Some("/media/qbt"));
+        // A cleared `completed_dir` (the key is gone) is the user's choice.
+        let mut o: Options =
+            serde_json::from_str(r#"{"download_dir": "/media/rbittorrent/downloads"}"#).unwrap();
+        assert!(apply_record(&mut o, &rec).is_empty());
+        assert_eq!(o.download_dir, "/media/rbittorrent/downloads");
+        assert_eq!(o.completed_dir, None);
+    }
+
+    #[test]
     fn unusable_save_paths_are_not_taken_over() {
         let (rec, notes) = build_record(
             &[LegacyInstall {
