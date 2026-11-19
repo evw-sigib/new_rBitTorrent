@@ -176,7 +176,11 @@ jobs:
           if run --entrypoint /usr/local/bin/rbittorrent-supervisor "$IMG" healthcheck; then exit 1; fi
           run --entrypoint /usr/local/bin/rtbit "$IMG" --version
           run --entrypoint /usr/local/bin/rtbit "$IMG" --help | sed -n 1,20p
-          run --entrypoint /usr/local/bin/rtbit "$IMG" server start --help | grep -E 'disable-upnp-port-forward|disable-lsd|bind-device|ipv4-only'
+          # The flags the supervisor relies on are rtbit's global options.
+          help=$(run --entrypoint /usr/local/bin/rtbit "$IMG" --help)
+          for flag in disable-upnp-port-forward disable-lsd bind-device ipv4-only listen-port; do
+            grep -q -- "--$flag" <<<"$help" || { echo "rtbit --help lacks --$flag"; exit 1; }
+          done
           # rtbit is our own build: mimalloc is linked in as the allocator.
           run --entrypoint /bin/sh "$IMG" -c 'grep -c mimalloc /usr/local/bin/rtbit' | grep -qv '^0$'
           echo "::endgroup::"
