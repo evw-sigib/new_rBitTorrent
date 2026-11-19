@@ -284,6 +284,32 @@ jobs:
           if docker exec direct cat /proc/1/environ >/dev/null 2>&1; then
             echo "PID 1's environment is readable"; exit 1
           fi
+          # Memory of the three processes (KiB), idle and with 30 paused
+          # torrents; the runner is a LAN client of the Web UI on 8080.
+          ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' direct)
+          pw=$(docker exec direct cat /config/.webui-password)
+          rss() {
+            docker exec direct /bin/sh -c 'for p in $(pidof rbittorrent-supervisor rtbit); do
+              echo "$(cat /proc/$p/comm) $p $(grep VmRSS /proc/$p/status | tr -s " " | cut -d" " -f2)"; done'
+          }
+          sleep 10
+          idle=$(rss)
+          # The qBittorrent API calls Sonarr, Radarr and the HA integration
+          # make, against the real rtbit inside the Landlock sandbox.
+          echo "::group::qBittorrent API against the real rtbit (Landlock)"
+          python3 -I "$APP_DIR/tests/qbit_api_smoke.py" "http://$ip:8080" admin "$pw" /media/rbittorrent/downloads
+          python3 -I "$APP_DIR/tests/qbit_api_smoke.py" --load 30 "http://$ip:8080" admin "$pw"
+          echo "::endgroup::"
+          sleep 10
+          loaded=$(rss)
+          mem() { awk -v n="$1" -v want="$2" '$1 ~ n && (want == "" || (want == "1") == ($2 == 1)) {print $3; exit}'; }
+          {
+            echo "| memory (VmRSS) | idle | 30 paused torrents |"
+            echo "|---|---|---|"
+            echo "| supervisor (PID 1) | $(mem rbittorrent 1 <<<"$idle") KiB | $(mem rbittorrent 1 <<<"$loaded") KiB |"
+            echo "| Ingress proxy | $(mem rbittorrent 0 <<<"$idle") KiB | $(mem rbittorrent 0 <<<"$loaded") KiB |"
+            echo "| rtbit | $(mem rtbit "" <<<"$idle") KiB | $(mem rtbit "" <<<"$loaded") KiB |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
           docker stop -t 30 direct
           test "$(docker inspect -f '{{.State.ExitCode}}' direct)" -eq 0
           logs=$(docker logs direct 2>&1)
@@ -394,6 +420,11 @@ jobs:
           if docker exec aa cat /proc/1/environ >/dev/null 2>&1; then
             echo "PID 1's environment is readable"; exit 1
           fi
+          # The same API calls with rtbit confined by AppArmor alone.
+          ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' aa)
+          pw=$(docker exec aa cat /config/.webui-password)
+          python3 -I "$APP_DIR/tests/qbit_api_smoke.py" "http://$ip:8080" admin "$pw" /media/rbittorrent/downloads
+          sudo dmesg | grep 'apparmor="DENIED"' | tail -n 20 || true
           docker stop -t 30 aa
           test "$(docker inspect -f '{{.State.ExitCode}}' aa)" -eq 0
           docker rm aa >/dev/null
@@ -407,8 +438,7 @@ jobs:
             echo "| rbittorrent-supervisor | $(stat -c %s rbittorrent-supervisor) bytes |"
             echo "| rtbit | $(stat -c %s rtbit) bytes |"
           } | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: rtbit memory benchmark (native amd64 only)
-        if: matrix.arch == 'amd64'
+      - name: rtbit memory benchmark (rtbit alone)
         env:
           IMG: local/rbittorrent:test
         run: |
@@ -435,7 +465,7 @@ jobs:
           docker exec bench cat /proc/1/status | grep -E 'VmRSS|VmHWM|RssAnon|RssFile|Threads'
           docker rm -f bench >/dev/null
           {
-            echo "| rtbit idle RSS (musl, amd64 runner) | ${idle} KiB |"
+            echo "| rtbit alone, idle RSS (${{ matrix.arch }}) | ${idle} KiB |"
             echo "| rtbit RSS after setup + 3 logins | ${after} KiB |"
           } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Keep the tested image for publishing

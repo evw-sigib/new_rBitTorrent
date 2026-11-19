@@ -130,7 +130,11 @@ pub fn status_banner(
     let _ = writeln!(s, "| VPN public IP   {ip}");
     let _ = writeln!(s, "| Forwarded port  {port}");
     let _ = writeln!(s, "| qBittorrent     {migration}");
-    let _ = writeln!(s, "| CPU cores       {cores} (all available to rtbit)");
+    let _ = writeln!(
+        s,
+        "| CPU cores       {cores} (rtbit at nice {}, below Home Assistant)",
+        crate::process::RTBIT_NICE
+    );
     let _ = writeln!(s, "| Storage         {storage}");
     s.push_str("+---------------------------------------------------------------+");
     s
@@ -212,7 +216,7 @@ mod tests {
         assert!(lines[0].contains("185.159.156.1"));
         assert!(lines[1].contains("45678 TCP+UDP"));
         assert!(lines[2].contains("3 categories"));
-        assert!(lines[3].contains("4 (all available"));
+        assert!(lines[3].contains("4 (rtbit at nice 10"));
         assert!(lines[4].contains("412.3 GiB"));
         let b = status_banner(None, PortState::Pending(4240), "off", 1, "x");
         assert!(b.contains("not verified") && b.contains("none yet"));

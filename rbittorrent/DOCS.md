@@ -367,6 +367,17 @@ It always asks for the user name and password. Only the networks in
 `local_allow_cidrs` can reach it, and they only ever get replies: torrent
 traffic never leaves through your LAN.
 
+CI checks the calls these clients make against the real rtbit, inside
+both sandboxes (`tests/qbit_api_smoke.py`): login and logout,
+`app/version`, `webapiVersion`, `preferences`, `defaultSavePath`,
+categories, `.torrent` uploads with a category, save path and `paused`,
+`torrents/info` with its filters, `properties`, `files`, `trackers`,
+`setCategory`, tags, pause/resume/start/stop/recheck, `transfer/info`,
+`sync/maindata` and `delete`. One difference from qBittorrent: rtbit
+answers a **magnet** link only once it has the torrent's metadata from
+peers (usually a few seconds; with no peers, the request waits and may
+time out in Sonarr, which then retries).
+
 To use another host port, change it in the *Network* section of the app
 page. Clear it to close the port. Inside the container it stays 8080.
 
@@ -446,7 +457,7 @@ At startup and whenever the forwarded port changes, the log shows:
 | VPN public IP   185.159.156.1 (verified through the tunnel via NAT-PMP)
 | Forwarded port  45678 TCP+UDP (NAT-PMP, peers can connect)
 | qBittorrent     done earlier (from db21ed7f_qbittorrent)
-| CPU cores       4 (all available to rtbit)
+| CPU cores       4 (rtbit at nice 10, below Home Assistant)
 | Storage         412.3 GiB free on /media/torrents/incomplete
 +---------------------------------------------------------------+
 ```
