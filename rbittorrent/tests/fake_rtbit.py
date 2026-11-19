@@ -5,7 +5,7 @@ Records how the supervisor launched it (env, argv, capabilities), listens on
 the Web UI port and on the BitTorrent port it was given, and exits cleanly on
 SIGTERM, like rtbit does.
 
-* `auth reset-password -u USER` reads the password from stdin and records
+* `auth reset-password --username=USER` reads the password from stdin and records
   only whether it arrived there (never the value). The value is kept in a
   private file so the fake qBittorrent login below can check it.
 * The Web UI port answers `/healthz` and the qBittorrent API calls the
@@ -167,7 +167,8 @@ def listen(ip, port, api):
 
 def auth_command():
     password = sys.stdin.readline().rstrip("\n")
-    username = sys.argv[-1]
+    arg = sys.argv[-1]
+    username = arg.split("=", 1)[1] if arg.startswith("--username=") else arg
     record({
         "event": "auth",
         "pid": os.getpid(),

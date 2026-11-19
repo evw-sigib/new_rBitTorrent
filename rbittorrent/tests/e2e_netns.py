@@ -513,7 +513,7 @@ def checks(sup, cli_priv, supervisor):
     check(len(auths) == 1, f"rtbit auth reset-password ran once ({len(auths)})")
     if auths:
         a = auths[0]
-        check(a["argv"] == ["auth", "reset-password", "-u", LEGACY_USER],
+        check(a["argv"] == ["auth", "reset-password", f"--username={LEGACY_USER}"],
               f"imported qBittorrent user name used ({a['argv']})")
         check(a["password_len"] == 24, "generated 24-character password arrived on stdin")
         check(not a["password_in_argv"] and not a["password_in_env"], "password not in argv/env")

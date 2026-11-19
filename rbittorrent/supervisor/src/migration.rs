@@ -29,17 +29,19 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::bencode;
 use crate::config::{self, Options, Secret};
-use crate::rtbit_api::{CategoryOutcome, RtbitApi, TorrentUpload};
+use crate::rtbit_api::{self, CategoryOutcome, RtbitApi, TorrentUpload};
 
 pub const MIGRATED_MARKER: &str = ".migrated";
 pub const TORRENTS_MARKER: &str = ".torrents_migrated";
 const RECORD_VERSION: u32 = 1;
 const MAX_WALK_DEPTH: usize = 4;
 const MAX_WALK_ENTRIES: usize = 20_000;
+/// A folder with more entries than this is a download folder: not walked.
+const MAX_DIR_ENTRIES: usize = 2_000;
 const MAX_TEXT_FILE: u64 = 1 << 20;
 const MAX_TORRENT_FILE: u64 = 32 << 20;
 /// Upper bound on imported torrents (a runaway BT_backup must not stall startup).
@@ -87,6 +89,9 @@ pub struct LegacyInstall {
     pub wireguard: Vec<PathBuf>,
     /// qBittorrent 5's SQLite resume store, which is not supported.
     pub sqlite_resume: bool,
+    /// The walk stopped at [`MAX_WALK_ENTRIES`]: a WireGuard file may have
+    /// been missed.
+    pub truncated: bool,
 }
 
 impl LegacyInstall {
@@ -138,9 +143,17 @@ pub fn candidate_roots(roots: &Roots) -> Vec<(PathBuf, Option<String>)> {
     out
 }
 
-/// Bounded breadth-first walk of one candidate folder (no symlinks, at most
+/// Bounded breadth-first walk of one candidate folder (at most
 /// [`MAX_WALK_DEPTH`] levels and [`MAX_WALK_ENTRIES`] entries: the folder
 /// may also hold a large download tree).
+///
+/// `wireguard` folders are walked before anything else, and a folder with
+/// more than [`MAX_DIR_ENTRIES`] entries (a download folder, not a
+/// qBittorrent profile) is skipped as one entry, so a large tree cannot hide
+/// a WireGuard config behind the entry limit. Symlinks are never followed; a
+/// symlinked WireGuard file is still reported (it cannot be imported, which
+/// makes the import fail closed). A walk that hits the limit anyway is
+/// marked `truncated`.
 pub fn scan(root: &Path, slug: Option<String>) -> LegacyInstall {
     let mut found = LegacyInstall {
         root: root.to_path_buf(),
@@ -153,11 +166,19 @@ pub fn scan(root: &Path, slug: Option<String>) -> LegacyInstall {
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
         };
-        let mut entries: Vec<_> = rd.flatten().collect();
-        entries.sort_by_key(std::fs::DirEntry::file_name);
         let in_wireguard_dir = dir
             .file_name()
             .is_some_and(|n| n.eq_ignore_ascii_case("wireguard"));
+        let mut entries: Vec<_> = rd.take(MAX_DIR_ENTRIES + 1).flatten().collect();
+        if depth > 0 && !in_wireguard_dir && entries.len() > MAX_DIR_ENTRIES {
+            debug!(
+                "not scanning {} (more than {MAX_DIR_ENTRIES} entries)",
+                dir.display()
+            );
+            seen += 1;
+            continue;
+        }
+        entries.sort_by_key(std::fs::DirEntry::file_name);
         for e in entries {
             seen += 1;
             if seen > MAX_WALK_ENTRIES {
@@ -165,28 +186,37 @@ pub fn scan(root: &Path, slug: Option<String>) -> LegacyInstall {
                     "stopped scanning {} after {MAX_WALK_ENTRIES} entries",
                     root.display()
                 );
+                found.truncated = true;
                 return found;
             }
             let Ok(ft) = e.file_type() else { continue };
             let name = e.file_name().to_string_lossy().into_owned();
+            let lower = name.to_ascii_lowercase();
             let path = e.path();
+            let wireguard_name =
+                lower.ends_with(".conf") && (in_wireguard_dir || lower == "wg0.conf");
             if ft.is_dir() {
                 if name == "BT_backup" {
                     found.bt_backup.get_or_insert(path);
                 } else if depth < MAX_WALK_DEPTH {
-                    queue.push_back((path, depth + 1));
+                    if lower == "wireguard" {
+                        queue.push_front((path, depth + 1));
+                    } else {
+                        queue.push_back((path, depth + 1));
+                    }
                 }
             } else if ft.is_file() {
-                let lower = name.to_ascii_lowercase();
                 if name == "qBittorrent.conf" {
                     found.conf.get_or_insert(path);
                 } else if name == "categories.json" {
                     found.categories.get_or_insert(path);
                 } else if name == "torrents.db" {
                     found.sqlite_resume = true;
-                } else if lower.ends_with(".conf") && (in_wireguard_dir || lower == "wg0.conf") {
+                } else if wireguard_name {
                     found.wireguard.push(path);
                 }
+            } else if ft.is_symlink() && wireguard_name {
+                found.wireguard.push(path);
             }
         }
     }
@@ -272,6 +302,7 @@ pub fn valid_category_name(name: &str) -> bool {
         && !name.starts_with('/')
         && !name.ends_with('/')
         && !name.contains("//")
+        && !name.split('/').any(|part| part == "." || part == "..")
         && !name.chars().any(char::is_control)
 }
 
@@ -356,21 +387,24 @@ pub fn parse_fastresume(data: &[u8]) -> Result<ResumeInfo> {
 // WireGuard takeover
 // ---------------------------------------------------------------------------
 
-/// rBittorrent has no VPN settings of its own (methods 2 and 3 empty).
+/// rBittorrent has no VPN settings of its own (methods 2 and 3 empty): the
+/// same fields [`config::vpn_intent`] treats as WireGuard material.
 pub fn wireguard_options_empty(o: &Options) -> bool {
     [
         &o.wireguard_conf,
         &o.wg_private_key,
         &o.wg_public_key,
+        &o.wg_preshared_key,
         &o.wg_endpoint,
         &o.wg_address,
+        &o.wg_dns,
     ]
     .iter()
     .all(|v| v.as_deref().is_none_or(|s| s.trim().is_empty()))
 }
 
-/// The first legacy WireGuard file that is complete (`wg0.conf` first, then
-/// by name), with its text.
+/// The first legacy WireGuard file the tunnel could start from (`wg0.conf`
+/// first, then by name), with its text.
 pub fn pick_wireguard(candidates: &[PathBuf]) -> Option<(PathBuf, String)> {
     let mut sorted: Vec<&PathBuf> = candidates.iter().collect();
     sorted.sort_by_key(|p| {
@@ -383,27 +417,46 @@ pub fn pick_wireguard(candidates: &[PathBuf]) -> Option<(PathBuf, String)> {
         let Some(text) = read_small(p, MAX_TEXT_FILE) else {
             continue;
         };
-        match config::parse_wg_conf(&text) {
-            Ok(c)
-                if c.private_key.is_some()
-                    && c.peer_public_key.is_some()
-                    && c.endpoint.is_some() =>
-            {
-                return Some((p.clone(), text));
-            }
-            Ok(_) => debug!("{} is not a complete WireGuard config", p.display()),
-            Err(e) => debug!("{} is not a WireGuard config: {e:#}", p.display()),
+        // The same validation as at start-up: a file that parses but has a
+        // malformed key, endpoint or address is not taken over.
+        match config::check_wg_conf_text(&text) {
+            Ok(()) => return Some((p.clone(), text)),
+            Err(e) => debug!("{} is not a usable WireGuard config: {e:#}", p.display()),
         }
     }
     None
 }
 
 fn read_small(p: &Path, limit: u64) -> Option<String> {
-    let meta = std::fs::metadata(p).ok()?;
-    if !meta.is_file() || meta.len() > limit {
-        return None;
+    read_regular(p, limit)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+}
+
+/// Reads a regular file of at most `limit` bytes without following a
+/// symlink: the type and size are checked on the opened file, so a FIFO,
+/// device or swapped-in symlink is never read.
+fn read_regular(p: &Path, limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(p)
+        .with_context(|| format!("cannot open {}", p.display()))?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        bail!("{} is not a regular file", p.display());
     }
-    std::fs::read_to_string(p).ok()
+    if meta.len() > limit {
+        bail!("larger than {} KiB", limit >> 10);
+    }
+    let mut data = Vec::new();
+    f.take(limit.saturating_add(1)).read_to_end(&mut data)?;
+    if u64::try_from(data.len()).unwrap_or(u64::MAX) > limit {
+        bail!("larger than {} KiB", limit >> 10);
+    }
+    Ok(data)
 }
 
 // ---------------------------------------------------------------------------
@@ -527,9 +580,20 @@ pub fn build_record(installs: &[LegacyInstall], now: u64) -> (Record, Vec<String
             ));
         }
     }
-    rec.webui_username = conf
-        .username
-        .filter(|u| !u.trim().is_empty() && u.len() <= 128 && !u.chars().any(char::is_control));
+    // Same rule as the `webui_username` option, so an imported name can
+    // never make every later start fail validation.
+    rec.webui_username = match conf.username.map(|u| u.trim().to_owned()) {
+        Some(u) if config::check_webui_username(&u).is_ok() => Some(u),
+        Some(u) if !u.is_empty() => {
+            notes.push(
+                "qBittorrent's Web UI user name is not usable here (1-64 characters, no \
+                 spaces, `:` or leading `-`); keeping `webui_username`"
+                    .to_owned(),
+            );
+            None
+        }
+        _ => None,
+    };
     if let Some(p) = conf.webui_port.filter(|p| *p != config::WEBUI_PORT) {
         notes.push(format!(
             "qBittorrent's Web UI used port {p}; rBittorrent answers on {}: set the host \
@@ -648,29 +712,27 @@ pub fn prepare(o: &mut Options, roots: &Roots) -> Migration {
         warn!("qBittorrent import: {n}");
     }
 
-    // WireGuard: only when rBittorrent has nothing of its own.
+    // WireGuard: only when rBittorrent has nothing of its own. qBittorrent
+    // ran behind a VPN when WireGuard files are found, so a file that cannot
+    // be taken over (or a walk too large to be sure) keeps VPN mode on: the
+    // start then stops with a configuration error instead of seeding the
+    // imported torrents from the real IP address.
     let wg0 = roots.config.join(config::WG_CONF_FILE);
-    if wireguard_options_empty(o) && !wg0.exists() {
-        let all: Vec<PathBuf> = installs.iter().flat_map(|i| i.wireguard.clone()).collect();
-        if let Some((src, text)) = pick_wireguard(&all) {
-            match config::write_private(&wg0, &text) {
-                Ok(()) => {
-                    info!(
-                        "qBittorrent import: copied the WireGuard config {} to {}",
-                        src.display(),
-                        wg0.display()
-                    );
-                    rec.wireguard_from = Some(src.display().to_string());
-                }
-                Err(e) => warn!("qBittorrent import: cannot write {}: {e:#}", wg0.display()),
-            }
-        } else if !all.is_empty() {
-            warn!(
-                "qBittorrent import: {} WireGuard file(s) found, none complete \
-                 (PrivateKey, PublicKey and Endpoint)",
-                all.len()
-            );
-        }
+    if wireguard_options_empty(o)
+        && !config::path_present(&wg0)
+        && let Some(reason) = take_over_wireguard(&installs, &wg0, &mut rec)
+    {
+        error!("qBittorrent import: {reason}");
+        error!(
+            "VPN mode stays on so the imported torrents never run without the VPN: put \
+             your WireGuard config in /config/{}, or set `import_from_qbittorrent: \
+             false` to start without importing",
+            config::WG_CONF_FILE
+        );
+        o.vpn_enabled = true;
+        // Nothing is recorded: the next start looks again.
+        m.status = format!("stopped: {reason}");
+        return m;
     }
 
     let applied = apply_record(o, &rec);
@@ -700,6 +762,44 @@ pub fn prepare(o: &mut Options, roots: &Roots) -> Migration {
     m
 }
 
+/// Copies the first usable legacy WireGuard file to `wg0`. `Some(reason)`
+/// when qBittorrent may have used WireGuard but nothing could be copied.
+fn take_over_wireguard(installs: &[LegacyInstall], wg0: &Path, rec: &mut Record) -> Option<String> {
+    let all: Vec<PathBuf> = installs.iter().flat_map(|i| i.wireguard.clone()).collect();
+    if all.is_empty() {
+        return installs.iter().find(|i| i.truncated).map(|i| {
+            format!(
+                "{} is too large to scan completely ({MAX_WALK_ENTRIES} entries), so a \
+                 WireGuard config there may have been missed",
+                i.root.display()
+            )
+        });
+    }
+    let Some((src, text)) = pick_wireguard(&all) else {
+        return Some(format!(
+            "{} WireGuard file(s) found but none is a usable config (regular file with \
+             PrivateKey, Address, PublicKey and Endpoint): {}",
+            all.len(),
+            all.iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    };
+    match config::write_private(wg0, &text) {
+        Ok(()) => {
+            info!(
+                "qBittorrent import: copied the WireGuard config {} to {}",
+                src.display(),
+                wg0.display()
+            );
+            rec.wireguard_from = Some(src.display().to_string());
+            None
+        }
+        Err(e) => Some(format!("cannot write {}: {e}", wg0.display())),
+    }
+}
+
 fn yes(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
@@ -717,6 +817,11 @@ pub struct SeedReport {
     pub torrents_added: usize,
     pub torrents_skipped: Vec<String>,
     pub torrents_failed: Vec<String>,
+    /// Calls that failed for a passing reason (rtbit restarting, timeouts):
+    /// the phase is tried again on the next start instead of being marked
+    /// done.
+    #[serde(skip)]
+    pub transient_failures: usize,
 }
 
 impl SeedReport {
@@ -757,13 +862,14 @@ pub struct SeedJob {
     pub migration: Migration,
 }
 
-/// Phase 2: categories, then torrents. Markers are written only once rtbit
-/// has answered, so an rtbit that never starts means another try next time.
+/// Phase 2: categories, then torrents. A marker is written only once rtbit
+/// has answered every call of its phase (a refusal is an answer; a timeout
+/// or a restart is not), so a failed phase is tried again on the next start.
 pub async fn seed(job: SeedJob) -> Result<SeedReport> {
     let mut report = SeedReport::default();
     let mut api = RtbitApi::new(job.api);
     api.wait_ready(RTBIT_READY_TIMEOUT).await?;
-    api.login(&job.username, job.password.expose())
+    api.login(&job.username, &job.password)
         .await
         .context("cannot sign in to rtbit's qBittorrent API")?;
 
@@ -775,30 +881,54 @@ pub async fn seed(job: SeedJob) -> Result<SeedReport> {
             match api.create_category(name, path.as_deref()).await {
                 Ok(CategoryOutcome::Created) => report.categories_created += 1,
                 Ok(CategoryOutcome::AlreadyExists) => report.categories_existing += 1,
-                Err(e) => report.category_errors.push(format!("{name}: {e:#}")),
+                Err(e) => {
+                    if !rtbit_api::is_refusal(&e) {
+                        report.transient_failures += 1;
+                    }
+                    report.category_errors.push(format!("{name}: {e:#}"));
+                }
             }
         }
-        config::write_private(
-            &job.config_root.join(MIGRATED_MARKER),
-            &serde_json::to_string_pretty(rec)?,
-        )
-        .context("cannot write the migration record")?;
+        // Done only when every category got an answer from rtbit; otherwise
+        // the next start tries again (existing ones answer 409).
+        if report.transient_failures == 0 {
+            config::write_private(
+                &job.config_root.join(MIGRATED_MARKER),
+                &serde_json::to_string_pretty(rec)?,
+            )
+            .context("cannot write the migration record")?;
+        } else {
+            warn!(
+                "qBittorrent import: rtbit did not answer for {} categories; trying again \
+                 on the next start",
+                report.transient_failures
+            );
+        }
     }
 
     if let Some(dir) = &m.torrents_from {
-        import_torrents(&api, dir, &job.data_roots, &mut report).await;
-        let done = serde_json::json!({
-            "completed_at": now_secs(),
-            "from": dir.display().to_string(),
-            "added": report.torrents_added,
-            "skipped": report.torrents_skipped,
-            "failed": report.torrents_failed,
-        });
-        config::write_private(
-            &job.config_root.join(TORRENTS_MARKER),
-            &serde_json::to_string_pretty(&done)?,
-        )
-        .context("cannot write the torrent import marker")?;
+        let before = report.transient_failures;
+        import_torrents(&mut api, dir, &job.data_roots, &mut report).await;
+        let transient = report.transient_failures - before;
+        if transient == 0 {
+            let done = serde_json::json!({
+                "completed_at": now_secs(),
+                "from": dir.display().to_string(),
+                "added": report.torrents_added,
+                "skipped": report.torrents_skipped,
+                "failed": report.torrents_failed,
+            });
+            config::write_private(
+                &job.config_root.join(TORRENTS_MARKER),
+                &serde_json::to_string_pretty(&done)?,
+            )
+            .context("cannot write the torrent import marker")?;
+        } else {
+            warn!(
+                "qBittorrent import: rtbit did not answer for {transient} torrents; trying \
+                 again on the next start (torrents already added are skipped)"
+            );
+        }
     }
     Ok(report)
 }
@@ -808,6 +938,8 @@ pub fn list_backup(dir: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
     let mut out: Vec<(PathBuf, PathBuf)> = std::fs::read_dir(dir)
         .with_context(|| format!("cannot read {}", dir.display()))?
         .flatten()
+        // Regular files only: no symlinks, FIFOs or devices.
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "torrent"))
         .map(|t| {
@@ -832,17 +964,10 @@ pub fn prepare_upload(
     resume: &Path,
     data_roots: &[PathBuf],
 ) -> Result<(Vec<u8>, ResumeInfo)> {
-    let meta = std::fs::metadata(torrent)?;
-    if meta.len() > MAX_TORRENT_FILE {
-        bail!("larger than {} MiB", MAX_TORRENT_FILE >> 20);
-    }
-    let data = std::fs::read(torrent)?;
+    let data = read_regular(torrent, MAX_TORRENT_FILE)?;
     bencode::decode(&data).context("not a valid .torrent file")?;
-    let resume_meta = std::fs::metadata(resume).context("no .fastresume next to it")?;
-    if resume_meta.len() > MAX_TORRENT_FILE {
-        bail!(".fastresume larger than {} MiB", MAX_TORRENT_FILE >> 20);
-    }
-    let info = parse_fastresume(&std::fs::read(resume)?)?;
+    let resume_data = read_regular(resume, MAX_TORRENT_FILE).context("no usable .fastresume")?;
+    let info = parse_fastresume(&resume_data)?;
     let Some(save) = &info.save_path else {
         bail!("no save path in its .fastresume");
     };
@@ -856,7 +981,7 @@ pub fn prepare_upload(
 }
 
 async fn import_torrents(
-    api: &RtbitApi,
+    api: &mut RtbitApi,
     dir: &Path,
     data_roots: &[PathBuf],
     report: &mut SeedReport,
@@ -864,6 +989,8 @@ async fn import_torrents(
     let pairs = match list_backup(dir) {
         Ok(p) => p,
         Err(e) => {
+            // The folder may come back (a disk not mounted yet).
+            report.transient_failures += 1;
             report.torrents_failed.push(format!("{e:#}"));
             return;
         }
@@ -890,7 +1017,12 @@ async fn import_torrents(
         };
         match api.add_torrent(&upload).await {
             Ok(()) => report.torrents_added += 1,
-            Err(e) => report.torrents_failed.push(format!("{name}: {e:#}")),
+            Err(e) => {
+                if !rtbit_api::is_refusal(&e) {
+                    report.transient_failures += 1;
+                }
+                report.torrents_failed.push(format!("{name}: {e:#}"));
+            }
         }
     }
 }
@@ -1264,6 +1396,109 @@ mod tests {
         assert!(!path_allowed("/share/../etc", &default_data_roots()));
         assert!(!path_allowed("/share", &default_data_roots()));
         assert!(path_allowed("/share/tv", &default_data_roots()));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn unusable_wireguard_files_keep_vpn_mode_on() {
+        let base = tmp("wg-fail-closed");
+        let r = roots(&base);
+        let app = legacy(&base);
+        // Only the broken file is left: nothing can be taken over.
+        std::fs::remove_file(app.join("wireguard/proton.conf")).unwrap();
+        let mut o = Options::default();
+        assert!(!o.vpn_enabled);
+        let m = prepare(&mut o, &r);
+        assert!(o.vpn_enabled, "VPN mode must stay on");
+        assert!(!m.fresh && m.record.is_none(), "nothing is recorded: {m:?}");
+        assert!(m.status.starts_with("stopped:"), "{}", m.status);
+        assert!(!base.join("config/wg0.conf").exists());
+        assert!(!base.join("config/.migrated").exists());
+        // The configuration then fails instead of starting unprotected.
+        let paths = config::Paths {
+            config_root: base.join("config"),
+        };
+        assert!(config::Settings::from_options(&o, &paths).is_err());
+
+        // A file that parses but has an unusable endpoint is not taken over.
+        std::fs::write(
+            app.join("wireguard/proton.conf"),
+            WG.replace("190.2.131.156:51820", "127.0.0.1:51820"),
+        )
+        .unwrap();
+        let mut o = Options::default();
+        prepare(&mut o, &r);
+        assert!(o.vpn_enabled);
+
+        // A symlinked config is reported, never followed, and fails closed.
+        std::fs::remove_file(app.join("wireguard/proton.conf")).unwrap();
+        std::fs::remove_file(app.join("wireguard/broken.conf")).unwrap();
+        let outside = base.join("outside.conf");
+        std::fs::write(&outside, WG).unwrap();
+        std::os::unix::fs::symlink(&outside, app.join("wireguard/wg0.conf")).unwrap();
+        let mut o = Options::default();
+        prepare(&mut o, &r);
+        assert!(o.vpn_enabled);
+        assert!(!base.join("config/wg0.conf").exists());
+
+        // Opting out of the import starts without it.
+        let mut o = Options {
+            import_from_qbittorrent: false,
+            ..Options::default()
+        };
+        prepare(&mut o, &r);
+        assert!(!o.vpn_enabled);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_large_download_tree_cannot_hide_the_wireguard_folder() {
+        let base = tmp("wg-large-tree");
+        let root = base.join("qbittorrent");
+        // `downloads` sorts before `config`, which holds `wireguard`.
+        let big = root.join("downloads");
+        std::fs::create_dir_all(&big).unwrap();
+        for i in 0..=MAX_DIR_ENTRIES {
+            std::fs::write(big.join(format!("{i:05}")), b"").unwrap();
+        }
+        std::fs::create_dir_all(root.join("config/wireguard")).unwrap();
+        std::fs::write(root.join("config/wireguard/proton.conf"), WG).unwrap();
+        let found = scan(&root, None);
+        assert_eq!(
+            found.wireguard,
+            vec![root.join("config/wireguard/proton.conf")]
+        );
+        assert!(!found.truncated);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn category_names_cannot_climb_out() {
+        for bad in ["..", "tv/..", "../x", "a/./b", ".", ""] {
+            assert!(!valid_category_name(bad), "{bad}");
+        }
+        for good in ["tv", "tv/sonarr", "..x", "x..", "a.b"] {
+            assert!(valid_category_name(good), "{good}");
+        }
+    }
+
+    #[test]
+    fn only_regular_files_are_read_from_bt_backup() {
+        let base = tmp("backup-files");
+        std::fs::create_dir_all(&base).unwrap();
+        let real = base.join("real.bin");
+        std::fs::write(&real, b"d4:infod4:name1:xee").unwrap();
+        std::os::unix::fs::symlink(&real, base.join("link.torrent")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", base.join("zero.torrent")).unwrap();
+        assert!(list_backup(&base).unwrap().is_empty());
+        let err = prepare_upload(
+            &base.join("zero.torrent"),
+            &base.join("zero.fastresume"),
+            std::slice::from_ref(&base),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot open"), "{err:#}");
+        assert!(read_regular(Path::new("/dev/null"), 10).is_err());
         let _ = std::fs::remove_dir_all(base);
     }
 

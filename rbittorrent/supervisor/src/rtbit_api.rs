@@ -13,8 +13,31 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tracing::debug;
 
+use crate::config::Secret;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE: usize = 1 << 20;
+/// How long a call waits for rtbit to come back (a NAT-PMP port change
+/// restarts it) before the call counts as failed.
+const RECOVER_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// rtbit answered and said no: retrying the same request will not help.
+/// Anything else (no connection, timeout, lost session) is transient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Whether `e` is a [`Refused`] answer rather than a transient failure.
+pub fn is_refusal(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Refused>().is_some()
+}
 
 /// What `torrents/createCategory` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +62,9 @@ pub struct RtbitApi {
     addr: SocketAddr,
     host: HeaderValue,
     sid: Option<String>,
+    /// Kept so a call can sign in again after rtbit restarted (its sessions
+    /// do not survive a restart).
+    credentials: Option<(String, Secret)>,
 }
 
 impl std::fmt::Debug for RtbitApi {
@@ -58,6 +84,7 @@ impl RtbitApi {
             addr,
             host,
             sid: None,
+            credentials: None,
         }
     }
 
@@ -66,12 +93,12 @@ impl RtbitApi {
         method: Method,
         path: &str,
         content_type: Option<&str>,
-        body: Vec<u8>,
+        body: Bytes,
     ) -> Result<(StatusCode, hyper::HeaderMap, Bytes)> {
         let mut req = Request::builder()
             .method(method)
             .uri(path)
-            .body(Full::new(Bytes::from(body)))
+            .body(Full::new(body))
             .context("cannot build the request")?;
         let h = req.headers_mut();
         h.insert(header::HOST, self.host.clone());
@@ -114,11 +141,43 @@ impl RtbitApi {
             .map_err(|_| anyhow!("rtbit did not answer {path} within {REQUEST_TIMEOUT:?}"))?
     }
 
+    /// One authenticated call. A lost session (401/403) signs in again, and a
+    /// failed connection waits for rtbit to come back and signs in again;
+    /// either way the request is sent once more.
+    async fn call(
+        &mut self,
+        method: Method,
+        path: &str,
+        content_type: Option<&str>,
+        body: Bytes,
+    ) -> Result<(StatusCode, hyper::HeaderMap, Bytes)> {
+        if self.credentials.is_none() {
+            return self.send(method, path, content_type, body).await;
+        }
+        match self
+            .send(method.clone(), path, content_type, body.clone())
+            .await
+        {
+            Ok((s, ..)) if s == StatusCode::UNAUTHORIZED || s == StatusCode::FORBIDDEN => {
+                debug!("rtbit answered {path} with {s}: signing in again");
+            }
+            Err(e) => {
+                debug!("rtbit API call {path} failed ({e:#}): waiting for rtbit");
+                self.wait_ready(RECOVER_TIMEOUT)
+                    .await
+                    .with_context(|| format!("{e:#}"))?;
+            }
+            Ok(answer) => return Ok(answer),
+        }
+        self.sign_in().await?;
+        self.send(method, path, content_type, body).await
+    }
+
     /// Waits until `GET /healthz` answers 200.
     pub async fn wait_ready(&self, limit: Duration) -> Result<()> {
         let start = tokio::time::Instant::now();
         loop {
-            match self.send(Method::GET, "/healthz", None, Vec::new()).await {
+            match self.send(Method::GET, "/healthz", None, Bytes::new()).await {
                 Ok((s, _, _)) if s.is_success() => return Ok(()),
                 Ok((s, _, _)) => debug!("rtbit /healthz: {s}"),
                 Err(e) => debug!("rtbit /healthz: {e:#}"),
@@ -133,33 +192,32 @@ impl RtbitApi {
         }
     }
 
-    /// `auth/login`: keeps the SID cookie for later calls.
-    pub async fn login(&mut self, username: &str, password: &str) -> Result<()> {
+    /// `auth/login`: keeps the SID cookie (and the credentials, to sign in
+    /// again after an rtbit restart) for later calls.
+    pub async fn login(&mut self, username: &str, password: &Secret) -> Result<()> {
+        self.credentials = Some((username.to_owned(), password.clone()));
+        self.sign_in().await
+    }
+
+    async fn sign_in(&mut self) -> Result<()> {
+        let Some((username, password)) = &self.credentials else {
+            bail!("no rtbit credentials");
+        };
         let form = format!(
             "username={}&password={}",
             form_encode(username),
-            form_encode(password)
+            form_encode(password.expose())
         );
+        self.sid = None;
         let (status, headers, _) = self
             .send(
                 Method::POST,
                 "/api/v2/auth/login",
                 Some("application/x-www-form-urlencoded"),
-                form.into_bytes(),
+                Bytes::from(form),
             )
             .await?;
-        let sid = headers
-            .get_all(header::SET_COOKIE)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .find_map(|c| {
-                c.split(';')
-                    .next()
-                    .and_then(|kv| kv.trim().strip_prefix("SID="))
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_owned)
-            });
-        match sid {
+        match session_cookie(&headers) {
             Some(sid) if status.is_success() => {
                 self.sid = Some(sid);
                 Ok(())
@@ -170,7 +228,7 @@ impl RtbitApi {
 
     /// `torrents/createCategory`.
     pub async fn create_category(
-        &self,
+        &mut self,
         name: &str,
         save_path: Option<&str>,
     ) -> Result<CategoryOutcome> {
@@ -180,52 +238,73 @@ impl RtbitApi {
             form_encode(save_path.unwrap_or(""))
         );
         let (status, _, body) = self
-            .send(
+            .call(
                 Method::POST,
                 "/api/v2/torrents/createCategory",
                 Some("application/x-www-form-urlencoded"),
-                form.into_bytes(),
+                Bytes::from(form),
             )
             .await?;
         match status {
             s if s.is_success() => Ok(CategoryOutcome::Created),
             StatusCode::CONFLICT => Ok(CategoryOutcome::AlreadyExists),
-            s => bail!(
-                "rtbit refused category `{name}` ({s}: {})",
-                String::from_utf8_lossy(&body).trim()
-            ),
+            s => Err(refusal(&format!("category `{name}`"), s, &body)),
         }
     }
 
     /// `torrents/add` with one `.torrent` file.
-    pub async fn add_torrent(&self, t: &TorrentUpload<'_>) -> Result<()> {
-        let boundary = multipart_boundary();
+    pub async fn add_torrent(&mut self, t: &TorrentUpload<'_>) -> Result<()> {
         let mut fields: Vec<(&str, Option<&str>, &[u8])> = vec![
             ("torrents", Some(t.file_name), t.data),
             ("savepath", None, t.save_path.as_bytes()),
+            // An explicit save path only applies with automatic management off.
+            ("autoTMM", None, b"false"),
             ("contentLayout", None, t.content_layout.as_bytes()),
             ("stopped", None, if t.stopped { b"true" } else { b"false" }),
         ];
         if let Some(c) = t.category {
             fields.push(("category", None, c.as_bytes()));
         }
+        let boundary = multipart_boundary(&fields)?;
         let body = multipart(&boundary, &fields);
         let (status, _, body) = self
-            .send(
+            .call(
                 Method::POST,
                 "/api/v2/torrents/add",
                 Some(&format!("multipart/form-data; boundary={boundary}")),
-                body,
+                Bytes::from(body),
             )
             .await?;
-        if !status.is_success() {
-            bail!(
-                "rtbit refused the torrent ({status}: {})",
-                String::from_utf8_lossy(&body).trim()
-            );
+        // qBittorrent answers a rejected torrent with 200 and `Fails.`.
+        if !status.is_success() || body.trim_ascii().eq_ignore_ascii_case(b"Fails.") {
+            return Err(refusal("the torrent", status, &body));
         }
         Ok(())
     }
+}
+
+fn refusal(what: &str, status: StatusCode, body: &[u8]) -> anyhow::Error {
+    let text: String = String::from_utf8_lossy(body)
+        .trim()
+        .chars()
+        .take(200)
+        .collect();
+    anyhow::Error::new(Refused(format!("rtbit refused {what} ({status}: {text})")))
+}
+
+/// The `SID` value from a login answer's `Set-Cookie` headers.
+fn session_cookie(headers: &hyper::HeaderMap) -> Option<String> {
+    headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|c| {
+            c.split(';')
+                .next()
+                .and_then(|kv| kv.trim().strip_prefix("SID="))
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        })
 }
 
 /// `application/x-www-form-urlencoded` value encoding.
@@ -241,11 +320,26 @@ pub fn form_encode(s: &str) -> String {
     out
 }
 
-fn multipart_boundary() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    format!("rbittorrent-{nanos:x}-{:x}", std::process::id())
+/// A random boundary (128 bits from the kernel CSPRNG) that occurs in none
+/// of the field values.
+fn multipart_boundary(fields: &[(&str, Option<&str>, &[u8])]) -> Result<String> {
+    use ring::rand::SecureRandom;
+    let rng = ring::rand::SystemRandom::new();
+    for _ in 0..4 {
+        let mut nonce = [0u8; 16];
+        rng.fill(&mut nonce)
+            .map_err(|_| anyhow!("no randomness for a multipart boundary"))?;
+        let hex: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        let boundary = format!("rbittorrent-{hex}");
+        let needle = boundary.as_bytes();
+        let collides = fields
+            .iter()
+            .any(|(_, _, v)| v.windows(needle.len()).any(|w| w == needle));
+        if !collides {
+            return Ok(boundary);
+        }
+    }
+    bail!("cannot find a multipart boundary that is not in the upload")
 }
 
 /// `multipart/form-data` body. Field names and file names are ours (ASCII,
@@ -300,5 +394,42 @@ mod tests {
              Content-Type: application/x-bittorrent\r\n\r\nd4:infodee\r\n\
              --B\r\nContent-Disposition: form-data; name=\"savepath\"\r\n\r\n/share/tv\r\n--B--\r\n"
         );
+    }
+
+    #[test]
+    fn boundaries_are_random_and_never_in_the_body() {
+        let fields: [(&str, Option<&str>, &[u8]); 1] = [("torrents", None, b"rbittorrent-")];
+        let a = multipart_boundary(&fields).unwrap();
+        let b = multipart_boundary(&fields).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), "rbittorrent-".len() + 32);
+        assert!(!a.contains(char::is_uppercase));
+    }
+
+    #[test]
+    fn refusals_are_told_apart_from_transient_failures() {
+        let refused = refusal("the torrent", StatusCode::OK, b"Fails.");
+        assert!(is_refusal(&refused));
+        assert!(refused.to_string().contains("Fails."));
+        let wrapped = refused.context("x.torrent");
+        assert!(is_refusal(&wrapped));
+        assert!(!is_refusal(&anyhow!("cannot connect to rtbit")));
+    }
+
+    #[test]
+    fn session_cookie_is_found() {
+        let mut h = hyper::HeaderMap::new();
+        h.append(
+            header::SET_COOKIE,
+            HeaderValue::from_static("other=1; Path=/"),
+        );
+        h.append(
+            header::SET_COOKIE,
+            HeaderValue::from_static("SID=abc; HttpOnly"),
+        );
+        assert_eq!(session_cookie(&h).as_deref(), Some("abc"));
+        let mut empty = hyper::HeaderMap::new();
+        empty.append(header::SET_COOKIE, HeaderValue::from_static("SID=; Path=/"));
+        assert_eq!(session_cookie(&empty), None);
     }
 }

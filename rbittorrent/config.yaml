@@ -105,7 +105,7 @@ options:
 
 schema:
   vpn_enabled: bool
-  wireguard_conf: str?
+  wireguard_conf: password?
   wg_private_key: password?
   wg_public_key: str?
   wg_preshared_key: password?

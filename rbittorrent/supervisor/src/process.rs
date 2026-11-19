@@ -510,10 +510,12 @@ impl RtbitSpec {
         cmd
     }
 
-    /// `rtbit auth reset-password -u <user>`; the password goes to stdin.
+    /// `rtbit auth reset-password --username=<user>`; the password goes to
+    /// stdin. The `--username=` form keeps a user name from ever being parsed
+    /// as an option (the name is also validated: no leading `-`).
     pub fn reset_password_command(&self, username: &str) -> Command {
         let mut cmd = self.base_command(0);
-        cmd.args(["auth", "reset-password", "-u", username])
+        cmd.args(["auth", "reset-password", &format!("--username={username}")])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -545,6 +547,15 @@ impl RtbitSpec {
                 "rtbit auth reset-password failed ({}): {}",
                 out.status,
                 String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        // Fail closed: exit 0 alone is not proof (clap's help also exits 0).
+        // rtbit confirms with "stored new credentials for <user> in <file>".
+        let said = String::from_utf8_lossy(&out.stdout);
+        if !said.contains(&format!("stored new credentials for {username}")) {
+            bail!(
+                "rtbit auth reset-password did not confirm storing the Web UI login; \
+                 refusing to start rtbit without authentication"
             );
         }
         Ok(())
@@ -786,7 +797,8 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\necho \"$@\" > {r}.argv\nread -r pw\necho \"$pw\" > {r}.stdin\n",
+                "#!/bin/sh\necho \"$@\" > {r}.argv\nread -r pw\necho \"$pw\" > {r}.stdin\n\
+                 echo \"stored new credentials for admin in /x/credentials.json\"\n",
                 r = record.display()
             ),
         )
@@ -799,7 +811,7 @@ mod tests {
             .await
             .unwrap();
         let argv = std::fs::read_to_string(dir.join("record.argv")).unwrap();
-        assert_eq!(argv.trim(), "auth reset-password -u admin");
+        assert_eq!(argv.trim(), "auth reset-password --username=admin");
         assert_eq!(
             std::fs::read_to_string(dir.join("record.stdin"))
                 .unwrap()
@@ -815,6 +827,21 @@ mod tests {
                 .unwrap_err()
         );
         assert!(err.contains("broken") && !err.contains("s3cret"), "{err}");
+
+        // Exit 0 without rtbit's confirmation (e.g. clap printing help) is a
+        // failure: rtbit must never start without a stored login.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'Usage: rtbit auth reset-password'\nexit 0\n",
+        )
+        .unwrap();
+        let err = format!(
+            "{:#}",
+            sp.set_credentials("admin", &Secret::new("x".into()))
+                .await
+                .unwrap_err()
+        );
+        assert!(err.contains("did not confirm"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

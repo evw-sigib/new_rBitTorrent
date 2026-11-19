@@ -272,15 +272,22 @@ pub async fn install(runner: &impl Runner, spec: &RulesetSpec) -> Result<()> {
     verify_listing(&listing.stdout)
 }
 
-/// Sanity check on `nft list table` output: all three hooks with policy drop.
+/// Fail-closed check on `nft list table` output: the table is there and each
+/// of the input, forward and output hooks has `policy drop`. Empty or
+/// unexpected output is an error, never a pass.
 pub fn verify_listing(listing: &str) -> Result<()> {
-    if listing.trim().is_empty() {
-        // `nft` without a kernel (tests) prints nothing; nothing to verify.
-        return Ok(());
+    let header = format!("table {TABLE_FAMILY} {TABLE_NAME}");
+    if !listing.contains(&header) {
+        bail!("kill-switch verification failed: `nft list table` did not show `{header}`");
     }
-    let drops = listing.matches("policy drop").count();
-    if drops < 3 {
-        bail!("kill-switch verification failed: expected 3 chains with policy drop, found {drops}");
+    for hook in ["input", "forward", "output"] {
+        let needle = format!("hook {hook} ");
+        let dropped = listing
+            .lines()
+            .any(|l| l.contains(&needle) && l.contains("policy drop"));
+        if !dropped {
+            bail!("kill-switch verification failed: no `{hook}` chain with policy drop");
+        }
     }
     Ok(())
 }
@@ -554,7 +561,7 @@ mod tests {
         let runner = FakeRunner::default();
         runner.respond(
             "nft list table",
-            "table inet killswitch {\n chain input { policy drop; }\n chain forward { policy drop; }\n chain output { policy drop; }\n}",
+            "table inet killswitch {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t}\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy drop;\n\t}\n\tchain output {\n\t\ttype filter hook output priority filter; policy drop;\n\t}\n}",
         );
         install(&runner, &spec()).await.unwrap();
         let calls = runner.calls();
@@ -581,6 +588,25 @@ mod tests {
             "table inet killswitch { chain input { policy accept; } }",
         );
         assert!(install(&broken, &spec()).await.is_err());
+    }
+
+    #[test]
+    fn verification_fails_closed() {
+        // Empty output (nft exiting 0 without printing) is not a pass.
+        assert!(verify_listing("").is_err());
+        assert!(verify_listing("   \n").is_err());
+        // Three drops in the wrong places (or another table) are not enough.
+        assert!(
+            verify_listing(
+                "table inet other {\n\tchain a {\n\t\ttype filter hook input priority filter; policy drop;\n\t}\n}"
+            )
+            .is_err()
+        );
+        let missing_output = "table inet killswitch {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t}\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy drop;\n\t}\n\tchain output {\n\t\ttype filter hook output priority filter; policy accept;\n\t}\n}";
+        assert!(verify_listing(missing_output).is_err());
+        // What the renderer produces passes.
+        let rendered = render_ruleset(&spec()).unwrap();
+        assert!(verify_listing(&rendered).is_ok(), "{rendered}");
     }
 
     /// Loads the real ruleset into the kernel. Opt-in because it needs root

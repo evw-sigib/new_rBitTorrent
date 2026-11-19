@@ -89,7 +89,7 @@ impl LogLevel {
 /// The app options exactly as Home Assistant writes them. Every field has a
 /// default so a partially filled form still deserialises and validation can
 /// explain what is missing.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct Options {
     /// VPN mode. Off by default so a fresh install starts (unprotected, with a
@@ -147,6 +147,36 @@ impl Default for Options {
             import_from_qbittorrent: true,
             import_active_torrents: false,
         }
+    }
+}
+
+/// Hand-written so a `{:?}` can never print the private key, preshared key,
+/// pasted `.conf` or Web UI password: secrets show only whether they are set.
+impl fmt::Debug for Options {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let set = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        f.debug_struct("Options")
+            .field("vpn_enabled", &self.vpn_enabled)
+            .field("wireguard_conf", &set(&self.wireguard_conf))
+            .field("wg_private_key", &set(&self.wg_private_key))
+            .field("wg_public_key", &self.wg_public_key)
+            .field("wg_preshared_key", &set(&self.wg_preshared_key))
+            .field("wg_endpoint", &self.wg_endpoint)
+            .field("wg_address", &self.wg_address)
+            .field("wg_dns", &self.wg_dns)
+            .field("nat_pmp_gateway", &self.nat_pmp_gateway)
+            .field("enable_nat_pmp", &self.enable_nat_pmp)
+            .field("listen_port", &self.listen_port)
+            .field("download_dir", &self.download_dir)
+            .field("completed_dir", &self.completed_dir)
+            .field("local_allow_cidrs", &self.local_allow_cidrs)
+            .field("log_level", &self.log_level)
+            .field("webui_username", &self.webui_username)
+            .field("webui_password", &set(&self.webui_password))
+            .field("enable_dht", &self.enable_dht)
+            .field("import_from_qbittorrent", &self.import_from_qbittorrent)
+            .field("import_active_torrents", &self.import_active_torrents)
+            .finish()
     }
 }
 
@@ -358,7 +388,7 @@ pub fn parse_endpoint(raw: &str) -> Result<Endpoint> {
     };
     if let Ok(ip) = host.parse::<IpAddr>() {
         return match ip {
-            IpAddr::V4(v4) if !v4.is_unspecified() && !v4.is_broadcast() => Ok(Endpoint {
+            IpAddr::V4(v4) if usable_unicast(v4) => Ok(Endpoint {
                 host: EndpointHost::Ip(v4),
                 port,
             }),
@@ -408,7 +438,7 @@ const KNOWN_KEYS: [&str; 17] = [
 ];
 
 /// The raw values of a parsed `.conf`, before merging and validation.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq)]
 pub struct WgConf {
     pub private_key: Option<String>,
     pub addresses: Vec<String>,
@@ -423,6 +453,26 @@ pub struct WgConf {
     pub proton_nat_pmp: Option<bool>,
     /// Non-fatal observations to surface in the log.
     pub warnings: Vec<String>,
+}
+
+/// Hand-written: the private and preshared keys are never printed.
+impl fmt::Debug for WgConf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let set = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        f.debug_struct("WgConf")
+            .field("private_key", &set(&self.private_key))
+            .field("addresses", &self.addresses)
+            .field("dns", &self.dns)
+            .field("mtu", &self.mtu)
+            .field("peer_public_key", &self.peer_public_key)
+            .field("preshared_key", &set(&self.preshared_key))
+            .field("allowed_ips", &self.allowed_ips)
+            .field("endpoint", &self.endpoint)
+            .field("persistent_keepalive", &self.persistent_keepalive)
+            .field("proton_nat_pmp", &self.proton_nat_pmp)
+            .field("warnings", &self.warnings)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -457,25 +507,126 @@ fn detect_proton_nat_pmp(text: &str) -> Option<bool> {
 /// Keys whose value is a 44-character base64 WireGuard key.
 const KEY_VALUED: [&str; 3] = ["privatekey", "publickey", "presharedkey"];
 
+/// Hook keys: their values are shell commands (never executed, only warned
+/// about) and may contain `;`, `#` or `key=value` text of their own.
+const HOOK_KEYS: [&str; 4] = ["preup", "postup", "predown", "postdown"];
+
+/// Length of the section header `rest` (lowercase) starts with.
+fn header_at(rest: &str) -> Option<usize> {
+    ["[interface]", "[peer]"]
+        .into_iter()
+        .find(|h| rest.starts_with(h))
+        .map(str::len)
+}
+
+/// The known key (lowercase) `rest` (lowercase) starts with, when it is
+/// followed by optional blanks and `=`.
+fn key_at(rest: &str) -> Option<String> {
+    KNOWN_KEYS.iter().map(|k| k.to_ascii_lowercase()).find(|k| {
+        rest.strip_prefix(k.as_str())
+            .is_some_and(|after| after.trim_start_matches([' ', '\t']).starts_with('='))
+    })
+}
+
 /// True when `rest` (lowercase) starts with a section header or `Key =`.
 fn starts_entry(rest: &str) -> bool {
-    ["[interface]", "[peer]"]
-        .iter()
-        .any(|h| rest.starts_with(h))
-        || KNOWN_KEYS.iter().any(|k| {
-            rest.strip_prefix(k.to_ascii_lowercase().as_str())
-                .is_some_and(|after| after.trim_start_matches([' ', '\t']).starts_with('='))
-        })
+    header_at(rest).is_some() || key_at(rest).is_some()
+}
+
+fn char_len_at(text: &str, i: usize) -> usize {
+    text.get(i..)
+        .and_then(|r| r.chars().next())
+        .map_or(1, char::len_utf8)
+}
+
+/// Offset just past `Key<blanks>=<blanks>` for a key starting at `i`.
+fn value_start(lower: &str, i: usize, key_len: usize) -> usize {
+    let after_key = i + key_len;
+    let eq = lower
+        .get(after_key..)
+        .and_then(|r| r.find('='))
+        .map_or(after_key, |off| after_key + off + 1);
+    eq + lower
+        .get(eq..)
+        .map_or(0, |r| r.len() - r.trim_start_matches([' ', '\t']).len())
+}
+
+/// End of a base64 key value starting at `i`: at most 44 characters, up to
+/// and including the first `=` (the padding every WireGuard key ends with),
+/// and never across a blank, `;`, `#` or `[`. A short or truncated key thus
+/// stays short (and fails validation) instead of swallowing the next entry.
+fn key_value_end(text: &str, i: usize) -> usize {
+    let mut j = i;
+    for (n, c) in text.get(i..).unwrap_or("").char_indices() {
+        if n >= 44 || c.is_whitespace() || matches!(c, ';' | '#' | '[') {
+            return i + n;
+        }
+        j = i + n + c.len_utf8();
+        if c == '=' {
+            return j;
+        }
+    }
+    j
+}
+
+/// End of a hook value starting at `i`: the next section header, `#`, or a
+/// `;` that is followed by a new entry (or nothing). Text inside a hook is
+/// never split into directives.
+fn hook_value_end(lower: &str, i: usize) -> usize {
+    let mut j = i;
+    while j < lower.len() {
+        let rest = lower.get(j..).unwrap_or("");
+        if header_at(rest).is_some() || rest.starts_with('#') {
+            return j;
+        }
+        if let Some(after) = rest.strip_prefix(';') {
+            let after = after.trim_start_matches([' ', '\t']);
+            if after.is_empty() || starts_entry(after) {
+                return j;
+            }
+        }
+        j += char_len_at(lower, j);
+    }
+    lower.len()
+}
+
+/// End of a `#` comment starting at `i` in a flattened paste. The first
+/// token after `#` belongs to the comment even when it looks like a key or a
+/// header, so a commented-out `# DNS = 9.9.9.9` or `# [Peer]` stays a
+/// comment. After that, the next `#`, header or `Key =` ends it (Proton puts
+/// comments right before `PrivateKey`).
+fn comment_end(lower: &str, i: usize) -> usize {
+    let mut j = i + 1;
+    let rest = lower.get(j..).unwrap_or("");
+    j += rest.len() - rest.trim_start_matches([' ', '\t']).len();
+    let rest = lower.get(j..).unwrap_or("");
+    if let Some(h) = header_at(rest) {
+        j += h;
+    } else if let Some(k) = key_at(rest) {
+        j = value_start(lower, j, k.len());
+        if KEY_VALUED.contains(&k.as_str()) {
+            j = key_value_end(lower, j);
+        }
+    }
+    while j < lower.len() {
+        let rest = lower.get(j..).unwrap_or("");
+        if rest.starts_with('#') || starts_entry(rest) {
+            return j;
+        }
+        j += char_len_at(lower, j);
+    }
+    lower.len()
 }
 
 /// Re-inserts line breaks into a `.conf` that was flattened by a single-line
-/// text field (newlines turned into spaces, `;` or nothing at all).
+/// text field (newlines turned into spaces, `;` or, as browsers do for
+/// `<input>`, nothing at all).
 ///
-/// A line break goes before every section header and every known key that is
-/// followed by `=`; a `;` right before one of those (or at the end) is a
-/// separator and is dropped. Other `;` (e.g. inside a `PostUp` hook) are kept.
-/// Base64 key values are copied verbatim by length, so key material can never
-/// be mistaken for the next key name.
+/// A line break goes before every section header, comment and known key
+/// that is followed by `=`; a `;` right before one of those (or at the end)
+/// is a separator and is dropped. Base64 key values, hook commands and
+/// comments are copied as one piece, so nothing inside them can turn into a
+/// directive.
 fn restore_line_breaks(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 64);
     // ASCII lowercasing keeps byte offsets identical to `text`.
@@ -491,49 +642,66 @@ fn restore_line_breaks(text: &str) -> String {
                 continue;
             }
         }
-        let header = ["[interface]", "[peer]"]
-            .into_iter()
-            .find(|h| rest_lower.starts_with(h));
-        if let Some(h) = header {
+        if rest_lower.starts_with('#') {
+            let end = comment_end(&lower, i);
             out.push('\n');
-            out.push_str(text.get(i..i + h.len()).unwrap_or(""));
-            i += h.len();
+            out.push_str(text.get(i..end).unwrap_or(""));
+            i = end;
             continue;
         }
-        let key = KNOWN_KEYS.iter().map(|k| k.to_ascii_lowercase()).find(|k| {
-            rest_lower
-                .strip_prefix(k.as_str())
-                .is_some_and(|after| after.trim_start_matches([' ', '\t']).starts_with('='))
-        });
-        if let Some(k) = key {
+        if let Some(h) = header_at(rest_lower) {
             out.push('\n');
-            // Copy `Key<spaces>=<spaces>`.
-            let after_key = i + k.len();
-            let eq = lower
-                .get(after_key..)
-                .and_then(|r| r.find('='))
-                .map_or(after_key, |off| after_key + off + 1);
-            let value_start = eq
-                + lower
-                    .get(eq..)
-                    .map_or(0, |r| r.len() - r.trim_start_matches([' ', '\t']).len());
-            out.push_str(text.get(i..value_start).unwrap_or(""));
-            i = value_start;
-            if KEY_VALUED.contains(&k.as_str()) {
-                let end = (i + 44).min(text.len());
-                if let Some(v) = text.get(i..end) {
-                    out.push_str(v);
-                    i = end;
-                }
-            }
+            out.push_str(text.get(i..i + h).unwrap_or(""));
+            i += h;
             continue;
         }
-        // Advance one UTF-8 character.
-        let ch_len = text
-            .get(i..)
-            .and_then(|r| r.chars().next())
-            .map_or(1, char::len_utf8);
+        if let Some(k) = key_at(rest_lower) {
+            out.push('\n');
+            let start = value_start(&lower, i, k.len());
+            out.push_str(text.get(i..start).unwrap_or(""));
+            i = start;
+            let end = if KEY_VALUED.contains(&k.as_str()) {
+                key_value_end(text, i)
+            } else if HOOK_KEYS.contains(&k.as_str()) {
+                hook_value_end(&lower, i)
+            } else {
+                i
+            };
+            out.push_str(text.get(i..end).unwrap_or(""));
+            i = end;
+            continue;
+        }
+        let ch_len = char_len_at(text, i);
         out.push_str(text.get(i..i + ch_len).unwrap_or(""));
+        i += ch_len;
+    }
+    out
+}
+
+/// Multi-line configs: splits one line's code (comment already removed) at
+/// `;` separators that are followed by a new entry, as in
+/// `PrivateKey = ...; Address = ...`. Hook lines are left alone: their `;`
+/// separate shell commands, not directives.
+fn split_semicolons(code: &str) -> String {
+    let lower = code.to_ascii_lowercase();
+    let key = lower.split_once('=').map(|(k, _)| k.trim());
+    if !code.contains(';') || key.is_some_and(|k| HOOK_KEYS.contains(&k)) {
+        return code.to_owned();
+    }
+    let mut out = String::with_capacity(code.len() + 8);
+    let mut i = 0usize;
+    while i < code.len() {
+        let rest = lower.get(i..).unwrap_or("");
+        if let Some(after) = rest.strip_prefix(';') {
+            let after = after.trim_start_matches([' ', '\t']);
+            if after.is_empty() || starts_entry(after) {
+                out.push('\n');
+                i += 1;
+                continue;
+            }
+        }
+        let ch_len = char_len_at(code, i);
+        out.push_str(code.get(i..i + ch_len).unwrap_or(""));
         i += ch_len;
     }
     out
@@ -557,9 +725,8 @@ pub fn parse_wg_conf(raw: &str) -> Result<WgConf> {
         // must not come back to life); code is split on `;` separators.
         text.lines()
             .map(|line| match line.split_once('#') {
-                _ if !line.contains(';') => line.to_owned(),
-                Some((code, comment)) => format!("{}#{comment}", restore_line_breaks(code)),
-                None => restore_line_breaks(line),
+                Some((code, comment)) => format!("{}#{comment}", split_semicolons(code)),
+                None => split_semicolons(line),
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -593,12 +760,19 @@ pub fn parse_wg_conf(raw: &str) -> Result<WgConf> {
                     }
                     Section::Peer
                 }
-                other => bail!("WireGuard config line {lineno}: unknown section [{other}]"),
+                other if is_plain_key_name(other) => {
+                    bail!("WireGuard config line {lineno}: unknown section [{other}]")
+                }
+                _ => bail!("WireGuard config line {lineno}: unknown section"),
             };
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
-            bail!("WireGuard config line {lineno}: expected `Key = Value`, found `{line}`");
+            // Never echo the line: it may be a private key pasted on its own.
+            bail!(
+                "WireGuard config line {lineno}: expected `Key = Value` (the line's content is \
+                 not shown because it may hold a key)"
+            );
         };
         let key = key.trim().to_ascii_lowercase();
         let value = value.trim().trim_end_matches(';').trim_end();
@@ -654,12 +828,22 @@ pub fn parse_wg_conf(raw: &str) -> Result<WgConf> {
                     })?)
                 }
             }
-            (_, other) => conf
-                .warnings
-                .push(format!("ignoring unknown WireGuard config key `{other}`")),
+            (_, other) => conf.warnings.push(if is_plain_key_name(other) {
+                format!("ignoring unknown WireGuard config key `{other}` (line {lineno})")
+            } else {
+                // A bare base64 key ends in `=` and would split into a
+                // "key" holding 43 of its 44 characters: never print that.
+                format!("ignoring unrecognised WireGuard config line {lineno}")
+            }),
         }
     }
     Ok(conf)
+}
+
+/// A key name worth echoing in a warning: short and letters only, so no
+/// base64 key material can be printed by accident.
+fn is_plain_key_name(key: &str) -> bool {
+    !key.is_empty() && key.len() <= 24 && key.bytes().all(|b| b.is_ascii_alphabetic())
 }
 
 fn set_once(slot: &mut Option<String>, value: &str, name: &str, warnings: &mut Vec<String>) {
@@ -750,6 +934,18 @@ impl Default for Paths {
     }
 }
 
+/// A unicast IPv4 address a peer, DNS server or gateway can have: not
+/// 0.0.0.0, loopback, multicast or broadcast.
+fn usable_unicast(ip: Ipv4Addr) -> bool {
+    !(ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast())
+}
+
+/// `fd00::1/64`, `2a07:b944::2:2/128` or a bare IPv6 address.
+fn is_ipv6_network(entry: &str) -> bool {
+    let addr = entry.split_once('/').map_or(entry, |(a, _)| a).trim();
+    addr.parse::<std::net::Ipv6Addr>().is_ok()
+}
+
 fn parse_ipv4_list(
     entries: impl IntoIterator<Item = String>,
     what: &str,
@@ -758,6 +954,9 @@ fn parse_ipv4_list(
     let mut out = Vec::new();
     for e in entries {
         match e.parse::<IpAddr>() {
+            Ok(IpAddr::V4(v4)) if !usable_unicast(v4) => notes.push(format!(
+                "ignoring {what} {v4} (not a usable unicast address)"
+            )),
             Ok(IpAddr::V4(v4)) => {
                 if !out.contains(&v4) {
                     out.push(v4);
@@ -836,17 +1035,29 @@ fn parse_local_cidrs(raw: &[String], notes: &mut Vec<String>) -> Result<Vec<Ipv4
 
 /// Web UI login used for port 8080 (LAN clients, Sonarr/Radarr) and injected
 /// by the Ingress proxy. The password reaches rtbit only via stdin.
-fn validate_webui_credentials(opts: &Options) -> Result<(String, Option<Secret>)> {
-    let username = opts.webui_username.trim();
+/// The one rule for Web UI user names, shared by the options and the
+/// qBittorrent import: 1-64 bytes, no blanks, `:` or control characters, and
+/// no leading `-` (it is passed to `rtbit auth reset-password` and must never
+/// read as an option such as `--help`).
+pub fn check_webui_username(username: &str) -> std::result::Result<(), &'static str> {
     if username.is_empty() || username.len() > 64 {
-        bail!("`webui_username` must be 1-64 characters");
+        return Err("must be 1-64 characters");
     }
     if username
         .chars()
         .any(|c| c.is_control() || c == ':' || c.is_whitespace())
     {
-        bail!("`webui_username` must not contain spaces, `:` or control characters");
+        return Err("must not contain spaces, `:` or control characters");
     }
+    if username.starts_with('-') {
+        return Err("must not start with `-`");
+    }
+    Ok(())
+}
+
+fn validate_webui_credentials(opts: &Options) -> Result<(String, Option<Secret>)> {
+    let username = opts.webui_username.trim();
+    check_webui_username(username).map_err(|why| anyhow!("`webui_username` {why}"))?;
     let password = match opts.webui_password.as_deref().filter(|p| !p.is_empty()) {
         None => None,
         Some(p) => {
@@ -979,7 +1190,9 @@ fn resolve_vpn(
     for entry in &address_entries {
         match entry.parse::<Ipv4Cidr>() {
             Ok(c) => v4_addresses.push(c),
-            Err(_) if entry.contains(':') => notes.push(format!(
+            // Only a real IPv6 network is skipped; `10.2.0.2:51820` and other
+            // typos are errors, not silently ignored.
+            Err(_) if is_ipv6_network(entry) => notes.push(format!(
                 "ignoring IPv6 tunnel address {entry} (IPv6 is dropped by the kill-switch)"
             )),
             Err(e) => return Err(anyhow!(e)).context("invalid WireGuard `Address`"),
@@ -991,7 +1204,7 @@ fn resolve_vpn(
     if v4_addresses.len() > 1 {
         notes.push(format!("using the first IPv4 tunnel address {address}"));
     }
-    if address.addr().is_unspecified() || address.addr().is_loopback() {
+    if !usable_unicast(address.addr()) {
         bail!("the WireGuard `Address` {address} is not a usable tunnel address");
     }
 
@@ -1057,6 +1270,9 @@ fn resolve_vpn(
                 opts.nat_pmp_gateway
             )
         })?;
+        if !usable_unicast(gateway) {
+            bail!("`nat_pmp_gateway` {gateway} is not a usable gateway address (Proton: 10.2.0.1)");
+        }
         if conf.proton_nat_pmp == Some(false) {
             notes.push(
                 "your Proton WireGuard config says `NAT-PMP (Port Forwarding) = off`: \
@@ -1085,6 +1301,23 @@ fn resolve_vpn(
         source,
         reason,
     })
+}
+
+/// Whether `text` is a WireGuard config the tunnel could start from on its
+/// own: the same checks as at start-up (keys, endpoint, IPv4 address, MTU),
+/// without NAT-PMP and without reading `/config`.
+pub fn check_wg_conf_text(text: &str) -> Result<()> {
+    let opts = Options {
+        vpn_enabled: true,
+        wireguard_conf: Some(text.to_owned()),
+        enable_nat_pmp: false,
+        ..Options::default()
+    };
+    // A root that cannot exist, so no `/config/wg0.conf` is picked up.
+    let paths = Paths {
+        config_root: PathBuf::from("/nonexistent/rbittorrent-wg-check"),
+    };
+    resolve_vpn(&opts, &paths, String::new(), &mut Vec::new()).map(|_| ())
 }
 
 impl Settings {
@@ -1209,20 +1442,52 @@ fn generate_password() -> Result<String> {
     Ok(password)
 }
 
-/// Writes a file readable by root only (0600), atomically (tmp + fsync + rename).
+/// Writes a file readable by root only (0600), atomically: a fresh,
+/// unpredictably named temp file in the same folder (`O_CREAT | O_EXCL`, so
+/// an existing file or symlink is never reused or followed), fsync, rename.
+/// The temp file is removed if anything fails.
 pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("tmp");
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    f.write_all(contents.as_bytes())?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_owned());
+    let mut last_err = None;
+    for _ in 0..8 {
+        let mut nonce = [0u8; 8];
+        if ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut nonce).is_err() {
+            return Err(std::io::Error::other("no randomness for a temp file name"));
+        }
+        let suffix: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        let tmp = path.with_file_name(format!(".{name}.{suffix}.tmp"));
+        let mut f = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let written = f
+            // The umask could only narrow 0600, but be explicit anyway.
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .and_then(|()| f.write_all(contents.as_bytes()))
+            .and_then(|()| f.sync_all());
+        drop(f);
+        let result = written.and_then(|()| std::fs::rename(&tmp, path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        return result;
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("cannot create a temp file")))
 }
 
 #[cfg(test)]
@@ -1551,6 +1816,148 @@ Endpoint = 190.2.131.156:51820\r\n";
         assert_eq!(c.peer_public_key.as_deref(), Some(PUB));
         assert_eq!(c.endpoint.as_deref(), Some("190.2.131.156:51820"));
         assert!(c.warnings.iter().any(|w| w.contains("postup")));
+    }
+
+    #[test]
+    fn hook_commands_never_become_directives() {
+        // Multi-line: `mtu=1400` and `; DNS = ...` inside a hook stay in it.
+        let conf = format!(
+            "[Interface]\nPrivateKey = {PRIV}\nAddress = 10.2.0.2/32\nDNS = 10.2.0.1\n\
+             PostUp = ip link set %i mtu=1400; DNS = 6.6.6.6; iptables -A x\n\
+             [Peer]\nPublicKey = {PUB}\nEndpoint = 190.2.131.156:51820\n"
+        );
+        let c = parse_wg_conf(&conf).unwrap();
+        assert_eq!(c.mtu, None);
+        assert_eq!(c.dns, vec!["10.2.0.1"]);
+        // Single line, flattened with spaces or with nothing at all.
+        for flat in [conf.replace('\n', " "), conf.replace('\n', "")] {
+            let c = parse_wg_conf(&flat).unwrap_or_else(|e| panic!("{e:#}\n{flat}"));
+            assert_eq!(c.mtu, None, "{flat}");
+            assert!(!c.dns.iter().any(|d| d == "6.6.6.6"), "{flat}");
+            assert_eq!(c.private_key.as_deref(), Some(PRIV), "{flat}");
+            assert_eq!(c.peer_public_key.as_deref(), Some(PUB), "{flat}");
+        }
+    }
+
+    #[test]
+    fn commented_out_lines_stay_comments_in_single_line_pastes() {
+        let conf = format!(
+            "[Interface]\n# Key for x\nPrivateKey = {PRIV}\nAddress = 10.2.0.2/32\n\
+             # DNS = 9.9.9.9\nDNS = 10.2.0.1\n# [Peer]\n# MTU = 1280\n\
+             [Peer]\n# NL-FREE#1\nPublicKey = {PUB}\nEndpoint = 190.2.131.156:51820\n"
+        );
+        for flat in [
+            conf.clone(),
+            conf.replace('\n', " "),
+            conf.replace('\n', ""),
+        ] {
+            let c = parse_wg_conf(&flat).unwrap_or_else(|e| panic!("{e:#}\n{flat}"));
+            assert_eq!(c.dns, vec!["10.2.0.1"], "{flat}");
+            assert_eq!(c.mtu, None, "{flat}");
+            assert_eq!(c.addresses, vec!["10.2.0.2/32"], "{flat}");
+            assert_eq!(c.peer_public_key.as_deref(), Some(PUB), "{flat}");
+        }
+    }
+
+    #[test]
+    fn a_truncated_key_does_not_swallow_the_next_entry() {
+        let short = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYU=";
+        let conf = PROTON_CONF.replace(PRIV, short).replace("\r\n", "");
+        let c = parse_wg_conf(&conf).unwrap();
+        assert_eq!(c.private_key.as_deref(), Some(short));
+        assert_eq!(c.addresses, vec!["10.2.0.2/32", "2a07:b944::2:2/128"]);
+        assert!(settings(&opts_with_conf(&conf)).is_err());
+    }
+
+    #[test]
+    fn errors_warnings_and_debug_never_show_secrets() {
+        // A bare private key without its `=` padding: no `Key =` at all.
+        let bare = format!("[Interface]\n{}\n", &PRIV[..43]);
+        let err = format!("{:#}", parse_wg_conf(&bare).unwrap_err());
+        assert!(!err.contains(&PRIV[..20]), "{err}");
+        assert!(err.contains("line 2"), "{err}");
+        // `<43 chars>=` splits into an unknown "key" of key material.
+        let warned = parse_wg_conf(&format!("[Interface]\nPrivateKey = {PRIV}\n{PRIV}\n")).unwrap();
+        assert!(
+            warned.warnings.iter().all(|w| !w.contains(&PRIV[..20])),
+            "{:?}",
+            warned.warnings
+        );
+        let opts = Options {
+            wireguard_conf: Some(PROTON_CONF.to_owned()),
+            wg_private_key: Some(PRIV.to_owned()),
+            wg_preshared_key: Some(PSK.to_owned()),
+            webui_password: Some("hunter2-hunter2".to_owned()),
+            ..Options::default()
+        };
+        let dbg = format!("{opts:?} {:?}", parse_wg_conf(PROTON_CONF).unwrap());
+        for secret in [&PRIV[..20], &PSK[..20], "hunter2"] {
+            assert!(!dbg.contains(secret), "{secret} in {dbg}");
+        }
+        assert!(dbg.contains("<redacted>"));
+    }
+
+    #[test]
+    fn write_private_never_reuses_or_follows_a_planted_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rbt-wp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("wg0.conf");
+        // The old predictable temp names, planted world-readable / as a symlink.
+        let planted = dir.join("wg0.tmp");
+        std::fs::write(&planted, "old").unwrap();
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let elsewhere = dir.join("elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, dir.join(".wg0.conf.tmp")).unwrap();
+        write_private(&target, "secret\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "secret\n");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&planted).unwrap(), "old");
+        assert!(!elsewhere.exists());
+        // No temp files left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp") && n.starts_with(".wg0.conf.") && n != ".wg0.conf.tmp")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        // A failing rename (target is a directory) cleans up its temp file.
+        let blocked = dir.join("blocked");
+        std::fs::create_dir_all(blocked.join("x")).unwrap();
+        assert!(write_private(&blocked, "x").is_err());
+        let after: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".blocked."))
+            .collect();
+        assert!(after.is_empty(), "{after:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unusable_addresses_are_rejected() {
+        for bad in [
+            "127.0.0.1:51820",
+            "224.0.0.1:51820",
+            "0.0.0.0:51820",
+            "255.255.255.255",
+        ] {
+            assert!(parse_endpoint(bad).is_err(), "{bad}");
+        }
+        // `Address` with a port is a typo, not an IPv6 address to skip.
+        let typo = PROTON_CONF.replace("10.2.0.2/32, ", "10.2.0.2:51820, ");
+        assert!(settings(&opts_with_conf(&typo)).is_err());
+        // Loopback / 0.0.0.0 DNS entries are dropped (Proton's DNS is used instead).
+        let dns = PROTON_CONF.replace("DNS = 10.2.0.1, 2a07:b944::2:1", "DNS = 127.0.0.1, 0.0.0.0");
+        let s = settings(&opts_with_conf(&dns)).unwrap();
+        assert_eq!(vpn(&s).wireguard.dns, vec![PROTON_GATEWAY]);
+        let mut o = opts_with_conf(PROTON_CONF);
+        o.nat_pmp_gateway = "127.0.0.1".into();
+        assert!(settings(&o).is_err());
     }
 
     #[test]
