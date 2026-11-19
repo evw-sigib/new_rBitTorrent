@@ -2,12 +2,16 @@
 //!
 //! HAOS kernels enable AppArmor only (`CONFIG_LSM="apparmor"`, no Landlock),
 //! and the Supervisor loads the app's `apparmor.txt` under the app's slug.
-//! That profile switches rtbit and the Ingress proxy to the child profiles
-//! `<slug>//rtbit` and `<slug>//ingress`, stacked on the app's profile, when
-//! they are executed. This module reads the labels from `/proc` so the
-//! supervisor can tell whether its own profile is the app's, and prove that
-//! a child really runs in its child profile before trusting it.
+//! rtbit and the Ingress proxy run in its child profiles `<slug>//rtbit` and
+//! `<slug>//ingress`: the forked child changes to its profile
+//! ([`ProfileSwitch`]) before it sets `no_new_privs`, which would make
+//! AppArmor refuse the change, and then runs its binary in that profile.
+//! This module also reads the labels from `/proc` so the supervisor can tell
+//! whether its own profile is the app's, and prove that a child really runs
+//! in its child profile before trusting it.
 
+use std::ffi::CStr;
+use std::io;
 use std::path::Path;
 
 /// The app's slug ends in this; the Supervisor prefixes a repository id
@@ -99,9 +103,8 @@ pub fn app_profile(label: &Label) -> Result<String, String> {
 }
 
 /// Whether `label` confines a task to `<profile>//<child>`, enforced: the
-/// child profile stacked on the app's profile (`<profile>//&<profile>//<child>`,
-/// the only transition AppArmor allows under `no_new_privs`), or the child
-/// profile alone.
+/// child profile alone, or stacked on the app's profile
+/// (`<profile>//&<profile>//<child>`, never narrower than the child).
 pub fn is_child(label: &Label, profile: &str, child: &str) -> bool {
     let want = format!("{profile}//{child}");
     let parts: Vec<&str> = label.name.split("//&").collect();
@@ -110,11 +113,83 @@ pub fn is_child(label: &Label, profile: &str, child: &str) -> bool {
         && parts.iter().all(|p| *p == want || *p == profile)
 }
 
+/// Where a task changes its own profile: the AppArmor-specific file with LSM
+/// stacking, the shared one on older kernels.
+const ATTR_CURRENT: [&CStr; 2] = [
+    c"/proc/self/attr/apparmor/current",
+    c"/proc/self/attr/current",
+];
+
+/// Moves the calling task to the profile `<profile>//<child>`
+/// (`change_profile`, allowed by the app's profile). Built before `fork`, so
+/// that the forked child only makes syscalls.
+#[derive(Debug, Clone)]
+pub struct ProfileSwitch {
+    command: Vec<u8>,
+}
+
+impl ProfileSwitch {
+    pub fn new(profile: &str, child: &str) -> Self {
+        Self {
+            command: format!("changeprofile {profile}//{child}").into_bytes(),
+        }
+    }
+
+    /// Changes the profile now; it applies to this task and everything it
+    /// runs. Must come before `no_new_privs`. Async-signal-safe: open,
+    /// write, close, and errors built from an errno.
+    pub fn apply(&self) -> io::Result<()> {
+        for path in ATTR_CURRENT {
+            // SAFETY: a NUL-terminated path; the fd is closed below.
+            let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+            if fd < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ENOENT) {
+                    continue;
+                }
+                return Err(err);
+            }
+            // SAFETY: writes `command`, which outlives the call.
+            let n = unsafe { libc::write(fd, self.command.as_ptr().cast(), self.command.len()) };
+            let err = io::Error::last_os_error();
+            // SAFETY: the fd opened above.
+            unsafe { libc::close(fd) };
+            return match usize::try_from(n) {
+                Ok(n) if n == self.command.len() => Ok(()),
+                Ok(_) => Err(io::Error::from_raw_os_error(libc::EIO)),
+                Err(_) => Err(err),
+            };
+        }
+        Err(io::Error::from_raw_os_error(libc::ENOENT))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn a_failed_profile_switch_stops_the_child() {
+        use std::os::unix::process::CommandExt as _;
+        let marker = std::env::temp_dir().join(format!("rbt-switch-{}", std::process::id()));
+        // No such profile: with AppArmor the change is refused, without it
+        // the write fails. Either way the child must not run.
+        let switch = ProfileSwitch::new("rbt-test-no-such-profile", RTBIT_CHILD);
+        assert_eq!(
+            switch.command,
+            b"changeprofile rbt-test-no-such-profile//rtbit"
+        );
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!("touch {}", marker.display()));
+        // SAFETY: `apply` only makes syscalls on pre-allocated data.
+        unsafe {
+            cmd.pre_exec(move || switch.apply());
+        }
+        assert!(cmd.status().is_err(), "the exec must fail");
+        assert!(!marker.exists(), "the child ran");
+    }
 
     #[test]
     fn labels_are_parsed() {

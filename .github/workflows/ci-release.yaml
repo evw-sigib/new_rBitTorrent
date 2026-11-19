@@ -410,15 +410,17 @@ jobs:
           grep -q 'AppArmor profile `local_rbittorrent` confines the app' <<<"$logs"
           grep -q 'rtbit filesystem sandbox active (AppArmor `local_rbittorrent//rtbit`)' <<<"$logs"
           grep -q 'Ingress proxy filesystem sandbox active (AppArmor `local_rbittorrent//ingress`)' <<<"$logs"
-          # Stacked on the app's profile: the only transition AppArmor allows
-          # under no_new_privs.
-          stacked() { echo "(local_rbittorrent//&local_rbittorrent//$1|local_rbittorrent//$1//&local_rbittorrent) \(enforce\)"; }
-          grep -Eq "AppArmor \`$(stacked rtbit)\`" <<<"$logs"
-          grep -Eq "AppArmor \`$(stacked ingress)\`" <<<"$logs"
+          # Each child changed to its profile before no_new_privs and runs in
+          # it; the supervisor checked the labels after the start.
+          grep -q 'AppArmor `local_rbittorrent//rtbit (enforce)`' <<<"$logs"
+          grep -q 'AppArmor `local_rbittorrent//ingress (enforce)`' <<<"$logs"
           grep -q 'auth: enabled (user "admin")' <<<"$logs"
           label=$(docker exec aa /bin/sh -c 'cat /proc/$(pidof rtbit)/attr/current')
           echo "rtbit's label: $label"
-          grep -Eqx "$(stacked rtbit)" <<<"$label"
+          test "$label" = 'local_rbittorrent//rtbit (enforce)'
+          proxy=$(docker exec aa /bin/sh -c 'for p in $(pidof rbittorrent-supervisor); do [ "$p" = 1 ] || cat /proc/$p/attr/current; done')
+          echo "the Ingress proxy's label: $proxy"
+          test "$proxy" = 'local_rbittorrent//ingress (enforce)'
           docker exec aa /bin/sh -c 'wget -qO- http://127.0.0.1:8099/__health' | tee health.json
           grep -q '"fs_sandbox":true' health.json
           if docker exec aa cat /proc/1/environ >/dev/null 2>&1; then

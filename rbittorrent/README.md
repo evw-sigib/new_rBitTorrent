@@ -25,7 +25,7 @@ NAT-PMP port forwarding.
 - **Sidebar panel** with automatic sign-in (Ingress), a VPN status bar and
   a built-in speed test (line, disk, SHA-1).
 - **Watchdog health check:** a stalled tunnel restarts the app.
-- **Small:** one static Rust supervisor (about 2 MB RAM), no shell scripts.
+- **Small:** one static Rust supervisor (about 4 MiB RAM), no shell scripts.
   rtbit is compiled from source with the mimalloc allocator. Asks for
   `NET_ADMIN` only.
 

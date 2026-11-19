@@ -46,14 +46,22 @@ def check_apparmor(profile: Path, slug: str) -> list:
     errors = []
     print(f"apparmor.txt: profile {get_profile_name(profile)!r}")
     text = profile.read_text()
-    for child in ("rtbit", "ingress"):
-        # Stacked (`&`): the children run with no_new_privs, and AppArmor
-        # refuses any other transition then.
-        if f"profile {child} " not in text or f"cx -> &{child}," not in text:
-            errors.append(
-                f"apparmor.txt has no child profile `{child}` with a stacked cx transition "
-                f"(`cx -> &{child},`)"
-            )
+    # The supervisor moves each child to its profile with change_profile
+    # (before no_new_privs, which rules out exec transitions), and the child
+    # runs its binary in it.
+    if "change_profile -> {,*_}rbittorrent//{rtbit,ingress}," not in text:
+        errors.append("apparmor.txt does not let the app change to its child profiles "
+                      "(`change_profile -> {,*_}rbittorrent//{rtbit,ingress},`)")
+    if " cx " in text or " px " in text or "cx ->" in text:
+        errors.append("apparmor.txt has an exec transition; under no_new_privs AppArmor "
+                      "refuses it, the children change profile before")
+    for child, binary in (("rtbit", "/usr/local/bin/rtbit"),
+                          ("ingress", "/usr/local/bin/rbittorrent-supervisor")):
+        body = text.split(f"profile {child} ", 1)[1].split("\n  }", 1)[0] \
+            if f"profile {child} " in text else ""
+        if f"{binary} mrix," not in body:
+            errors.append(f"apparmor.txt has no child profile `{child}` that runs {binary} "
+                          f"in itself (`{binary} mrix,`)")
     with tempfile.TemporaryDirectory() as tmp:
         adjusted = Path(tmp) / "profile"
         adjust_profile(slug, profile, adjusted)

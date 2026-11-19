@@ -270,8 +270,8 @@ struct CapData {
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
 /// Runs in the forked child right before `execve`: async-signal-safe syscalls
-/// only, no allocation.
-fn drop_privileges(drop: &[u32]) -> io::Result<()> {
+/// only, no allocation. [`set_no_new_privs`] must follow.
+fn drop_capabilities(drop: &[u32]) -> io::Result<()> {
     // 1. Clear ambient capabilities (EINVAL on pre-4.3 kernels is fine).
     // SAFETY: prctl with integer args.
     let rc = unsafe {
@@ -321,7 +321,13 @@ fn drop_privileges(drop: &[u32]) -> io::Result<()> {
         }
     }
 
-    // 4. Never regain privileges through setuid/file capabilities.
+    Ok(())
+}
+
+/// Never regain privileges through setuid binaries or file capabilities.
+/// Also required by Landlock. After it, AppArmor refuses to change the
+/// profile, so [`enter_apparmor_child`] comes first. One syscall.
+fn set_no_new_privs() -> io::Result<()> {
     // SAFETY: prctl with integer args.
     let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if rc != 0 {
@@ -333,10 +339,9 @@ fn drop_privileges(drop: &[u32]) -> io::Result<()> {
 /// uid/gid of the unprivileged Ingress proxy (`nobody` on Alpine).
 pub const NOBODY: u32 = 65534;
 
-/// Like [`drop_privileges`], then switches to uid/gid 65534, which clears
-/// every remaining capability. Async-signal-safe syscalls only.
-fn drop_to_nobody(all_caps: &[u32]) -> io::Result<()> {
-    drop_privileges(all_caps)?;
+/// Switches to uid/gid 65534, which clears every remaining capability.
+/// Async-signal-safe syscalls only.
+fn become_nobody() -> io::Result<()> {
     // SAFETY: plain syscalls with integer args / a null list.
     unsafe {
         if libc::setgroups(0, std::ptr::null()) != 0 {
@@ -422,9 +427,13 @@ pub fn check_fs_sandbox(policy: &FsPolicy, allow_unsandboxed: bool) -> Result<bo
 
 /// A child's sandbox, decided before `fork`.
 enum FsSandbox {
-    /// Landlock (applied before `execve`) and/or the AppArmor child profile
-    /// (switched to by `execve`, verified after the start).
-    Confined { landlock: Option<Arc<Ruleset>> },
+    /// The AppArmor child profile (changed to before `no_new_privs`,
+    /// verified after the start) and/or Landlock (applied after
+    /// `no_new_privs`), both before `execve`.
+    Confined {
+        apparmor: Option<crate::apparmor::ProfileSwitch>,
+        landlock: Option<Arc<Ruleset>>,
+    },
     /// No sandbox at all, and [`check_fs_sandbox`] allowed that.
     Allowed,
     /// No sandbox, not allowed: the child must never run.
@@ -436,6 +445,7 @@ enum FsSandbox {
 /// [`apply_fs_sandbox`]).
 fn fs_sandbox(who: &str, child: &str, policy: &FsPolicy, announced: &AtomicBool) -> FsSandbox {
     let apparmor = APPARMOR_PROFILE.get();
+    let switch = apparmor.map(|p| crate::apparmor::ProfileSwitch::new(p, child));
     let first = !announced.swap(true, Ordering::Relaxed);
     match (landlock::build(policy), apparmor) {
         (Ok(rs), aa) => {
@@ -450,6 +460,7 @@ fn fs_sandbox(who: &str, child: &str, policy: &FsPolicy, announced: &AtomicBool)
                 );
             }
             FsSandbox::Confined {
+                apparmor: switch,
                 landlock: Some(Arc::new(rs)),
             }
         }
@@ -460,7 +471,10 @@ fn fs_sandbox(who: &str, child: &str, policy: &FsPolicy, announced: &AtomicBool)
                      /app_configs and the secrets in /config are out of reach"
                 );
             }
-            FsSandbox::Confined { landlock: None }
+            FsSandbox::Confined {
+                apparmor: switch,
+                landlock: None,
+            }
         }
         (Err(why), None) if FS_SANDBOX_OPTIONAL.load(Ordering::Relaxed) => {
             if first {
@@ -475,12 +489,29 @@ fn fs_sandbox(who: &str, child: &str, policy: &FsPolicy, announced: &AtomicBool)
     }
 }
 
-/// Runs in the forked child right before `execve` (async-signal-safe: one
-/// syscall, or an error built from an errno without allocating).
+/// Runs in the forked child before [`set_no_new_privs`]: moves it to its
+/// AppArmor child profile, where its binary then runs (`ix`). An exec
+/// transition would come after `no_new_privs`, and AppArmor refuses those.
+/// Async-signal-safe (see [`crate::apparmor::ProfileSwitch::apply`]).
+fn enter_apparmor_child(fs: &FsSandbox) -> io::Result<()> {
+    match fs {
+        FsSandbox::Confined {
+            apparmor: Some(switch),
+            ..
+        } => switch.apply(),
+        _ => Ok(()),
+    }
+}
+
+/// Runs in the forked child right before `execve`, after
+/// [`set_no_new_privs`] (async-signal-safe: one syscall, or an error built
+/// from an errno without allocating).
 fn apply_fs_sandbox(fs: &FsSandbox) -> io::Result<()> {
     match fs {
-        FsSandbox::Confined { landlock: Some(rs) } => rs.restrict_self(),
-        FsSandbox::Confined { landlock: None } | FsSandbox::Allowed => Ok(()),
+        FsSandbox::Confined {
+            landlock: Some(rs), ..
+        } => rs.restrict_self(),
+        FsSandbox::Confined { landlock: None, .. } | FsSandbox::Allowed => Ok(()),
         FsSandbox::Refused => Err(io::Error::from_raw_os_error(libc::EPERM)),
     }
 }
@@ -543,7 +574,10 @@ pub fn ingress_command(exe: &Path, sandbox: bool) -> Command {
         // SAFETY: async-signal-safe syscalls on pre-allocated data only.
         unsafe {
             cmd.pre_exec(move || {
-                drop_to_nobody(&all)?;
+                drop_capabilities(&all)?;
+                become_nobody()?;
+                enter_apparmor_child(&fs)?;
+                set_no_new_privs()?;
                 apply_fs_sandbox(&fs)
             });
         }
@@ -828,11 +862,13 @@ impl RtbitSpec {
                 &RTBIT_FS_ANNOUNCED,
             );
             // SAFETY: the closure only performs async-signal-safe syscalls on
-            // pre-allocated data (see `drop_privileges`); `no_new_privs` is
-            // set before Landlock is applied.
+            // pre-allocated data (see `drop_capabilities`). The AppArmor
+            // profile changes before `no_new_privs`, Landlock comes after it.
             unsafe {
                 cmd.pre_exec(move || {
-                    drop_privileges(&drop)?;
+                    drop_capabilities(&drop)?;
+                    enter_apparmor_child(&fs)?;
+                    set_no_new_privs()?;
                     apply_fs_sandbox(&fs)
                 });
             }

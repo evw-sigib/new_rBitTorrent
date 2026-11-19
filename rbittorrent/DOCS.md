@@ -535,7 +535,8 @@ To check it yourself:
 ## Performance notes
 
 - The supervisor and the Ingress proxy each use a single-threaded runtime
-  and about 2 MB of RAM (1.9 MB idle, 2.6 MB after 400 proxied requests).
+  and about 4 MiB of RAM (resident, measured in CI on amd64). rtbit itself
+  uses about 24 MiB idle and about 38 MiB with 30 paused torrents.
 - rtbit yields to Home Assistant: it runs at `nice` 10 and the lowest
   best-effort I/O priority, so hashing and peer I/O on a Pi never starve
   Core or the supervisor's health checks. Its limits follow the board:
@@ -624,11 +625,11 @@ and the app uses every one the kernel has:
 
 - **AppArmor** (Home Assistant OS, and Supervised installs on Debian). The
   app ships its own profile, `apparmor.txt`, which Home Assistant loads for
-  it. rtbit and the Ingress proxy switch to child profiles of it when they
-  start, stacked on the app's profile (`<slug>//&<slug>//rtbit`): they run
-  with `no_new_privs`, and AppArmor then only allows a switch that keeps the
-  current profile. Home Assistant OS kernels have AppArmor but no Landlock,
-  so this is the sandbox there.
+  it. rtbit and the Ingress proxy switch to child profiles of it
+  (`<slug>//rtbit`, `<slug>//ingress`) as they start, before they set
+  `no_new_privs` and run their binary, and the supervisor checks each
+  child's profile before it trusts it. Home Assistant OS kernels have
+  AppArmor but no Landlock, so this is the sandbox there.
 - **Landlock** (Linux 5.19 or newer with Landlock among the kernel's security
   modules, as on most current desktop and server distributions). It narrows
   rtbit to the exact folders it was given.

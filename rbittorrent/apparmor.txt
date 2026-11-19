@@ -9,8 +9,8 @@
 # a child profile when they are started: rtbit can only reach shared storage
 # (/media, /share) and its own state in /config, never /data, /app_configs,
 # the WireGuard configuration or another process's memory or environment.
-# The supervisor verifies both transitions and refuses to run a child that
-# is not confined.
+# The supervisor verifies both switches and refuses to run a child that is
+# not confined.
 profile rbittorrent flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
 
@@ -40,12 +40,13 @@ profile rbittorrent flags=(attach_disconnected,mediate_deleted) {
   deny /sys/firmware/** rwklx,
   deny /sys/kernel/security/** rwklx,
 
-  # Children start in their own profiles, stacked on this one (`&`): both
-  # run with no_new_privs, and AppArmor then only allows a transition that
-  # keeps the current profile. The child gets what both profiles allow,
-  # which is what the child profile allows.
-  /usr/local/bin/rtbit cx -> &rtbit,
-  /usr/local/bin/rbittorrent-supervisor cx -> &ingress,
+  # How the children get there: the forked child changes to its profile
+  # (`change_profile`) before it sets no_new_privs and runs the binary, which
+  # then stays in that profile (`ix`). An exec transition (`cx`) would come
+  # after no_new_privs, and AppArmor refuses those. The Supervisor renames
+  # this profile to the app's slug (`local_rbittorrent`,
+  # `1a2b3c4d_rbittorrent`), hence the pattern.
+  change_profile -> {,*_}rbittorrent//{rtbit,ingress},
 
   profile rtbit flags=(attach_disconnected,mediate_deleted) {
     #include <abstractions/base>
@@ -69,7 +70,7 @@ profile rbittorrent flags=(attach_disconnected,mediate_deleted) {
     signal (receive),
     ptrace (readby),
 
-    /usr/local/bin/rtbit mr,
+    /usr/local/bin/rtbit mrix,
     /etc/** r,
     /usr/share/zoneinfo/** r,
     @{PROC}/** r,
@@ -113,7 +114,7 @@ profile rbittorrent flags=(attach_disconnected,mediate_deleted) {
     signal (receive),
     ptrace (readby),
 
-    /usr/local/bin/rbittorrent-supervisor mr,
+    /usr/local/bin/rbittorrent-supervisor mrix,
     /etc/** r,
     /usr/share/zoneinfo/** r,
     owner @{PROC}/@{pid}/** r,
