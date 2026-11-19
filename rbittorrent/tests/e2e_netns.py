@@ -639,14 +639,15 @@ def checks(sup, cli_priv, supervisor):
     check(int(st["CapAmb"], 16) == 0 and int(st["CapInh"], 16) == 0, "no ambient/inheritable caps")
     check(st.get("NoNewPrivs") == "1", "no_new_privs set")
     probes = first.get("probes", {})
-    if "rtbit filesystem sandbox active" in log_text():
-        for name in ("wg0.conf", "webui-password", "options.json", "app_configs", "write-config"):
-            check(probes.get(name) == "denied",
-                  f"Landlock: rtbit cannot reach {name} ({probes.get(name)})")
-        check(probes.get("write-db") == "writable", "Landlock: rtbit can write its database folder")
-        check(not (WORK / "config" / "planted").exists(), "Landlock: nothing planted in /config")
-    else:
-        print(f"  info  Landlock unavailable on this kernel; rtbit probes: {probes}")
+    # Required: with the VPN on, the app never runs rtbit without Landlock.
+    check("rtbit filesystem sandbox active" in log_text(), "rtbit filesystem sandbox active")
+    check("Ingress proxy filesystem sandbox active" in log_text(),
+          "Ingress proxy filesystem sandbox active")
+    for name in ("wg0.conf", "webui-password", "options.json", "app_configs", "write-config"):
+        check(probes.get(name) == "denied",
+              f"Landlock: rtbit cannot reach {name} ({probes.get(name)})")
+    check(probes.get("write-db") == "writable", "Landlock: rtbit can write its database folder")
+    check(not (WORK / "config" / "planted").exists(), "Landlock: nothing planted in /config")
 
     step("routes, tunnel and firewall state")
     routes = sh("ip", "-4", "route", "show", ns=NS_CLI).stdout
@@ -728,6 +729,7 @@ def checks(sup, cli_priv, supervisor):
         60, "watchdog /__health = 200 from the Supervisor address")
     check(status == 200 and '"status":"ok"' in body, f"/__health healthy for the Supervisor ({body})")
     check(f'"port":{PORT_A}' in body, "/__health reports the forwarded port")
+    check('"fs_sandbox":true' in body, "/__health reports the filesystem sandbox")
     status, body = http_get(NS_RTR, OTHER_APP_IP, "10.99.0.2", INGRESS_PORT, "/__health")
     check(status == 403, f"other apps on 172.30.32.0/23 are refused by the proxy ({status})")
     ok, out = tcp_probe(NS_RTR, "10.99.0.2", INGRESS_PORT)

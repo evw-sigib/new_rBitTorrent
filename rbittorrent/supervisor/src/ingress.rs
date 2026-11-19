@@ -182,6 +182,10 @@ pub struct Health {
     /// session the proxy holds is gone.
     #[serde(default)]
     pub generation: u64,
+    /// rtbit runs without its Landlock filesystem sandbox (the kernel has
+    /// none and the user set `allow_unsandboxed`).
+    #[serde(default)]
+    pub unsandboxed: bool,
 }
 
 /// A request from the proxy to the supervisor (one JSON line on stdout).
@@ -1608,7 +1612,7 @@ var CSS=":host{all:initial}*{box-sizing:border-box;font:13px/1.25 system-ui,-app
 ".label{font-weight:600;flex:none}.pill{flex:none;font-weight:600;color:#fff;background:#2e7d32;border-radius:999px;padding:3px 10px}.pill.down{background:#a15c00}"+
 ".b{flex:none;font-weight:500;color:inherit;background:transparent;border:1px solid currentColor;border-radius:6px;padding:4px 10px;cursor:pointer;text-decoration:none}"+
 ".b:hover{background:rgba(127,127,127,.12)}.b:focus-visible,.l:focus-visible{outline:2px solid #1565c0;outline-offset:2px}"+
-".primary{background:#1565c0;border-color:#1565c0;color:#fff}.primary:hover{background:#0d47a1}.l{flex:none;color:inherit;text-decoration:underline}.x{margin-left:auto}"+
+".primary{background:#1565c0;border-color:#1565c0;color:#fff}.primary:hover{background:#0d47a1}.l{flex:none;color:inherit;text-decoration:underline}.warn{font-weight:700;color:#b71c1c}.x{margin-left:auto}"+
 ".overlay{position:fixed;inset:0;z-index:2147483001;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,.45)}"+
 ".modal{width:100%;max-width:440px;max-height:90vh;overflow:auto;background:#fff;color:#212121;border-radius:12px;padding:16px 18px;box-shadow:0 10px 40px rgba(0,0,0,.3)}"+
 ".modal h2{font-size:16px;font-weight:700;margin:0 0 10px}.modal h3{font-size:13px;font-weight:700;margin:14px 0 4px}"+
@@ -1616,7 +1620,7 @@ var CSS=":host{all:initial}*{box-sizing:border-box;font:13px/1.25 system-ui,-app
 ".muted{color:#666;white-space:normal}.err{color:#c62828;white-space:normal}.foot{display:flex;justify-content:flex-end;margin-top:14px}.modal .b{border-color:rgba(127,127,127,.6)}"+
 ".spin{width:26px;height:26px;margin:12px auto;border:3px solid rgba(127,127,127,.3);border-top-color:#1565c0;border-radius:50%;animation:s 1s linear infinite}@keyframes s{to{transform:rotate(360deg)}}"+
 "@media (prefers-color-scheme:dark){.direct{background:#2b1d00;color:#ffcc80;border-color:#7a4f00}.vpn{background:#0f2214;color:#a5d6a7;border-color:#1e4620}"+
-".modal{background:#1e1e1e;color:#e6e6e6}.k,.muted{color:#aaa}.err{color:#ef9a9a}}";
+".modal{background:#1e1e1e;color:#e6e6e6}.k,.muted{color:#aaa}.err{color:#ef9a9a}.warn{color:#ef9a9a}}";
 var host=null,root=null,bar=null,modal=null,state="",last=null;
 function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e;}
 function btn(c,x,f){var b=el("button",c,x);b.type="button";b.addEventListener("click",f);return b;}
@@ -1625,20 +1629,23 @@ function offset(px){var d=document.documentElement;if(px){d.style.setProperty("-
 function ensure(){if(host)return true;if(!document.body)return false;host=el("div");host.id="rbittorrent-status-bar";host.style.cssText="position:fixed;top:0;left:0;right:0;z-index:2147483000";
 root=host.attachShadow?host.attachShadow({mode:"open"}):host;var s=el("style");s.textContent=CSS;root.appendChild(s);bar=el("div","bar");root.appendChild(bar);document.body.appendChild(host);return true;}
 function render(h){var key="";
-if(h&&h.vpn===false)key=store()==="1"?"":"direct";else if(h&&h.vpn===true)key=h.tunnel?"vpn|"+(h.public_ip||"")+"|"+(h.port||""):"down";
+var nosb=!!h&&h.fs_sandbox===false;
+if(h&&h.vpn===false)key=store()==="1"&&!nosb?"":"direct";else if(h&&h.vpn===true)key=h.tunnel?"vpn|"+(h.public_ip||"")+"|"+(h.port||""):"down";
+if(key&&nosb)key+="|nosb";
 if(key===state&&(!key||host))return;if(key&&!ensure())return;state=key;
 if(!key){if(host)host.style.display="none";offset(0);return;}
 host.style.display="";bar.textContent="";
-if(key==="direct"){bar.className="bar direct";bar.setAttribute("role","status");
+if(key.indexOf("direct")===0){bar.className="bar direct";bar.setAttribute("role","status");
 bar.appendChild(el("span","label","\uD83D\uDD13 Direct Connection (Unprotected)"));
 bar.appendChild(btn("b","\u26A1 Speed Test",speed));
 bar.appendChild(link("b primary","\uD83D\uDCD8 Proton VPN Setup",D+"#proton-vpn-setup"));
 bar.appendChild(link("l","Custom / Static WireGuard",D+"#other-wireguard-providers-static-port"));
-var x=btn("b x","\u2715 Dismiss",function(){store("1");render(last);});x.title="Hide this notice for good in this browser";bar.appendChild(x);offset(36);}
-else{bar.className="bar vpn";bar.setAttribute("role","status");var p=el("span",key==="down"?"pill down":"pill");
-if(key==="down")p.textContent="\uD83D\uDD12 VPN reconnecting (kill-switch on)";
+sandbox(nosb);var x=btn("b x","\u2715 Dismiss",function(){store("1");render(last);});x.title="Hide this notice for good in this browser";if(!nosb)bar.appendChild(x);offset(36);}
+else{bar.className="bar vpn";bar.setAttribute("role","status");var dn=key.indexOf("down")===0,p=el("span",dn?"pill down":"pill");
+if(dn)p.textContent="\uD83D\uDD12 VPN reconnecting (kill-switch on)";
 else{var d=[];if(h.public_ip)d.push(h.public_ip);if(h.port)d.push("Port "+h.port);p.textContent="\uD83D\uDD12 VPN Protected"+(d.length?" ("+d.join(" \u2022 ")+")":"");}
-bar.appendChild(p);if(key!=="down")bar.appendChild(btn("b","\u26A1 Test VPN Speed",speed));offset(32);}}
+bar.appendChild(p);if(!dn)bar.appendChild(btn("b","\u26A1 Test VPN Speed",speed));sandbox(nosb);offset(32);}}
+function sandbox(off){if(!off)return;var w=link("l warn","\u26A0 No filesystem sandbox",D+"#filesystem-sandbox");w.title="rtbit runs without Landlock (allow_unsandboxed): it could read the WireGuard key and other apps' files";bar.appendChild(w);}
 function row(t,k,v){var r=el("div","row");r.appendChild(el("span","k",k));r.appendChild(el("span","v",v));t.appendChild(r);}
 function num(v,u){return typeof v==="number"?v.toLocaleString(undefined,{maximumFractionDigits:1})+" "+u:"\u2014";}
 function shut(){if(modal){root.removeChild(modal);modal=null;document.removeEventListener("keydown",esc,true);}}
@@ -1880,6 +1887,8 @@ fn health_json(ok: bool, message: &str, h: Option<&Health>) -> Response<ProxyBod
         // Unknown (null) until the supervisor's first heartbeat.
         "vpn": h.map(|h| !h.direct),
         "public_ip": h.and_then(|h| h.public_ip),
+        // false only when rtbit runs without Landlock (`allow_unsandboxed`).
+        "fs_sandbox": h.map(|h| !h.unsandboxed),
     })
     .to_string();
     let status = if ok {

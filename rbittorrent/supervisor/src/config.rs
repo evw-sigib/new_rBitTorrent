@@ -116,6 +116,9 @@ pub struct Options {
     pub import_from_qbittorrent: bool,
     /// Also re-add qBittorrent's torrents from `BT_backup` (opt-in).
     pub import_active_torrents: bool,
+    /// Start even when the kernel cannot provide the Landlock filesystem
+    /// sandbox (opt-out; the app refuses to start otherwise).
+    pub allow_unsandboxed: bool,
 }
 
 impl Default for Options {
@@ -146,6 +149,7 @@ impl Default for Options {
             enable_dht: true,
             import_from_qbittorrent: true,
             import_active_torrents: false,
+            allow_unsandboxed: false,
         }
     }
 }
@@ -176,6 +180,7 @@ impl fmt::Debug for Options {
             .field("enable_dht", &self.enable_dht)
             .field("import_from_qbittorrent", &self.import_from_qbittorrent)
             .field("import_active_torrents", &self.import_active_torrents)
+            .field("allow_unsandboxed", &self.allow_unsandboxed)
             .finish()
     }
 }
@@ -914,6 +919,8 @@ pub struct Settings {
     /// `None`: generate (once) and persist a random password.
     pub webui_password: Option<Secret>,
     pub enable_dht: bool,
+    /// Run the children without Landlock when the kernel has none.
+    pub allow_unsandboxed: bool,
     /// The app's private `/config` folder.
     pub config_root: PathBuf,
     /// Informational notes gathered while validating (logged at startup).
@@ -1380,6 +1387,7 @@ impl Settings {
             webui_username,
             webui_password,
             enable_dht: opts.enable_dht,
+            allow_unsandboxed: opts.allow_unsandboxed,
             config_root: paths.config_root.clone(),
             notes,
         })

@@ -87,6 +87,9 @@ pub struct LegacyInstall {
     pub categories: Option<PathBuf>,
     pub bt_backup: Option<PathBuf>,
     pub wireguard: Vec<PathBuf>,
+    /// OpenVPN profiles (`*.ovpn`, or `*.conf` in an `openvpn` folder): the
+    /// old app may have run behind OpenVPN, which rBittorrent does not have.
+    pub openvpn: Vec<PathBuf>,
     /// qBittorrent 5's SQLite resume store, which is not supported.
     pub sqlite_resume: bool,
     /// The walk stopped at [`MAX_WALK_ENTRIES`]: a WireGuard file may have
@@ -100,6 +103,7 @@ impl LegacyInstall {
             || self.categories.is_some()
             || self.bt_backup.is_some()
             || !self.wireguard.is_empty()
+            || !self.openvpn.is_empty()
     }
 
     pub fn label(&self) -> String {
@@ -169,8 +173,11 @@ pub fn scan(root: &Path, slug: Option<String>) -> LegacyInstall {
         let in_wireguard_dir = dir
             .file_name()
             .is_some_and(|n| n.eq_ignore_ascii_case("wireguard"));
+        let in_openvpn_dir = dir
+            .file_name()
+            .is_some_and(|n| n.eq_ignore_ascii_case("openvpn"));
         let mut entries: Vec<_> = rd.take(MAX_DIR_ENTRIES + 1).flatten().collect();
-        if depth > 0 && !in_wireguard_dir && entries.len() > MAX_DIR_ENTRIES {
+        if depth > 0 && !in_wireguard_dir && !in_openvpn_dir && entries.len() > MAX_DIR_ENTRIES {
             debug!(
                 "not scanning {} (more than {MAX_DIR_ENTRIES} entries)",
                 dir.display()
@@ -193,13 +200,16 @@ pub fn scan(root: &Path, slug: Option<String>) -> LegacyInstall {
             let name = e.file_name().to_string_lossy().into_owned();
             let lower = name.to_ascii_lowercase();
             let path = e.path();
-            let wireguard_name =
-                lower.ends_with(".conf") && (in_wireguard_dir || lower == "wg0.conf");
+            let openvpn_name =
+                lower.ends_with(".ovpn") || (in_openvpn_dir && lower.ends_with(".conf"));
+            let wireguard_name = !openvpn_name
+                && lower.ends_with(".conf")
+                && (in_wireguard_dir || lower == "wg0.conf");
             if ft.is_dir() {
                 if name == "BT_backup" {
                     found.bt_backup.get_or_insert(path);
                 } else if depth < MAX_WALK_DEPTH {
-                    if lower == "wireguard" {
+                    if lower == "wireguard" || lower == "openvpn" {
                         queue.push_front((path, depth + 1));
                     } else {
                         queue.push_back((path, depth + 1));
@@ -214,9 +224,13 @@ pub fn scan(root: &Path, slug: Option<String>) -> LegacyInstall {
                     found.sqlite_resume = true;
                 } else if wireguard_name {
                     found.wireguard.push(path);
+                } else if openvpn_name {
+                    found.openvpn.push(path);
                 }
             } else if ft.is_symlink() && wireguard_name {
                 found.wireguard.push(path);
+            } else if ft.is_symlink() && openvpn_name {
+                found.openvpn.push(path);
             }
         }
     }
@@ -698,12 +712,14 @@ pub fn prepare(o: &mut Options, roots: &Roots) -> Migration {
     }
     for i in &installs {
         info!(
-            "qBittorrent import: found {} (settings: {}, categories: {}, torrents: {}, WireGuard files: {})",
+            "qBittorrent import: found {} (settings: {}, categories: {}, torrents: {}, WireGuard \
+             files: {}, OpenVPN profiles: {})",
             i.root.display(),
             yes(i.conf.is_some()),
             yes(i.categories.is_some()),
             yes(i.bt_backup.is_some()),
-            i.wireguard.len()
+            i.wireguard.len(),
+            i.openvpn.len()
         );
     }
 
@@ -731,6 +747,26 @@ pub fn prepare(o: &mut Options, roots: &Roots) -> Migration {
         );
         o.vpn_enabled = true;
         // Nothing is recorded: the next start looks again.
+        m.status = format!("stopped: {reason}");
+        return m;
+    }
+    // OpenVPN: rBittorrent has none. A qBittorrent that ran behind OpenVPN,
+    // with no WireGuard config to take over, would otherwise come back on the
+    // real IP address (and, with `import_active_torrents`, seed everything
+    // there). Same treatment: VPN mode stays on, so the start stops.
+    if wireguard_options_empty(o)
+        && !config::path_present(&wg0)
+        && let Some(reason) = openvpn_without_wireguard(&installs)
+    {
+        error!("qBittorrent import: {reason}");
+        error!(
+            "VPN mode stays on so the import never runs without a VPN: get a WireGuard config \
+             from your VPN provider and put it in /config/{} (Proton: see the Proton VPN \
+             setup in the documentation), or set `import_from_qbittorrent: false` to start \
+             without importing",
+            config::WG_CONF_FILE
+        );
+        o.vpn_enabled = true;
         m.status = format!("stopped: {reason}");
         return m;
     }
@@ -798,6 +834,22 @@ fn take_over_wireguard(installs: &[LegacyInstall], wg0: &Path, rec: &mut Record)
         }
         Err(e) => Some(format!("cannot write {}: {e}", wg0.display())),
     }
+}
+
+/// The old app had OpenVPN profiles and no WireGuard config was taken over.
+fn openvpn_without_wireguard(installs: &[LegacyInstall]) -> Option<String> {
+    let all: Vec<&PathBuf> = installs.iter().flat_map(|i| &i.openvpn).collect();
+    if all.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "the old app has {} OpenVPN profile(s) ({}), and rBittorrent supports WireGuard only",
+        all.len(),
+        all.iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 fn yes(b: bool) -> &'static str {
@@ -1448,6 +1500,51 @@ mod tests {
         };
         prepare(&mut o, &r);
         assert!(!o.vpn_enabled);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn an_openvpn_profile_without_wireguard_keeps_vpn_mode_on() {
+        let base = tmp("ovpn-fail-closed");
+        let r = roots(&base);
+        let app = legacy(&base);
+        // The old app ran behind OpenVPN: no WireGuard files at all.
+        std::fs::remove_dir_all(app.join("wireguard")).unwrap();
+        std::fs::create_dir_all(app.join("openvpn")).unwrap();
+        std::fs::write(
+            app.join("openvpn/proton.ovpn"),
+            "client\nremote 1.2.3.4 1194\n",
+        )
+        .unwrap();
+        let mut o = Options {
+            import_active_torrents: true,
+            ..Options::default()
+        };
+        let m = prepare(&mut o, &r);
+        assert!(o.vpn_enabled, "VPN mode must stay on");
+        assert!(m.status.contains("OpenVPN"), "{}", m.status);
+        assert!(m.status.starts_with("stopped:"), "{}", m.status);
+        assert!(m.torrents_from.is_none() && m.record.is_none(), "{m:?}");
+        assert!(!base.join("config/.migrated").exists());
+        let paths = config::Paths {
+            config_root: base.join("config"),
+        };
+        assert!(config::Settings::from_options(&o, &paths).is_err());
+
+        // `.conf` files in an `openvpn` folder are OpenVPN, not WireGuard.
+        std::fs::remove_file(app.join("openvpn/proton.ovpn")).unwrap();
+        std::fs::write(app.join("openvpn/nl.conf"), "client\n").unwrap();
+        let found = scan(&app, None);
+        assert_eq!(found.openvpn.len(), 1, "{found:?}");
+        assert!(found.wireguard.is_empty(), "{found:?}");
+
+        // A WireGuard config next to it is taken over and wins.
+        std::fs::create_dir_all(app.join("wireguard")).unwrap();
+        std::fs::write(app.join("wireguard/proton.conf"), WG).unwrap();
+        let mut o = Options::default();
+        let m = prepare(&mut o, &r);
+        assert!(base.join("config/wg0.conf").exists(), "{}", m.status);
+        assert!(!m.status.starts_with("stopped:"), "{}", m.status);
         let _ = std::fs::remove_dir_all(base);
     }
 

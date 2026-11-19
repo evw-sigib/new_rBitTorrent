@@ -126,3 +126,4 @@ schema:
   local_allow_cidrs:
     - str
   log_level: list(trace|debug|info|warn|error)
+  allow_unsandboxed: bool?

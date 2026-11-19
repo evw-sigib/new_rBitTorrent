@@ -1,0 +1,87 @@
+diff --git a/crates/librtbit-dht/src/dht.rs b/crates/librtbit-dht/src/dht.rs
+index 17f1c90..69e1e22 100644
+--- a/crates/librtbit-dht/src/dht.rs
++++ b/crates/librtbit-dht/src/dht.rs
+@@ -1437,15 +1437,22 @@ impl DhtState {
+             let addr = config
+                 .listen_addr
+                 .unwrap_or((Ipv6Addr::UNSPECIFIED, 0).into());
+-            let socket = UdpSocket::bind_udp(
+-                addr,
+-                librqbit_dualstack_sockets::BindOpts {
+-                    request_dualstack: true,
+-                    reuseport: false,
+-                    device: config.bind_device,
+-                },
+-            )
+-            .map_err(|e| Error::Bind(Box::new(e)))?;
++            let opts = librqbit_dualstack_sockets::BindOpts {
++                request_dualstack: true,
++                reuseport: false,
++                device: config.bind_device,
++            };
++            let socket = match UdpSocket::bind_udp(addr, opts) {
++                Ok(socket) => socket,
++                // No IPv6 socket family (a kernel booted with ipv6.disable=1):
++                // the same port on IPv4.
++                Err(e) if addr.is_ipv6() && addr.ip().is_unspecified() => {
++                    let v4 = SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, addr.port()));
++                    warn!("DHT: cannot open {addr} ({e:#}), using {v4}");
++                    UdpSocket::bind_udp(v4, opts).map_err(|e| Error::Bind(Box::new(e)))?
++                }
++                Err(e) => return Err(Error::Bind(Box::new(e))),
++            };
+ 
+             let listen_addr = socket.bind_addr();
+             info!("DHT listening on {:?}", listen_addr);
+diff --git a/crates/librtbit-dht/src/persistence.rs b/crates/librtbit-dht/src/persistence.rs
+index 73fbc4a..7e0947d 100644
+--- a/crates/librtbit-dht/src/persistence.rs
++++ b/crates/librtbit-dht/src/persistence.rs
+@@ -154,7 +154,11 @@ impl PersistentDht {
+                 if let Some(ref mut addr) = listen_addr {
+                     addr.set_port(port);
+                 } else {
+-                    listen_addr = Some(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)));
++                    listen_addr = Some(if config.ipv4_only {
++                        SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))
++                    } else {
++                        SocketAddr::from((Ipv6Addr::UNSPECIFIED, port))
++                    });
+                 }
+             }
+             let peer_id = routing_table.as_ref().map(|r| r.id());
+diff --git a/crates/librtbit-tracker-comms/src/tracker_comms_udp.rs b/crates/librtbit-tracker-comms/src/tracker_comms_udp.rs
+index c74a0e2..b840d61 100644
+--- a/crates/librtbit-tracker-comms/src/tracker_comms_udp.rs
++++ b/crates/librtbit-tracker-comms/src/tracker_comms_udp.rs
+@@ -308,14 +308,21 @@ impl UdpTrackerClient {
+         bind_device: Option<&BindDevice>,
+     ) -> anyhow::Result<Self> {
+         let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+-        let sock = UdpSocket::bind_udp(
+-            addr,
+-            librqbit_dualstack_sockets::BindOpts {
+-                device: bind_device,
+-                ..Default::default()
+-            },
+-        )
+-        .with_context(|| format!("error creating UDP socket at {addr}"))?;
++        let opts = librqbit_dualstack_sockets::BindOpts {
++            device: bind_device,
++            ..Default::default()
++        };
++        let sock = match UdpSocket::bind_udp(addr, opts) {
++            Ok(sock) => sock,
++            // No IPv6 socket family (a kernel booted with ipv6.disable=1):
++            // IPv4 trackers still work over an IPv4 socket.
++            Err(e) => {
++                let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
++                warn!("UDP trackers: cannot open {addr} ({e:#}), using {v4}");
++                UdpSocket::bind_udp(v4, opts)
++                    .with_context(|| format!("error creating UDP socket at {v4}"))?
++            }
++        };
+ 
+         let client = Self {
+             state: Arc::new(ClientShared {

@@ -21,7 +21,7 @@ use anyhow::{Context, Result, bail};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tokio::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{LogLevel, Secret};
 use crate::landlock::{self, FsPolicy, Ruleset};
@@ -367,10 +367,56 @@ pub fn parse_uid(status: &str) -> Option<u32> {
 
 static RTBIT_FS_ANNOUNCED: AtomicBool = AtomicBool::new(false);
 static PROXY_FS_ANNOUNCED: AtomicBool = AtomicBool::new(false);
+/// Set only by [`check_fs_sandbox`] when running without Landlock is
+/// acceptable (direct mode, or `allow_unsandboxed`). Until then every
+/// sandboxed child refuses to start without its ruleset.
+static FS_SANDBOX_OPTIONAL: AtomicBool = AtomicBool::new(false);
 
-/// The Landlock ruleset for a child, or `None` (logged once per kind of
-/// child) when the kernel cannot provide one.
-fn fs_sandbox(who: &str, policy: &FsPolicy, announced: &AtomicBool) -> Option<Arc<Ruleset>> {
+/// What a child loses without Landlock, for the refusal and the warning.
+const UNSANDBOXED_RISK: &str = "rtbit runs as root with CAP_DAC_OVERRIDE, so without the \
+    sandbox it could read the Web UI password, /data/options.json, every other app's folder in \
+    /app_configs and, with the VPN on, /config/wg0.conf";
+
+/// Checks, before any child starts, that the kernel can confine rtbit with
+/// Landlock (ABI 2+: Linux 5.19 or newer, Landlock in the kernel's LSM list,
+/// not blocked by seccomp). With the VPN on this fails closed unless the user
+/// set `allow_unsandboxed`; a direct connection only warns. Returns whether
+/// the sandbox is active.
+pub fn check_fs_sandbox(policy: &FsPolicy, vpn: bool, allow_unsandboxed: bool) -> Result<bool> {
+    let why = match landlock::build(policy) {
+        Ok(_) => {
+            FS_SANDBOX_OPTIONAL.store(false, Ordering::Relaxed);
+            return Ok(true);
+        }
+        Err(why) => why,
+    };
+    if vpn && !allow_unsandboxed {
+        bail!(
+            "the filesystem sandbox is not available: {why}. {UNSANDBOXED_RISK}. It needs Linux \
+             5.19 or newer with Landlock enabled. Refusing to start with the VPN on; set \
+             `allow_unsandboxed: true` (Configuration, show unused optional options) to run \
+             without it at your own risk"
+        );
+    }
+    FS_SANDBOX_OPTIONAL.store(true, Ordering::Relaxed);
+    if vpn {
+        warn!(
+            "the filesystem sandbox is not available ({why}); running without it because \
+             `allow_unsandboxed` is on. {UNSANDBOXED_RISK}"
+        );
+    } else {
+        warn!(
+            "the filesystem sandbox is not available ({why}): {UNSANDBOXED_RISK}. With the VPN \
+             on, the app refuses to start without it unless `allow_unsandboxed` is set"
+        );
+    }
+    Ok(false)
+}
+
+/// The Landlock ruleset for a child. Without one, the child runs only when
+/// [`check_fs_sandbox`] allowed that; otherwise it refuses to `execve` (see
+/// [`apply_fs_sandbox`]).
+fn fs_sandbox(who: &str, policy: &FsPolicy, announced: &AtomicBool) -> FsSandbox {
     match landlock::build(policy) {
         Ok(rs) => {
             if !announced.swap(true, Ordering::Relaxed) {
@@ -381,14 +427,37 @@ fn fs_sandbox(who: &str, policy: &FsPolicy, announced: &AtomicBool) -> Option<Ar
                     policy.describe()
                 );
             }
-            Some(Arc::new(rs))
+            FsSandbox::Active(Arc::new(rs))
         }
-        Err(why) => {
+        Err(why) if FS_SANDBOX_OPTIONAL.load(Ordering::Relaxed) => {
             if !announced.swap(true, Ordering::Relaxed) {
                 warn!("{who} runs without a filesystem sandbox: {why}");
             }
-            None
+            FsSandbox::Allowed
         }
+        Err(why) => {
+            error!("{who} cannot be sandboxed ({why}); refusing to start it");
+            FsSandbox::Refused
+        }
+    }
+}
+
+/// A child's Landlock state, decided before `fork`.
+enum FsSandbox {
+    Active(Arc<Ruleset>),
+    /// No Landlock, and [`check_fs_sandbox`] allowed that.
+    Allowed,
+    /// No Landlock, not allowed: the child must never run.
+    Refused,
+}
+
+/// Runs in the forked child right before `execve` (async-signal-safe: one
+/// syscall, or an error built from an errno without allocating).
+fn apply_fs_sandbox(fs: &FsSandbox) -> io::Result<()> {
+    match fs {
+        FsSandbox::Active(rs) => rs.restrict_self(),
+        FsSandbox::Allowed => Ok(()),
+        FsSandbox::Refused => Err(io::Error::from_raw_os_error(libc::EPERM)),
     }
 }
 
@@ -435,10 +504,7 @@ pub fn ingress_command(exe: &Path, sandbox: bool) -> Command {
         unsafe {
             cmd.pre_exec(move || {
                 drop_to_nobody(&all)?;
-                match &fs {
-                    Some(rs) => rs.restrict_self(),
-                    None => Ok(()),
-                }
+                apply_fs_sandbox(&fs)
             });
         }
     }
@@ -700,10 +766,7 @@ impl RtbitSpec {
             unsafe {
                 cmd.pre_exec(move || {
                     drop_privileges(&drop)?;
-                    match &fs {
-                        Some(rs) => rs.restrict_self(),
-                        None => Ok(()),
-                    }
+                    apply_fs_sandbox(&fs)
                 });
             }
         }
@@ -883,6 +946,32 @@ impl Rtbit {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn a_child_without_its_required_sandbox_never_runs() {
+        use std::os::unix::process::CommandExt as _;
+        let marker = std::env::temp_dir().join(format!("rbt-refused-{}", std::process::id()));
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!("touch {}", marker.display()));
+        let fs = FsSandbox::Refused;
+        // SAFETY: apply_fs_sandbox only builds an io::Error from an errno.
+        unsafe {
+            cmd.pre_exec(move || apply_fs_sandbox(&fs));
+        }
+        let err = cmd
+            .status()
+            .expect_err("a refused sandbox must stop the exec");
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
+        assert!(!marker.exists(), "the child ran");
+
+        let mut ok = std::process::Command::new("/bin/true");
+        let allowed = FsSandbox::Allowed;
+        // SAFETY: as above.
+        unsafe {
+            ok.pre_exec(move || apply_fs_sandbox(&allowed));
+        }
+        assert!(ok.status().expect("allowed runs").success());
+    }
 
     fn spec(binary: &str) -> RtbitSpec {
         RtbitSpec {

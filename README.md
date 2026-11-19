@@ -24,6 +24,7 @@
 | `rbittorrent/rtbit/mimalloc.patch` | mimalloc as rtbit's global allocator |
 | `rbittorrent/rtbit/auth-banner.patch` | rtbit's startup log reports the stored Web UI login as `auth: enabled` |
 | `rbittorrent/rtbit/swagger-vendored.patch` | Build-only: Swagger UI from a checksum-pinned crate, no download from github.com |
+| `rbittorrent/rtbit/ipv4-fallback.patch` | The DHT and UDP tracker sockets fall back to IPv4 on hosts booted with `ipv6.disable=1` |
 | `rbittorrent/supervisor/` | `rbittorrent-supervisor`, the Rust PID 1 (config, firewall, WireGuard, NAT-PMP, migration, process, Ingress, benchmark) |
 | `rbittorrent/tests/` | Kernel end-to-end leak test (network namespaces + real WireGuard) |
 | `.github/workflows/ci-release.yaml` | fmt, clippy, tests, live nftables, e2e (VPN + direct mode), native per-arch image builds and smoke tests, GHCR publishing of the tested images |
@@ -51,9 +52,9 @@ exactly the images it smoke-tested as `<version>` and `latest`.
 ## Credits
 
 [rustTorrent](https://github.com/thedancingdeveloper-org/rusttorrent) (`rtbit`)
-is the BitTorrent engine, built from its release source with three small
-patches in `rbittorrent/rtbit/`: the mimalloc allocator, a startup-log fix
-and a build-only Swagger UI change.
+is the BitTorrent engine, built from its release source with four small
+patches in `rbittorrent/rtbit/`: the mimalloc allocator, a startup-log fix,
+a build-only Swagger UI change and an IPv4 fallback for hosts without IPv6.
 
 [repo-badge]: https://img.shields.io/badge/Add%20repository-Home%20Assistant-41BDF5?logo=home-assistant
 [repo-add]: https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fevw-sigib%2Fnew_rBitTorrent

@@ -133,6 +133,13 @@ configuration:
       Verbosity of the supervisor and rtbit. At "info", rtbit's per-peer and
       DHT messages are reduced to warnings to spare SD cards; choose "debug"
       to see everything.
+  allow_unsandboxed:
+    name: Allow running without the filesystem sandbox
+    description: >-
+      Leave this off. With the VPN on, the app refuses to start when the
+      kernel cannot confine rtbit with Landlock, because rtbit could then
+      read your WireGuard key, the Web UI password and other apps' files.
+      Turn it on only to accept that risk on an old kernel.
 network:
   8080/tcp: >-
     Web UI and qBittorrent-compatible API on qBittorrent's own default port,

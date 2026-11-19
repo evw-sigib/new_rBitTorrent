@@ -45,8 +45,8 @@ or C NAT-PMP library.
 - **Home Assistant OS** (or Supervised) on aarch64 (Raspberry Pi 4/5, ...) or
   amd64. WireGuard is built into the HAOS kernel; the app never loads kernel
   modules.
-- Do not boot the host with `ipv6.disable=1`: rtbit needs IPv6 *sockets* to
-  start. All IPv6 *traffic* is still dropped, see
+- A host booted with `ipv6.disable=1` works too: rtbit then opens IPv4
+  sockets only. IPv6 *traffic* is dropped either way, see
   [Leak protection](#leak-protection).
 
 ## Moving from qBittorrent
@@ -103,6 +103,14 @@ It never changes or deletes anything there.
   skipped and listed in the log.
 - qBittorrent 5 profiles that store torrents only in `torrents.db` (SQLite)
   are not supported. Their categories and settings are still taken over.
+- **OpenVPN is not supported.** If the old app has OpenVPN profiles
+  (`*.ovpn`, or `*.conf` in an `openvpn` folder) and no WireGuard file, the
+  app keeps VPN mode on and stops with `rBittorrent supports WireGuard only`,
+  so nothing starts on your real IP address. Get a WireGuard config from your
+  provider (Proton: [Proton VPN setup](#proton-vpn-setup)) and put it in
+  `/config/wg0.conf`, or turn off **Import from qBittorrent**.
+- The same applies to WireGuard files that cannot be used: the import never
+  falls back to the direct connection.
 
 ### Running it once, and again
 
@@ -373,6 +381,7 @@ page. Clear it to close the port. Inside the container it stays 8080.
 | `completed_dir` | `/media/rbittorrent/completed` | Finished torrents. Same rules. |
 | `local_allow_cidrs` | `172.30.32.0/23`, `172.16.0.0/12`, `192.168.0.0/16`, `10.0.0.0/8` | Networks that may reach port 8080. Private IPv4 ranges only; `172.30.32.0/23` is always added. |
 | `log_level` | `info` | `trace`, `debug`, `info`, `warn`, `error`. |
+| `allow_unsandboxed` | off (optional) | Start the VPN mode even if the kernel cannot sandbox rtbit, see [Filesystem sandbox](#filesystem-sandbox). Leave it off. |
 
 Notes:
 - **USB disk or SSD:** mount it in Home Assistant (*Settings* → *System* →
@@ -510,11 +519,14 @@ To check it yourself:
   log say `auth: enabled` for the login the supervisor stored (upstream
   printed "not set up" although the API was protected), and the build-only
   `rtbit/swagger-vendored.patch` takes the Swagger UI page from a
-  checksum-pinned crate. Everything the build downloads is pinned: crates
-  by `Cargo.lock`, and the Web UI's npm packages (rtbit's build runs
-  `npm ci`) by upstream's `package-lock.json`. The patches apply in this
-  order, as the Dockerfile does: `mimalloc`, `auth-banner`,
-  `swagger-vendored` (the last two expect the first one's changes).
+  checksum-pinned crate. `rtbit/ipv4-fallback.patch` lets the DHT and the
+  UDP tracker client fall back to IPv4 sockets when the kernel has no IPv6
+  (`ipv6.disable=1`); upstream exited at once. Everything the build
+  downloads is pinned: crates by `Cargo.lock`, and the Web UI's npm
+  packages (rtbit's build runs `npm ci`) by upstream's `package-lock.json`.
+  The patches apply in this order, as the Dockerfile does: `mimalloc`,
+  `auth-banner`, `swagger-vendored`, `ipv4-fallback` (the middle two expect
+  the first one's changes).
 - Its SHA-1 piece hashing picks ARMv8 or SHA-NI instructions at runtime. No
   `target-cpu` flags are set, so it also runs on a Raspberry Pi 3 or 4.
 - The [speed test](#speed-test) costs nothing while idle: its threads and
@@ -545,11 +557,10 @@ To check it yourself:
 - **Processes:** rtbit has no network capability, only the four file
   capabilities listed above; the proxy runs as uid 65534 with none at all.
   Both run with `no_new_privs`.
-- **Filesystem sandbox:** where the kernel supports Landlock (ABI 2 or
-  newer, Linux 5.19+), rtbit may write only to `/media`, `/share`, its
+- **Filesystem sandbox:** rtbit may write only to `/media`, `/share`, its
   download folders and its own state, and the Ingress proxy may write
-  nowhere. The log says at start whether the sandbox is active. Older
-  kernels run without it and the log says so.
+  nowhere. With the VPN on, the app does not start without the sandbox, see
+  [Filesystem sandbox](#filesystem-sandbox).
 - **Direct connection:** without a VPN, the app runs without a kill-switch
   and says so in the log and the sidebar. Any WireGuard setup switches the
   VPN on, and from then on it never falls back.
@@ -557,12 +568,46 @@ To check it yourself:
   off, 1.1.1.1, 8.8.8.8 and 9.9.9.9 for a TCP connect), and only when you
   press the button.
 
+## Filesystem sandbox
+
+rtbit runs as root with `CAP_DAC_OVERRIDE` so it can manage files other apps
+wrote to `/media` and `/share`. File permissions alone therefore cannot keep
+it away from your secrets. Landlock confines it by path instead:
+
+- read and write: `/media`, `/share`, its download and completed folders,
+  and its own database and cache in `/config/db` and `/config/cache`;
+- read only: `/etc`, `/proc`, `/sys`, `/dev` and the system folders it
+  starts from;
+- nothing else. `/config/wg0.conf`, `/config/.webui-password`,
+  `/data/options.json` and every other app's folder in `/app_configs` are out
+  of reach, even for root.
+
+The Ingress proxy gets a stricter policy: it may write nowhere.
+
+Landlock needs Linux 5.19 or newer with Landlock in the kernel's list of
+security modules. The log line `rtbit filesystem sandbox active (Landlock
+ABI ...)` confirms it at every start, and `/__health` reports
+`"fs_sandbox": true`. A download folder you pick in rtbit's own Web UI must
+stay below `/media` or `/share`, or rtbit cannot write to it.
+
+**Fails closed with the VPN on.** On a kernel without Landlock (or with a
+seccomp profile that blocks it) the VPN mode refuses to start and says why:
+the point of the VPN mode is privacy, and the WireGuard key would be
+readable. If you accept the risk, enable *Show unused optional configuration
+options*, set `allow_unsandboxed: true` and start the app again.
+
+On a direct connection (VPN off) the app starts without the sandbox and warns
+instead. Either way, an unsandboxed rtbit is logged at every start and the
+sidebar's status bar shows **⚠ No filesystem sandbox** (it cannot be
+dismissed).
+
 ## Troubleshooting
 
 | Log message | Meaning |
 |---|---|
 | `VPN mode is on (...)` followed by an error | A WireGuard setup exists but is incomplete or broken. The app stops instead of running unprotected. Fix the file or options, or remove them all for the direct connection. |
 | `no WireGuard private key configured` (or endpoint, address, ...) | VPN mode is on, but no method is filled in, or the value is missing from your file. |
+| `rBittorrent supports WireGuard only` | Your old qBittorrent app used OpenVPN. See [What is taken over](#what-is-taken-over). |
 | `VPN OFF: rBittorrent uses your normal internet connection` | No WireGuard setup was found. See [Proton VPN setup](#proton-vpn-setup). |
 | `qBittorrent is still running` | Stop the old app and turn off its *Start on boot*. |
 | `qBittorrent import: ... is outside /media, /share and /config` | Set `download_dir` / `completed_dir` yourself. |
@@ -570,7 +615,7 @@ To check it yourself:
 | `no WireGuard handshake with ...` | Wrong key or endpoint, or the configuration was revoked in your Proton account. Generate a new one. |
 | `has not answered for 10 minutes` | The Proton server is down or your key was revoked. Restart the app, or use another server. |
 | `Proton VPN did not grant a forwarded port` | See [Port forwarding](#port-forwarding-nat-pmp). |
-| `rtbit needs IPv6 sockets to start` | Remove `ipv6.disable=1` from the host kernel command line. |
+| `the filesystem sandbox is not available` | The kernel has no Landlock (or blocks it). With the VPN on, the app stops. See [Filesystem sandbox](#filesystem-sandbox). |
 | `LOW DISK SPACE` | See [Disk space guard](#disk-space-guard). |
 | Sidebar shows *rBittorrent is starting...* for minutes | rtbit keeps exiting. Check the log, e.g. for a folder on a missing disk. |
 | Sonarr gets `401` / `403` | Wrong user name or password, or Sonarr's IP is not in `local_allow_cidrs`. |
@@ -582,7 +627,7 @@ contains keys or passwords.
 
 The BitTorrent engine is
 [rustTorrent](https://github.com/thedancingdeveloper-org/rusttorrent)
-(`rtbit`), built from its release source with three small patches: the
-mimalloc allocator, a startup-log fix, and Swagger UI from the
-checksum-pinned `utoipa-swagger-ui-vendored` crate instead of a download
-at build time.
+(`rtbit`), built from its release source with four small patches: the
+mimalloc allocator, a startup-log fix, Swagger UI from the checksum-pinned
+`utoipa-swagger-ui-vendored` crate instead of a download at build time,
+and an IPv4 fallback for hosts without IPv6.

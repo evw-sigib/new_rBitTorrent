@@ -34,6 +34,7 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -335,7 +336,7 @@ async fn unless_shutdown<T>(
 async fn preflight(runner: &impl Runner, vpn: bool) -> Result<()> {
     if !vpn {
         // Direct mode needs no tunnel tools.
-        return ensure_ipv6_sockets();
+        return Ok(());
     }
     let ip = runner
         .run("ip", &["-V"], None)
@@ -362,27 +363,7 @@ async fn preflight(runner: &impl Runner, vpn: bool) -> Result<()> {
         wg.stdout.trim(),
         nft.stdout.trim()
     );
-    ensure_ipv6_sockets()
-}
-
-/// rtbit opens dual-stack `[::]` UDP sockets (DHT, UDP trackers) even in
-/// IPv4-only mode, so a kernel booted with `ipv6.disable=1` makes it exit at
-/// once. IPv6 *traffic* is still dropped by the kill-switch; only the socket
-/// family has to exist. Failing here beats an endless rtbit crash loop.
-fn ensure_ipv6_sockets() -> Result<()> {
-    match std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)) {
-        Ok(_) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(libc::EAFNOSUPPORT) => anyhow::bail!(
-            "the host kernel has IPv6 disabled completely (ipv6.disable=1), but rtbit needs \
-             IPv6 sockets to start. Remove ipv6.disable=1 from the kernel command line; this \
-             app still blocks all IPv6 traffic with its kill-switch"
-        ),
-        // Any other error (e.g. sysctl-disabled IPv6) does not stop rtbit.
-        Err(e) => {
-            debug!("IPv6 socket probe: {e}");
-            Ok(())
-        }
-    }
+    Ok(())
 }
 
 fn prepare_dirs(s: &Settings) -> Result<()> {
@@ -438,13 +419,21 @@ async fn supervise(
     let runner = SystemRunner;
     preflight(&runner, s.vpn.is_some()).await?;
     prepare_dirs(s)?;
+    // Before the first rtbit command (even `auth`): no child runs without
+    // Landlock unless that was allowed here.
+    let rtbit_spec = rtbit_spec(s);
+    let sandboxed = process::check_fs_sandbox(
+        &rtbit_spec.fs_policy(),
+        s.vpn.is_some(),
+        s.allow_unsandboxed,
+    )?;
+    FS_SANDBOX_ACTIVE.store(sandboxed, Ordering::Relaxed);
     host::raise_udp_buffer_limits();
     // Supervisor API: before the kill-switch (it uses the normal network).
     supervisor_checks(s).await;
 
     // The Web UI account goes into rtbit's credential store before rtbit
     // ever runs: port 8080 is never open and never waits for first-run setup.
-    let rtbit_spec = rtbit_spec(s);
     let (password, generated) = s.resolve_webui_password()?;
     rtbit_spec
         .set_credentials(&s.webui_username, &password)
@@ -535,7 +524,7 @@ async fn supervise(
     // shows a "starting" page instead of an error while the tunnel comes up.
     let (health, health_rx) = watch::channel(Health {
         detail: "connecting the WireGuard tunnel".into(),
-        ..Health::default()
+        ..health_base()
     });
     let (stop_ingress, stop_rx) = watch::channel(false);
     let ingress_task = tokio::spawn(supervise_ingress(
@@ -607,7 +596,7 @@ async fn supervise_direct(
         direct: true,
         port: Some(s.fallback_listen_port),
         detail: "starting rtbit on a direct connection (VPN off)".into(),
-        ..Health::default()
+        ..health_base()
     });
     let (stop_ingress, stop_rx) = watch::channel(false);
     let ingress_task = tokio::spawn(supervise_ingress(
@@ -698,7 +687,7 @@ async fn run_tunnel(
                         "WireGuard tunnel setup failed; retrying in {}s",
                         d.as_secs()
                     ),
-                    ..Health::default()
+                    ..health_base()
                 });
                 if unless_shutdown(shutdown, sleep(d)).await.is_none() {
                     return Ok(());
@@ -755,6 +744,17 @@ async fn supervisor_checks(s: &Settings) {
             s.webui_port
         ),
         Err(e) => debug!("Home Assistant discovery not available: {e:#}"),
+    }
+}
+
+/// Whether rtbit's Landlock sandbox is active (set once at startup).
+static FS_SANDBOX_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// The parts of [`Health`] that never change after startup.
+fn health_base() -> Health {
+    Health {
+        unsandboxed: !FS_SANDBOX_ACTIVE.load(Ordering::Relaxed),
+        ..Health::default()
     }
 }
 
@@ -1094,6 +1094,7 @@ impl<R: Runner> Session<'_, R> {
             direct: self.direct,
             public_ip: self.public_ip,
             generation: self.rtbit_starts,
+            unsandboxed: !FS_SANDBOX_ACTIVE.load(Ordering::Relaxed),
         });
     }
 
@@ -1289,7 +1290,7 @@ async fn run_session(
         } else {
             "starting rtbit on a direct connection (VPN off)".into()
         },
-        ..Health::default()
+        ..health_base()
     });
 
     // NAT-PMP: verify the public IP through the tunnel, then lease a port.

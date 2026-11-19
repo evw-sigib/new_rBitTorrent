@@ -264,8 +264,9 @@ jobs:
           test "$ok" -eq 1
           grep -q 'VPN OFF' <<<"$logs"
           grep -q 'direct connection: LAN \[' <<<"$logs"
-          # Landlock depends on the runner's kernel: report it, never require it.
-          grep -E 'filesystem sandbox' <<<"$logs" || echo "no filesystem sandbox line"
+          # The runners' kernels have Landlock: both children must be confined.
+          grep -q 'rtbit filesystem sandbox active' <<<"$logs"
+          grep -q 'Ingress proxy filesystem sandbox active' <<<"$logs"
           docker exec direct nft list table inet direct
           # The supervisor stores the Web UI account before rtbit's first
           # start: the API on 8080 is never open, even on a fresh install.
@@ -277,11 +278,51 @@ jobs:
           docker exec direct /bin/sh -c 'wget -qO- http://127.0.0.1:8099/__health' | tee health.json
           grep -q '"vpn":false' health.json
           grep -q '"port":4240' health.json
+          grep -q '"fs_sandbox":true' health.json
           docker stop -t 30 direct
           test "$(docker inspect -f '{{.State.ExitCode}}' direct)" -eq 0
           logs=$(docker logs direct 2>&1)
           grep -q 'shutdown complete' <<<"$logs"
           docker rm direct >/dev/null
+          echo "::endgroup::"
+          echo "::group::fail-closed: no Landlock (blocked by seccomp)"
+          # Everything allowed except Landlock, which answers EPERM.
+          printf '%s' '{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["landlock_create_ruleset","landlock_add_rule","landlock_restrict_self"],"action":"SCMP_ACT_ERRNO","errnoRet":1}]}' > no-landlock.json
+          nolandlock=(--security-opt "seccomp=$PWD/no-landlock.json")
+          wg='"wg_private_key": "aGVsbG8taGVsbG8taGVsbG8taGVsbG8taGVsbG8tISE=", "wg_public_key": "d29ybGQtd29ybGQtd29ybGQtd29ybGQtd29ybGQtISE=", "wg_endpoint": "203.0.113.1:51820", "wg_address": "10.2.0.2/32", "wg_dns": "10.2.0.1"'
+          echo "{$wg}" > vpn.json
+          # VPN on: refuses before rtbit (or its auth helper) ever runs.
+          set +e
+          out=$(run "${nolandlock[@]}" -v "$PWD/vpn.json:/data/options.json:ro" "$IMG" 2>&1); code=$?
+          set -e
+          echo "$out" | tail -n 20
+          test "$code" -eq 1
+          grep -q 'the filesystem sandbox is not available: Landlock is blocked' <<<"$out"
+          grep -q 'allow_unsandboxed' <<<"$out"
+          if grep -q 'reset-password\|auth: enabled' <<<"$out"; then echo "rtbit ran without a sandbox"; exit 1; fi
+          # The explicit opt-out gets past the check (and then stops at the
+          # firewall here: no NET_ADMIN).
+          echo "{$wg, \"allow_unsandboxed\": true}" > vpn-unsandboxed.json
+          set +e
+          out=$(run "${nolandlock[@]}" -v "$PWD/vpn-unsandboxed.json:/data/options.json:ro" "$IMG" 2>&1)
+          set -e
+          echo "$out" | tail -n 20
+          grep -q 'running without it because `allow_unsandboxed` is on' <<<"$out"
+          # Direct connection: starts, warns, and the status bar data says so.
+          docker run -d --name nosb --platform "$PLATFORM" --cap-add NET_ADMIN "${nolandlock[@]}" \
+            -v "$PWD/direct.json:/data/options.json:ro" "$IMG"
+          ok=0
+          for i in $(seq 1 90); do
+            if docker exec nosb /usr/local/bin/rbittorrent-supervisor healthcheck; then ok=1; break; fi
+            sleep 1
+          done
+          logs=$(docker logs nosb 2>&1)
+          tail -n 30 <<<"$logs"
+          test "$ok" -eq 1
+          grep -q 'the filesystem sandbox is not available' <<<"$logs"
+          docker exec nosb /bin/sh -c 'wget -qO- http://127.0.0.1:8099/__health' | tee health.json
+          grep -q '"fs_sandbox":false' health.json
+          docker rm -f nosb >/dev/null
           echo "::endgroup::"
           size=$(docker image inspect -f '{{.Size}}' "$IMG")
           {

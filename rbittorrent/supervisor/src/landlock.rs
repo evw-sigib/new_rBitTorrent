@@ -1,5 +1,5 @@
-//! Best-effort Landlock filesystem sandbox for the children (rtbit and the
-//! Ingress proxy).
+//! Landlock filesystem sandbox for the children (rtbit and the Ingress
+//! proxy).
 //!
 //! rtbit runs as uid 0 with `CAP_DAC_OVERRIDE` so it can manage files other
 //! apps wrote to shared storage, which also means file modes alone cannot
@@ -9,8 +9,9 @@
 //! in the forked child right before `execve` with one async-signal-safe
 //! syscall, after `no_new_privs` is set.
 //!
-//! Kernels without Landlock (or a seccomp profile that blocks it) run the
-//! children without it and the supervisor says so. ABI 1 is not used: it
+//! Kernels without Landlock (or a seccomp profile that blocks it) stop the
+//! app before any child starts, unless the user set `allow_unsandboxed`
+//! (`process::check_fs_sandbox`). ABI 1 is not used: it
 //! denies every cross-folder rename, which would break moving finished
 //! downloads.
 

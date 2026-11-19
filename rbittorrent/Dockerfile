@@ -36,12 +36,18 @@ RUN git clone --depth 1 --branch "${RTBIT_TAG}" "${RTBIT_REPO}" . \
 # swagger-vendored.patch is build-only: Swagger UI (rtbit's /swagger page)
 # comes from a checksum-pinned crate instead of a curl download from
 # github.com inside build.rs.
+# ipv4-fallback.patch: the DHT and the UDP tracker client open [::] sockets
+# even with RTBIT_IPV4_ONLY, so a host booted with ipv6.disable=1 made rtbit
+# exit at once; they now fall back to 0.0.0.0.
 # The order matters: the later patches are made on top of mimalloc.patch.
-COPY rtbit/mimalloc.patch rtbit/auth-banner.patch rtbit/swagger-vendored.patch /tmp/
+COPY rtbit/mimalloc.patch rtbit/auth-banner.patch rtbit/swagger-vendored.patch rtbit/ipv4-fallback.patch /tmp/
 RUN git apply --verbose /tmp/mimalloc.patch /tmp/auth-banner.patch /tmp/swagger-vendored.patch \
+      /tmp/ipv4-fallback.patch \
  && grep -q 'static GLOBAL: mimalloc::MiMalloc' crates/rtbit/src/main.rs \
  && grep -q 'store.username()' crates/rtbit/src/main.rs \
- && grep -q '"vendored"' crates/librtbit/Cargo.toml
+ && grep -q '"vendored"' crates/librtbit/Cargo.toml \
+ && grep -q 'UDP trackers: cannot open' crates/librtbit-tracker-comms/src/tracker_comms_udp.rs \
+ && grep -q 'DHT: cannot open' crates/librtbit-dht/src/dht.rs
 ENV OPENSSL_STATIC=1 \
     CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
     CARGO_PROFILE_RELEASE_OPT_LEVEL=3 \
