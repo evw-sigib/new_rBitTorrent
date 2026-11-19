@@ -71,12 +71,17 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const HANDSHAKE_STALE_AFTER: Duration = Duration::from_secs(180);
 const STALE_ESCALATE_AFTER: Duration = Duration::from_secs(600);
 const HEALTH_INTERVAL: Duration = Duration::from_secs(30);
-/// Grace period when restarting rtbit for a new forwarded port.
-const RTBIT_RESTART_GRACE: Duration = Duration::from_secs(5);
+/// Grace period when restarting rtbit for a new forwarded port: longer than
+/// rtbit's own shutdown budget, so its fast-resume flush is never cut short.
+const RTBIT_RESTART_GRACE: Duration = Duration::from_secs(15);
 /// Grace period on app shutdown (config.yaml `timeout: 30`).
 const RTBIT_SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 /// rtbit's own graceful-shutdown budget (flushes the session/fast-resume DB).
 const RTBIT_INTERNAL_SHUTDOWN: Duration = Duration::from_secs(12);
+const _: () = assert!(
+    RTBIT_RESTART_GRACE.as_secs() > RTBIT_INTERNAL_SHUTDOWN.as_secs()
+        && RTBIT_SHUTDOWN_GRACE.as_secs() > RTBIT_INTERNAL_SHUTDOWN.as_secs()
+);
 /// An rtbit that ran this long without crashing resets the respawn backoff.
 const RTBIT_STABLE_AFTER: Duration = Duration::from_secs(300);
 const REAP_INTERVAL: Duration = Duration::from_secs(30);
@@ -966,6 +971,11 @@ struct Session<'a, R: Runner> {
     listen_port: u16,
     /// Last NAT-PMP port applied to firewall + rtbit (None = fallback port).
     applied_lease: Option<u16>,
+    /// The TCP and UDP ports currently in the kill-switch's `@bt_port` set
+    /// (NAT-PMP mode).
+    applied_ports: Vec<u16>,
+    /// When the gateway drops the current mappings unless they are renewed.
+    lease_expires: Option<Instant>,
     tunnel_healthy: bool,
     /// Direct connection: no tunnel, no kill-switch.
     direct: bool,
@@ -1014,10 +1024,16 @@ impl<R: Runner> Session<'_, R> {
         } else {
             "rtbit is running behind the VPN"
         };
+        // Only a port peers can actually reach: none while NAT-PMP has no
+        // (or an expired) lease.
+        let port = match self.port_state() {
+            PortState::Pending(_) => None,
+            PortState::Forwarded(p) | PortState::Static(p) | PortState::Direct(p) => Some(p),
+        };
         let _ = self.health.send(Health {
             rtbit: self.rtbit.is_running(),
             tunnel: !self.direct && self.tunnel_healthy,
-            port: Some(self.listen_port),
+            port,
             detail: detail.into(),
             direct: self.direct,
             public_ip: self.public_ip,
@@ -1077,22 +1093,29 @@ impl<R: Runner> Session<'_, R> {
         self.respawn_at = Some(Instant::now() + d);
     }
 
-    /// Applies a freshly leased port: firewall first, then rtbit, and only if
-    /// the port actually changed.
+    /// Applies a freshly leased port: firewall first (TCP and UDP), then
+    /// rtbit, and only what actually changed.
     async fn apply_lease(&mut self, lease: &natpmp::Lease) {
+        let ports = lease.firewall_ports();
+        if ports != self.applied_ports {
+            if let Err(e) = firewall::set_bt_ports(self.runner, &ports).await {
+                error!("{e:#}; keeping the previous port for now");
+                return;
+            }
+            self.applied_ports = ports;
+        }
+        self.lease_expires =
+            Some(Instant::now() + Duration::from_secs(u64::from(lease.lifetime.max(1))));
         match natpmp::decide(self.applied_lease, lease.port) {
             PortDecision::Unchanged => {
                 debug!(
                     port = lease.port,
+                    udp = lease.udp_port,
                     lifetime = lease.lifetime,
                     "NAT-PMP lease renewed"
                 );
             }
             PortDecision::Changed { old, new } => {
-                if let Err(e) = firewall::set_bt_ports(self.runner, &lease.firewall_ports()).await {
-                    error!("{e:#}; keeping the previous port for now");
-                    return;
-                }
                 match old {
                     None => info!(
                         port = new,
@@ -1108,13 +1131,67 @@ impl<R: Runner> Session<'_, R> {
                     if self.rtbit.is_running() {
                         self.rtbit.stop(RTBIT_RESTART_GRACE).await;
                     }
-                    self.start_rtbit();
+                    self.restart_when_ready();
                 }
                 if self.announced {
                     self.log_banner();
                 }
+                self.publish();
             }
         }
+    }
+
+    /// Starts rtbit now if nothing stands in the way; otherwise the respawn
+    /// timer starts it (crash backoff, or a tunnel without a handshake).
+    fn restart_when_ready(&mut self) {
+        if self.respawn_at.is_some() {
+            return;
+        }
+        if self.tunnel_healthy {
+            self.start_rtbit();
+        } else {
+            info!(
+                "rtbit starts on port {} once the tunnel is healthy again",
+                self.listen_port
+            );
+            self.respawn_at = Some(Instant::now());
+            self.publish();
+        }
+    }
+
+    /// Renewals failed for longer than the lease lifetime: the gateway has
+    /// dropped the mapping, so the port is closed again and the status bar
+    /// stops showing it. The next successful lease opens it again.
+    async fn expire_lease_if_stale(&mut self) {
+        if self.applied_lease.is_none() || self.lease_expires.is_none_or(|t| Instant::now() < t) {
+            return;
+        }
+        warn!(
+            "the NAT-PMP lease on port {} expired without a renewal; inbound peers cannot reach \
+             rtbit until a new port is leased",
+            self.listen_port
+        );
+        match firewall::set_bt_ports(self.runner, &[]).await {
+            Ok(()) => self.applied_ports.clear(),
+            Err(e) => error!("{e:#}"),
+        }
+        self.applied_lease = None;
+        self.lease_expires = None;
+        self.publish();
+    }
+}
+
+/// Asks the gateway for the VPN exit address; keeps the old one on errors.
+async fn refresh_public_ip<R: Runner>(f: &PortForwarder, session: &mut Session<'_, R>) {
+    match f.client().external_address().await {
+        Ok(ext) if wireguard::is_public(ext.ip.into()) => {
+            if session.public_ip.is_some_and(|ip| ip != ext.ip) {
+                info!("VPN exit address is now {}", ext.ip);
+            }
+            session.public_ip = Some(ext.ip);
+        }
+        Ok(ext) => warn!("NAT-PMP reports a non-public address {}", ext.ip),
+        Err(e) => debug!("NAT-PMP external address: {e}"),
     }
 }
 
@@ -1134,6 +1211,8 @@ async fn run_session(
         respawn_at: None,
         listen_port: s.fallback_listen_port,
         applied_lease: None,
+        applied_ports: Vec::new(),
+        lease_expires: None,
         tunnel_healthy: true,
         direct: vpn.is_none(),
         nat_pmp: vpn.is_some_and(|v| v.nat_pmp.is_some()),
@@ -1270,11 +1349,9 @@ async fn run_session(
                             if lease.gateway_restarted {
                                 warn!("NAT-PMP gateway restarted (epoch went backwards); mappings were re-created");
                             }
-                            if session.public_ip.is_none()
-                                && let Ok(ext) = f.client().external_address().await
-                                && wireguard::is_public(ext.ip.into())
-                            {
-                                session.public_ip = Some(ext.ip);
+                            // A restarted gateway may come back with another exit address.
+                            if session.public_ip.is_none() || lease.gateway_restarted {
+                                refresh_public_ip(f, &mut session).await;
                             }
                             session.apply_lease(&lease).await;
                             next_pmp = Instant::now() + natpmp::RENEW_INTERVAL;
@@ -1282,6 +1359,7 @@ async fn run_session(
                         Err(e) => {
                             pmp.failure(&e, s.fallback_listen_port);
                             next_pmp = Instant::now() + pmp_retry.next_delay();
+                            session.expire_lease_if_stale().await;
                         }
                     }
                 }
@@ -1324,6 +1402,7 @@ async fn run_session(
                         stale_escalated = true;
                     }
                 }
+                session.expire_lease_if_stale().await;
                 session.check_disk(false);
                 session.publish();
             }

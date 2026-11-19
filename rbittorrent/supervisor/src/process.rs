@@ -532,7 +532,9 @@ impl RtbitSpec {
             // No LAN multicast: Local Service Discovery and the UPnP media server.
             ("RTBIT_LSD_DISABLE".into(), "true".into()),
             ("RTBIT_UPNP_SERVER_ENABLE".into(), "false".into()),
-            // Web UI network settings must not override the supervisor's port.
+            // Saved network settings must not override the supervisor's port.
+            // The pinned 0.2.0-beta.4 never saves any (its network endpoint
+            // refuses every change), so this only matters from beta.5 on.
             ("RTBIT_IGNORE_SAVED_NETWORK".into(), "true".into()),
             ("RTBIT_DOWNLOAD_FOLDER".into(), path(&self.download_dir)),
             ("RTBIT_COMPLETED_FOLDER".into(), path(&self.completed_dir)),

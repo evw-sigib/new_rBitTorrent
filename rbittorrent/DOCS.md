@@ -308,12 +308,12 @@ shows the results in a dialog:
 
 | Result | How |
 |---|---|
-| Download | [Cloudflare's speed test](https://speed.cloudflare.com), 4 parallel HTTPS streams for 6 seconds, over the active route: `wg0` with the VPN, `eth0` without. |
+| Download | [Cloudflare's speed test](https://speed.cloudflare.com), 4 parallel HTTPS streams for 6 seconds, counted from the first byte (slow connection setup does not count), over the active route: `wg0` with the VPN, `eth0` without. |
 | Latency | Median of 5 small requests, plus the Cloudflare location that answered. |
 | Public IP | The address Cloudflare saw: the VPN exit IP when the VPN is on. |
 | Disk write | One 4 MiB file in `download_dir`, written, flushed to disk with `fsync` and deleted immediately. |
 | SHA-1 hashing | 64 MiB hashed, the piece hash BitTorrent uses. It shows how fast rtbit can verify downloads (ARMv8 crypto or SHA-NI when the CPU has them). |
-| Regional peering | VPN off only: TCP connect time to Cloudflare (1.1.1.1), Google (8.8.8.8) and Quad9 (9.9.9.9), best of 3. |
+| Regional peering | VPN off only: TCP connect time to Cloudflare (1.1.1.1), Google (8.8.8.8) and Quad9 (9.9.9.9), best of 3, all three at once. |
 
 - Nothing of the test runs or uses memory until you press the button. The
   threads and buffers are gone again afterwards.
@@ -477,7 +477,9 @@ it keeps only the four file capabilities root needs on shared storage
 (`CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_FSETID`). A Landlock
 filesystem sandbox limits it to `/media`, `/share`, its download folders and
 its own state: `/data`, `/app_configs` and the WireGuard key in `/config` are
-out of reach. Its UPnP, LSD and IPv6 are off. If the tunnel goes down, traffic stops: nothing falls back
+out of reach. Its UPnP, LSD and IPv6 are off. (rtbit remembers a download
+folder chosen in its own Web UI, and that choice wins over `download_dir`;
+keep it under `/media` or `/share`, or the sandbox refuses the writes.) If the tunnel goes down, traffic stops: nothing falls back
 to your normal connection.
 
 To check it yourself:
