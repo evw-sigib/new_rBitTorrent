@@ -154,5 +154,6 @@ network:
     it to the listen port inside the container. Unused with the VPN on: the
     tunnel carries all torrent traffic.
   4240/udp: >-
-    BitTorrent peers (uTP) and DHT on a direct connection (VPN off) only.
-    The app forwards it to the listen port inside the container.
+    Reserved for uTP peers. rtbit accepts peers over TCP only (its uTP is
+    experimental and off), and its DHT and UDP trackers use their own
+    ports, so leave this empty.

@@ -262,6 +262,37 @@ impl SupervisorApi {
     }
 }
 
+/// What Home Assistant publishes for one of this app's container ports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPort {
+    /// Published on this host port.
+    Mapped(u16),
+    /// Not published (the field is empty in the app's Network settings).
+    Unmapped,
+}
+
+impl SupervisorApi {
+    /// The host port for `container_port` (`"4240/tcp"`), from the app's
+    /// own `/addons/self/info` (allowed for every app).
+    pub async fn own_host_port(&self, container_port: &str) -> Result<Option<HostPort>> {
+        let info = self.call(Method::GET, "/addons/self/info", None).await?;
+        Ok(host_port(&info, container_port))
+    }
+}
+
+/// `network` in an app's info: `{"4240/tcp": 51413, "8080/tcp": null}`.
+/// `None` when the port is not listed at all.
+pub fn host_port(info: &Value, container_port: &str) -> Option<HostPort> {
+    let v = info.get("network")?.get(container_port)?;
+    if v.is_null() {
+        return Some(HostPort::Unmapped);
+    }
+    v.as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|p| *p != 0)
+        .map(HostPort::Mapped)
+}
+
 pub fn is_qbittorrent(slug: &str) -> bool {
     slug.to_ascii_lowercase().contains("qbittorrent")
 }
@@ -339,6 +370,18 @@ pub fn default_addr() -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_ports_are_read_from_the_apps_network_map() {
+        let info = serde_json::json!({
+            "network": {"4240/tcp": 51413, "4240/udp": 51413, "8080/tcp": null, "x/tcp": 0}
+        });
+        assert_eq!(host_port(&info, "4240/tcp"), Some(HostPort::Mapped(51413)));
+        assert_eq!(host_port(&info, "8080/tcp"), Some(HostPort::Unmapped));
+        assert_eq!(host_port(&info, "x/tcp"), None);
+        assert_eq!(host_port(&info, "9999/tcp"), None);
+        assert_eq!(host_port(&serde_json::json!({}), "4240/tcp"), None);
+    }
 
     fn app(slug: &str, state: &str, ports: &[u16]) -> AppInfo {
         AppInfo {

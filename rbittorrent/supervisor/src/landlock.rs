@@ -198,7 +198,10 @@ impl Ruleset {
         }
         // SAFETY: we own the descriptor `open` returned.
         let parent = unsafe { OwnedFd::from_raw_fd(raw) };
-        let is_dir = std::fs::metadata(path).is_ok_and(|m| m.is_dir());
+        // The type of what was opened, not of whatever the path names now.
+        let is_dir = std::fs::File::from(parent.try_clone().map_err(|e| e.to_string())?)
+            .metadata()
+            .is_ok_and(|m| m.is_dir());
         let attr = PathBeneathAttr {
             allowed_access: if is_dir { access } else { access & FILE_RIGHTS },
             parent_fd: parent.as_raw_fd(),

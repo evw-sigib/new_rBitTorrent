@@ -651,6 +651,7 @@ def checks(sup, cli_priv, supervisor):
           f"no NET_ADMIN/NET_RAW/SYS_ADMIN (CapEff={eff:#x})")
     check(int(st["CapAmb"], 16) == 0 and int(st["CapInh"], 16) == 0, "no ambient/inheritable caps")
     check(st.get("NoNewPrivs") == "1", "no_new_privs set")
+    check(first.get("nice") == 10, f"rtbit runs at nice 10 ({first.get('nice')})")
     probes = first.get("probes", {})
     # Required: with the VPN on, the app never runs rtbit without Landlock.
     check("rtbit filesystem sandbox active" in log_text(), "rtbit filesystem sandbox active")

@@ -630,6 +630,10 @@ pub struct RtbitSpec {
     pub webui_port: u16,
     /// `Some("wg0")` in VPN mode; `None` on a direct connection.
     pub bind_device: Option<String>,
+    /// The port announced to trackers and the DHT when peers reach rtbit on
+    /// another port than it listens on (a direct connection whose host port
+    /// differs from `listen_port`). `None`: the listen port.
+    pub announce_port: Option<u16>,
     /// The tunnel address in VPN mode; `None` listens on every address.
     pub listen_ip: Option<std::net::Ipv4Addr>,
     pub log_level: LogLevel,
@@ -690,6 +694,11 @@ impl RtbitSpec {
         if let Some(done) = &self.completed_dir {
             env.push(("RTBIT_COMPLETED_FOLDER".into(), path(done)));
         }
+        if let Some(port) = self.announce_port {
+            env.push(("RTBIT_ANNOUNCE_PORT".into(), port.to_string()));
+        }
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        env.extend(low_end_tuning(cores));
         if let Some(dev) = &self.bind_device {
             env.push(("RTBIT_BIND_DEVICE".into(), dev.clone()));
         }
@@ -803,6 +812,13 @@ impl RtbitSpec {
             // Own process group: terminal ^C goes to us, we stop rtbit in order.
             .process_group(0)
             .kill_on_drop(true);
+        // SAFETY: two plain syscalls on the calling process, no allocation.
+        unsafe {
+            cmd.pre_exec(|| {
+                lower_priority();
+                Ok(())
+            });
+        }
         if self.sandbox {
             let drop = caps_to_drop(last_cap());
             let fs = fs_sandbox(
@@ -822,6 +838,53 @@ impl RtbitSpec {
             }
         }
         cmd
+    }
+}
+
+/// Limits for small boards (Raspberry Pi, Home Assistant Green), sized by
+/// the number of CPU cores:
+/// - the DHT routing table is saved every 15 minutes, not every minute
+///   (1,440 writes a day to the SD card otherwise);
+/// - at most `cores / 2` torrents (1 to 5) re-hash at once after a restart
+///   or an import, instead of 5 on any machine;
+/// - `2 * cores` disk threads (4 to 8, rtbit's default is 8);
+/// - 100 peers per torrent, qBittorrent's default (rtbit's is 200).
+pub fn low_end_tuning(cores: usize) -> Vec<(String, String)> {
+    vec![
+        ("RTBIT_DHT_DUMP_INTERVAL".into(), "15m".into()),
+        (
+            "RTBIT_CONCURRENT_INIT_LIMIT".into(),
+            (cores / 2).clamp(1, 5).to_string(),
+        ),
+        (
+            "RTBIT_RUNTIME_MAX_BLOCKING_THREADS".into(),
+            (cores * 2).clamp(4, 8).to_string(),
+        ),
+        ("RTBIT_PEER_LIMIT".into(), "100".into()),
+    ]
+}
+
+/// rtbit's CPU niceness: below Home Assistant Core and the supervisor.
+pub const RTBIT_NICE: libc::c_int = 10;
+const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+/// `IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 7)`: best effort, lowest level.
+const IOPRIO_BE_LOWEST: libc::c_int = (2 << 13) | 7;
+
+/// Runs in rtbit's child before `execve`: rtbit yields the CPU (nice 10)
+/// and the disk (lowest best-effort I/O priority) to Home Assistant on a
+/// small board, e.g. while it re-hashes torrents on an SD card. Lowering
+/// one's own priority needs no capability, and a failure changes nothing
+/// else, so errors are ignored (async-signal-safe: two syscalls).
+fn lower_priority() {
+    // SAFETY: plain syscalls on the calling process.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, RTBIT_NICE);
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            IOPRIO_WHO_PROCESS,
+            0,
+            IOPRIO_BE_LOWEST,
+        );
     }
 }
 
@@ -1045,6 +1108,7 @@ mod tests {
             completed_dir: Some("/media/rbittorrent/completed".into()),
             webui_port: 8080,
             bind_device: Some("wg0".into()),
+            announce_port: None,
             listen_ip: Some(Ipv4Addr::new(10, 2, 0, 2)),
             log_level: LogLevel::Info,
             dht: true,
@@ -1069,14 +1133,57 @@ mod tests {
             get(&env, "RTBIT_LOG_LEVEL_CONSOLE").as_deref(),
             Some("info")
         );
+        assert_eq!(get(&env, "RTBIT_ANNOUNCE_PORT"), None);
+        assert_eq!(get(&env, "RTBIT_DHT_DUMP_INTERVAL").as_deref(), Some("15m"));
+        assert_eq!(get(&env, "RTBIT_PEER_LIMIT").as_deref(), Some("100"));
         sp.dht = false;
         sp.log_level = LogLevel::Debug;
+        sp.announce_port = Some(51413);
         let env = sp.env(1);
+        assert_eq!(get(&env, "RTBIT_ANNOUNCE_PORT").as_deref(), Some("51413"));
         assert_eq!(get(&env, "RTBIT_DHT_DISABLE").as_deref(), Some("true"));
         assert_eq!(get(&env, "RUST_LOG"), None, "debug shows everything");
         assert_eq!(
             get(&env, "RTBIT_LOG_LEVEL_CONSOLE").as_deref(),
             Some("debug")
+        );
+    }
+
+    #[test]
+    fn small_boards_get_smaller_limits() {
+        let get = |cores: usize, k: &str| {
+            low_end_tuning(cores)
+                .into_iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v)
+                .unwrap()
+        };
+        // Pi 3/4/5 and HA Green have 4 cores; HA Yellow's CM4 too.
+        assert_eq!(get(4, "RTBIT_CONCURRENT_INIT_LIMIT"), "2");
+        assert_eq!(get(4, "RTBIT_RUNTIME_MAX_BLOCKING_THREADS"), "8");
+        assert_eq!(get(1, "RTBIT_CONCURRENT_INIT_LIMIT"), "1");
+        assert_eq!(get(1, "RTBIT_RUNTIME_MAX_BLOCKING_THREADS"), "4");
+        assert_eq!(get(2, "RTBIT_RUNTIME_MAX_BLOCKING_THREADS"), "4");
+        assert_eq!(get(16, "RTBIT_CONCURRENT_INIT_LIMIT"), "5");
+        assert_eq!(get(16, "RTBIT_RUNTIME_MAX_BLOCKING_THREADS"), "8");
+    }
+
+    #[test]
+    fn rtbit_runs_at_a_lower_priority() {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "cut -d' ' -f19 /proc/self/stat"]);
+        // SAFETY: as in `base_command`.
+        unsafe {
+            cmd.pre_exec(|| {
+                lower_priority();
+                Ok(())
+            });
+        }
+        let out = cmd.output().expect("sh runs");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            RTBIT_NICE.to_string()
         );
     }
 

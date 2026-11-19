@@ -246,6 +246,7 @@ def main():
         "argv": sys.argv[1:],
         "env": env,
         "status": status_fields(),
+        "nice": os.getpriority(os.PRIO_PROCESS, 0),
         "probes": sandbox_probes(),
         "time": time.time(),
     })

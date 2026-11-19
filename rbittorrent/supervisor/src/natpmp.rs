@@ -35,6 +35,13 @@ const MAPPING_RESPONSE_LEN: usize = 16;
 pub const LEASE_LIFETIME_SECS: u32 = 60;
 /// Renewal period: comfortably inside the 60 s lifetime.
 pub const RENEW_INTERVAL: Duration = Duration::from_secs(45);
+
+/// When to renew a lease the gateway granted for `lifetime` seconds: after
+/// three quarters of it, at most [`RENEW_INTERVAL`] and at least 5 s (a
+/// gateway granting less than asked must not see the lease lapse).
+pub fn renew_after(lifetime: u32) -> Duration {
+    Duration::from_secs(u64::from(lifetime) * 3 / 4).clamp(Duration::from_secs(5), RENEW_INTERVAL)
+}
 /// RFC 6886 §3.1 retransmission start; doubled on every retry.
 pub const INITIAL_RETRY_TIMEOUT: Duration = Duration::from_millis(250);
 /// Total transmissions per request (250 + 500 + 1000 + 2000 ms ≈ 3.75 s).
@@ -557,6 +564,15 @@ impl PortForwarder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renewal_follows_a_short_lifetime() {
+        assert_eq!(renew_after(60), Duration::from_secs(45));
+        assert_eq!(renew_after(7200), RENEW_INTERVAL);
+        assert_eq!(renew_after(20), Duration::from_secs(15));
+        assert_eq!(renew_after(2), Duration::from_secs(5));
+        assert_eq!(renew_after(0), Duration::from_secs(5));
+    }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

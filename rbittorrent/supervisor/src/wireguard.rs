@@ -305,19 +305,66 @@ pub async fn tear_down(runner: &impl Runner) {
     }
 }
 
-/// Seconds since the last handshake with the peer, `None` if there was none.
-pub async fn handshake_age(runner: &impl Runner, wg: &WireGuardConfig) -> Result<Option<Duration>> {
+/// The wall-clock time (Unix seconds) of the last handshake with the peer,
+/// `None` if there was none.
+pub async fn handshake_timestamp(
+    runner: &impl Runner,
+    wg: &WireGuardConfig,
+) -> Result<Option<u64>> {
     let out = runner
         .run("wg", &["show", WG_IFACE, "latest-handshakes"], None)
         .await?;
-    let Some(ts) = parse_latest_handshake(&out.stdout, wg.peer_public_key.as_base64()) else {
-        return Ok(None);
-    };
-    let now = SystemTime::now()
+    Ok(parse_latest_handshake(
+        &out.stdout,
+        wg.peer_public_key.as_base64(),
+    ))
+}
+
+/// The wall clock in Unix seconds.
+pub fn wall_secs() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    Ok(Some(Duration::from_secs(now.saturating_sub(ts))))
+        .unwrap_or(0)
+}
+
+/// Seconds since the last handshake with the peer, `None` if there was none.
+pub async fn handshake_age(runner: &impl Runner, wg: &WireGuardConfig) -> Result<Option<Duration>> {
+    Ok(handshake_timestamp(runner, wg)
+        .await?
+        .map(|ts| Duration::from_secs(wall_secs().saturating_sub(ts))))
+}
+
+/// Turns WireGuard's wall-clock handshake times into ages on the monotonic
+/// clock. A board without a real-time clock (a Raspberry Pi) steps its
+/// clock when NTP syncs, possibly long after boot: a step forward must not
+/// make a fresh tunnel look dead, and a step back must not hide a dead one.
+/// A new handshake time counts from when it was first seen (no earlier than
+/// the previous poll); an unchanged one keeps aging on the monotonic clock.
+#[derive(Debug, Default)]
+pub struct HandshakeClock {
+    /// The last handshake time seen, and when it happened (monotonic).
+    last: Option<(u64, std::time::Instant)>,
+    polled: Option<std::time::Instant>,
+}
+
+impl HandshakeClock {
+    pub fn age(&mut self, ts: u64, wall_now: u64, now: std::time::Instant) -> Duration {
+        let wall_age = Duration::from_secs(wall_now.saturating_sub(ts));
+        let at = match self.last {
+            Some((seen, at)) if seen == ts => at,
+            _ => {
+                let since_poll = self
+                    .polled
+                    .map_or(wall_age, |p| now.saturating_duration_since(p));
+                let at = now.checked_sub(wall_age.min(since_poll)).unwrap_or(now);
+                self.last = Some((ts, at));
+                at
+            }
+        };
+        self.polled = Some(now);
+        now.saturating_duration_since(at)
+    }
 }
 
 /// Polls for the first handshake, poking the tunnel with a UDP probe so the
@@ -393,6 +440,35 @@ pub fn is_public(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_ages_survive_clock_steps() {
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut c = HandshakeClock::default();
+        // Boot clock (1970-ish), handshake 5 s ago.
+        assert_eq!(c.age(1_000, 1_005, at(0)), Duration::from_secs(5));
+        // NTP steps the wall clock forward by years: same handshake, 30 s on.
+        assert_eq!(c.age(1_000, 1_700_000_000, at(30)), Duration::from_secs(35));
+        // A new handshake (stamped with the new clock) is fresh.
+        assert_eq!(
+            c.age(1_700_000_050, 1_700_000_060, at(60)),
+            Duration::from_secs(10)
+        );
+        // The clock steps back: the unchanged handshake keeps aging.
+        assert_eq!(
+            c.age(1_700_000_050, 1_000, at(260)),
+            Duration::from_secs(210)
+        );
+        // A new handshake stamped in the future (clock stepped back) counts
+        // from the poll that saw it.
+        assert_eq!(c.age(1_800_000_000, 1_100, at(290)), Duration::ZERO);
+        // A handshake reported long ago by the wall clock, but new since the
+        // last poll, is at most as old as that poll.
+        let mut c = HandshakeClock::default();
+        c.age(5_000, 5_000, at(0));
+        assert_eq!(c.age(5_010, 99_999, at(30)), Duration::from_secs(30));
+    }
     use crate::config::{Options, Paths, Settings};
     use crate::exec::fake::FakeRunner;
 

@@ -192,21 +192,28 @@ pub struct Health {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum ProxyRequest {
-    /// Run [`benchmark::run_hardware`] and answer with [`hardware_line`].
-    Hardware,
+    /// Run [`benchmark::run_hardware`] and answer with [`hardware_line`]
+    /// for the same `id`.
+    Hardware { id: u64 },
 }
 
 /// A line from the supervisor after the configuration.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(untagged)]
 pub enum SupervisorLine {
-    Hardware { hardware: HardwareResult },
+    Hardware {
+        hardware: HardwareResult,
+        /// The request this answers: a late answer to a request the proxy
+        /// already gave up on never answers a newer one.
+        #[serde(default)]
+        id: u64,
+    },
     Health(Health),
 }
 
-/// The supervisor's answer to [`ProxyRequest::Hardware`].
-pub fn hardware_line(r: &HardwareResult) -> String {
-    serde_json::json!({ "hardware": r }).to_string()
+/// The supervisor's answer to request `id` ([`ProxyRequest::Hardware`]).
+pub fn hardware_line(r: &HardwareResult, id: u64) -> String {
+    serde_json::json!({ "hardware": r, "id": id }).to_string()
 }
 
 /// Entry point of `rbittorrent-supervisor ingress-proxy`.
@@ -319,7 +326,9 @@ async fn run(cfg: ProxyConfig, mut status: impl tokio::io::AsyncBufRead + Unpin)
                 Ok(0) => return "the supervisor closed the status pipe",
                 Ok(_) => match serde_json::from_str::<SupervisorLine>(line.trim()) {
                     Ok(SupervisorLine::Health(h)) => proxy.set_health(h),
-                    Ok(SupervisorLine::Hardware { hardware }) => proxy.deliver_hardware(hardware),
+                    Ok(SupervisorLine::Hardware { hardware, id }) => {
+                        proxy.deliver_hardware(hardware, id);
+                    }
                     Err(e) => debug!("ignoring a malformed status line: {e}"),
                 },
                 Err(e) => {
@@ -427,7 +436,9 @@ pub struct Proxy {
     speed_target: SpeedTarget,
     peering: Vec<PeeringTarget>,
     supervisor_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>,
-    hardware_waiter: std::sync::Mutex<Option<oneshot::Sender<HardwareResult>>>,
+    /// The request waiting for the supervisor's disk test, and its id.
+    hardware_waiter: std::sync::Mutex<Option<(u64, oneshot::Sender<HardwareResult>)>>,
+    hardware_seq: AtomicU64,
     benchmark_busy: AtomicBool,
     benchmark_done: std::sync::Mutex<Option<Instant>>,
 }
@@ -502,6 +513,7 @@ impl Proxy {
                 .unwrap_or_else(benchmark::default_peering),
             supervisor_tx: std::sync::Mutex::new(None),
             hardware_waiter: std::sync::Mutex::new(None),
+            hardware_seq: AtomicU64::new(0),
             benchmark_busy: AtomicBool::new(false),
             benchmark_done: std::sync::Mutex::new(None),
         }))
@@ -512,10 +524,16 @@ impl Proxy {
         *lock(&self.supervisor_tx) = Some(tx);
     }
 
-    /// The supervisor's answer to [`ProxyRequest::Hardware`].
-    pub fn deliver_hardware(&self, r: HardwareResult) {
-        if let Some(waiter) = lock(&self.hardware_waiter).take() {
-            let _ = waiter.send(r);
+    /// The supervisor's answer to [`ProxyRequest::Hardware`] `id`. An answer
+    /// to an older request (one that timed out) is dropped.
+    pub fn deliver_hardware(&self, r: HardwareResult, id: u64) {
+        let mut waiter = lock(&self.hardware_waiter);
+        if waiter.as_ref().is_some_and(|(want, _)| *want == id) {
+            if let Some((_, tx)) = waiter.take() {
+                let _ = tx.send(r);
+            }
+        } else {
+            debug!("dropping a late disk test result (request {id})");
         }
     }
 
@@ -524,8 +542,10 @@ impl Proxy {
             .clone()
             .ok_or_else(|| "not connected to the supervisor".to_owned())?;
         let (waiter, answer) = oneshot::channel();
-        *lock(&self.hardware_waiter) = Some(waiter);
-        let line = serde_json::to_string(&ProxyRequest::Hardware).map_err(|e| e.to_string())?;
+        let id = self.hardware_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        *lock(&self.hardware_waiter) = Some((id, waiter));
+        let line =
+            serde_json::to_string(&ProxyRequest::Hardware { id }).map_err(|e| e.to_string())?;
         tx.send(line)
             .map_err(|_| "the link to the supervisor is closed".to_owned())?;
         match tokio::time::timeout(HARDWARE_TIMEOUT, answer).await {
@@ -2330,14 +2350,17 @@ mod tests {
             cpu_cores: 4,
             ..HardwareResult::default()
         };
-        let line = hardware_line(&hw);
+        let line = hardware_line(&hw, 7);
         assert_eq!(
             serde_json::from_str::<SupervisorLine>(&line).unwrap(),
-            SupervisorLine::Hardware { hardware: hw }
+            SupervisorLine::Hardware {
+                hardware: hw,
+                id: 7
+            }
         );
         assert_eq!(
-            serde_json::to_string(&ProxyRequest::Hardware).unwrap(),
-            r#"{"request":"hardware"}"#
+            serde_json::to_string(&ProxyRequest::Hardware { id: 7 }).unwrap(),
+            r#"{"request":"hardware","id":7}"#
         );
         let direct = Health {
             direct: true,

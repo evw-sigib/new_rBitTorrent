@@ -44,7 +44,10 @@ or C NAT-PMP library.
   [Moving from qBittorrent](#moving-from-qbittorrent).
 - **Home Assistant OS** (or Supervised) on aarch64 (Raspberry Pi 4/5, ...) or
   amd64. WireGuard is built into the HAOS kernel; the app never loads kernel
-  modules.
+  modules. It needs **Supervisor 2026.07 or newer**: the manifest uses the
+  `app_config` and `all_app_configs` folder types introduced then, and an
+  older Supervisor does not list the app. The Supervisor updates itself, so
+  this only matters on a system that has not updated since July 2026.
 - rBittorrent is IPv4-only: all IPv6 traffic is dropped, with the VPN on
   or off (see [Leak protection](#leak-protection)), and rtbit opens IPv4
   sockets only. A host booted with `ipv6.disable=1` works too.
@@ -180,11 +183,17 @@ On a direct connection, the log shows this at every start:
 ...
 ```
 
-- There is no kill-switch and no tunnel. rtbit listens on `listen_port`
-  (default 4240), TCP and UDP.
-- For inbound peers, map port 4240 in the app's *Network* section and
-  forward it on your router. Inside the container, port 4240 is redirected
-  to `listen_port`, so the mapping works whatever `listen_port` is.
+- There is no kill-switch and no tunnel. rtbit accepts peers on
+  `listen_port` (default 4240) over TCP. Its DHT and UDP trackers use their
+  own UDP ports (rtbit's uTP is experimental and stays off).
+- For inbound peers, map port 4240/tcp in the app's *Network* section (it
+  is empty by default) and forward the same host port on your router.
+  Inside the container, port 4240 is redirected to `listen_port`, so the
+  mapping works whatever `listen_port` is, and rtbit announces the host
+  port you mapped to trackers and the DHT (read from Home Assistant at
+  every start; the log says `rtbit announces port ...`). Without a mapping
+  the log says `container port 4240 is not published`: you can still
+  download, but peers cannot connect to you.
   UPnP stays off: the app never opens router ports by itself.
 - The Web UI and API port (8080) still only answers `local_allow_cidrs` and
   Home Assistant's own network; the Ingress port (8099) only answers Home
@@ -271,7 +280,10 @@ Open the file in a text editor, copy everything, and paste it into
 
 For every method:
 - An endpoint hostname is resolved once at startup, before DNS is locked to
-  the tunnel.
+  the tunnel, through Home Assistant's own resolver. That resolver (and
+  your router or ISP) then sees which VPN server you use. Proton's files
+  already contain an IP address; for a hostname, paste its IPv4 address
+  instead to avoid the lookup.
 - IPv6 addresses are ignored.
 - The MTU is 1420 unless the file sets one.
 - Keepalive is 25 s.
@@ -513,7 +525,13 @@ To check it yourself:
 
 - The supervisor and the Ingress proxy each use a single-threaded runtime
   and about 2 MB of RAM (1.9 MB idle, 2.6 MB after 400 proxied requests).
-  rtbit's own thread pool is not limited: it gets every CPU core.
+- rtbit yields to Home Assistant: it runs at `nice` 10 and the lowest
+  best-effort I/O priority, so hashing and peer I/O on a Pi never starve
+  Core or the supervisor's health checks. Its limits follow the board:
+  pieces of at most `cores / 2` torrents (1 to 5) are checked at once at
+  startup, its blocking pool has `2 × cores` threads (4 to 8), and each
+  torrent talks to at most 100 peers. The DHT routing table is saved every
+  15 minutes instead of every minute, to spare the SD card.
 - Both are built with `opt-level = 3`, fat LTO, one codegen unit, static musl
   and the **mimalloc** allocator. mimalloc's transparent-huge-page hint is
   off, because it quadrupled idle memory.
@@ -549,7 +567,7 @@ To check it yourself:
   HTML pages up to 4 MiB are buffered, for the Ingress rewrite.
 - WireGuard stays at MTU 1420.
 - The supervisor tries to raise `net.core.rmem_max` and `wmem_max` to 7 MiB
-  for fast UDP (uTP, DHT). Home Assistant mounts `/proc/sys` read-only, so
+  for fast UDP (DHT, UDP trackers). Home Assistant mounts `/proc/sys` read-only, so
   the log normally says `read-only here`. That is harmless.
 - At `log_level: info`, rtbit's per-peer and DHT logs are limited to
   warnings (`RUST_LOG=info,librtbit=warn`), sparing SD cards. Use `debug` to

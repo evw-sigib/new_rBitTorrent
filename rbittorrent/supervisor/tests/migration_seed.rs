@@ -463,6 +463,10 @@ fn supervisor_handler(allow_list: bool) -> Handler {
                 "network": { "8080/tcp": 8080, "6881/tcp": 6881 }
             })),
             ("POST", "/discovery") => ok(serde_json::json!({ "uuid": "u-1" })),
+            ("GET", "/addons/self/info") => ok(serde_json::json!({
+                "slug": "local_rbittorrent",
+                "network": { "4240/tcp": 51413, "4240/udp": 51413, "8080/tcp": null }
+            })),
             _ => (
                 StatusCode::NOT_FOUND,
                 vec![],
@@ -511,6 +515,15 @@ async fn running_qbittorrent_is_found_even_without_the_app_list_permission() {
         let body: serde_json::Value = serde_json::from_slice(&disc.body).unwrap();
         assert_eq!(body["service"], "qbittorrent");
         assert_eq!(body["config"]["port"], 8080);
+        // The app's own port mapping (direct mode announces the host port).
+        assert_eq!(
+            api.own_host_port("4240/tcp").await.unwrap(),
+            Some(ha_supervisor::HostPort::Mapped(51413))
+        );
+        assert_eq!(
+            api.own_host_port("8080/tcp").await.unwrap(),
+            Some(ha_supervisor::HostPort::Unmapped)
+        );
     }
 
     // A refusing Supervisor is not an error for the app.

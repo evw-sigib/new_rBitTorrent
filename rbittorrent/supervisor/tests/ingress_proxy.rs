@@ -919,12 +919,14 @@ async fn speed_test_measures_network_disk_and_hashing_on_demand() {
     tokio::spawn(async move {
         while let Some(line) = rx.recv().await {
             let req: ProxyRequest = serde_json::from_str(&line).unwrap();
-            assert_eq!(req, ProxyRequest::Hardware);
+            let ProxyRequest::Hardware { id } = req;
             let d = work_dir.clone();
             let r = tokio::task::spawn_blocking(move || benchmark::run_hardware(&d, 2))
                 .await
                 .unwrap();
-            link.deliver_hardware(r);
+            // A stale answer (an older request) is ignored, the right one lands.
+            link.deliver_hardware(r.clone(), id.wrapping_sub(1));
+            link.deliver_hardware(r, id);
         }
     });
 
@@ -1154,9 +1156,10 @@ async fn a_speed_test_keeps_its_lock_when_the_client_leaves() {
     state.connect_supervisor(tx);
     let link = state.clone();
     tokio::spawn(async move {
-        while rx.recv().await.is_some() {
+        while let Some(line) = rx.recv().await {
+            let ProxyRequest::Hardware { id } = serde_json::from_str(&line).unwrap();
             tokio::time::sleep(Duration::from_millis(1500)).await;
-            link.deliver_hardware(benchmark::HardwareResult::default());
+            link.deliver_hardware(benchmark::HardwareResult::default(), id);
         }
     });
 

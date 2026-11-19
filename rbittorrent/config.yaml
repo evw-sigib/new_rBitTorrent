@@ -60,7 +60,7 @@ ports:
 ports_description:
   8080/tcp: Web UI + qBittorrent API (qBittorrent's port; LAN only, password-protected)
   4240/tcp: BitTorrent peers, VPN off only (forwarded to listen_port)
-  4240/udp: BitTorrent peers and DHT, VPN off only (forwarded to listen_port)
+  4240/udp: Reserved for uTP (rtbit accepts peers over TCP only); leave empty
 webui: http://[HOST]:[PORT:8080]/web/
 # 200 only while rtbit runs and (VPN mode) the WireGuard handshake is
 # fresh, so the Watchdog toggle restarts the app (and re-resolves the VPN

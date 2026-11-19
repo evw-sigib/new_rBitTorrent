@@ -436,12 +436,15 @@ async fn supervise(
     prepare_dirs(s)?;
     // Before the first rtbit command (even `auth`): no child runs without
     // a sandbox (AppArmor or Landlock) unless that was allowed here.
-    let rtbit_spec = rtbit_spec(s);
+    let mut rtbit_spec = rtbit_spec(s);
     let sandboxed = process::check_fs_sandbox(&rtbit_spec.fs_policy(), s.allow_unsandboxed)?;
     FS_SANDBOX_ACTIVE.store(sandboxed, Ordering::Relaxed);
     host::raise_udp_buffer_limits();
     // Supervisor API: before the kill-switch (it uses the normal network).
-    supervisor_checks(s).await;
+    let bt_host_port = supervisor_checks(s).await;
+    if s.vpn.is_none() {
+        rtbit_spec.announce_port = direct_announce_port(bt_host_port, s.fallback_listen_port);
+    }
 
     // The Web UI account goes into rtbit's credential store before rtbit
     // ever runs: port 8080 is never open and never waits for first-run setup.
@@ -723,13 +726,14 @@ async fn run_tunnel(
 }
 
 /// Port-conflict guard and discovery through the Supervisor API. Best
-/// effort: nothing here can stop the app.
-async fn supervisor_checks(s: &Settings) {
+/// effort: nothing here can stop the app. Returns the host port Home
+/// Assistant publishes the BitTorrent port on, when it could be read.
+async fn supervisor_checks(s: &Settings) -> Option<ha_supervisor::HostPort> {
     let Some(api) = ha_supervisor::SupervisorApi::from_env().await else {
         debug!(
             "no SUPERVISOR_TOKEN (not running under Home Assistant): skipping Supervisor checks"
         );
-        return;
+        return None;
     };
     let slugs: Vec<String> = migration::candidate_roots(&migration::Roots::new(&s.config_root))
         .into_iter()
@@ -755,6 +759,39 @@ async fn supervisor_checks(s: &Settings) {
             s.webui_port
         ),
         Err(e) => debug!("Home Assistant discovery not available: {e:#}"),
+    }
+    let bt = format!("{}/tcp", config::DEFAULT_LISTEN_PORT);
+    match api.own_host_port(&bt).await {
+        Ok(p) => p,
+        Err(e) => {
+            debug!("cannot read the app's port mapping: {e:#}");
+            None
+        }
+    }
+}
+
+/// On a direct connection peers reach rtbit through the host port Home
+/// Assistant maps to container port 4240 (redirected to `listen_port`
+/// inside), so that is the port to announce when it differs.
+fn direct_announce_port(mapped: Option<ha_supervisor::HostPort>, listen_port: u16) -> Option<u16> {
+    use ha_supervisor::HostPort;
+    let published = config::DEFAULT_LISTEN_PORT;
+    match mapped {
+        Some(HostPort::Mapped(p)) if p != listen_port => {
+            info!(
+                "direct connection: Home Assistant publishes container port {published} on host \
+                 port {p}; rtbit announces port {p} to trackers and the DHT"
+            );
+            Some(p)
+        }
+        Some(HostPort::Mapped(_)) | None => None,
+        Some(HostPort::Unmapped) => {
+            info!(
+                "direct connection: container port {published} is not published (the app's \
+                 Network settings): peers cannot connect to you, only you to them"
+            );
+            None
+        }
     }
 }
 
@@ -782,6 +819,8 @@ fn rtbit_spec(s: &Settings) -> RtbitSpec {
         webui_port: s.webui_port,
         // VPN mode: bound to wg0 and its address; direct mode: any interface.
         bind_device: s.vpn.as_ref().map(|_| WG_IFACE.to_owned()),
+        // Set from Home Assistant's port mapping on a direct connection.
+        announce_port: None,
         listen_ip: s.vpn.as_ref().map(|v| v.wireguard.address.addr()),
         log_level: s.log_level,
         dht: s.enable_dht,
@@ -849,7 +888,8 @@ async fn supervise_ingress(
         let (request_tx, mut requests) = tokio::sync::mpsc::channel::<String>(4);
         let reader = tokio::spawn(read_proxy_requests(stdout, request_tx));
         let mut requests_open = true;
-        let mut hardware_job: Option<tokio::task::JoinHandle<benchmark::HardwareResult>> = None;
+        let mut hardware_job: Option<(u64, tokio::task::JoinHandle<benchmark::HardwareResult>)> =
+            None;
         let current = health.borrow_and_update().clone();
         let mut stuck = !send_line(&mut stdin, &health_line(&current)).await;
         let status = loop {
@@ -870,22 +910,34 @@ async fn supervise_ingress(
                 }
                 line = requests.recv(), if requests_open => match line {
                     Some(line) => match serde_json::from_str::<ingress::ProxyRequest>(&line) {
-                        Ok(ingress::ProxyRequest::Hardware) if hardware_job.is_none() => {
+                        Ok(ingress::ProxyRequest::Hardware { id }) if hardware_job.is_none() => {
                             let dir = download_dir.clone();
-                            hardware_job = Some(tokio::task::spawn_blocking(move || {
+                            hardware_job = Some((id, tokio::task::spawn_blocking(move || {
                                 benchmark::run_hardware(&dir, host::cpu_cores())
-                            }));
+                            })));
                         }
-                        Ok(ingress::ProxyRequest::Hardware) => {
-                            debug!("a disk speed test is already running");
+                        Ok(ingress::ProxyRequest::Hardware { id }) => {
+                            // An earlier test (one the proxy gave up on, e.g.
+                            // on a stalled network disk) still runs: answer
+                            // now instead of letting this one wait for it.
+                            let busy = benchmark::HardwareResult {
+                                disk_error: Some(
+                                    "the disk test from an earlier run has not finished (a slow \
+                                     or stalled disk?); try again later"
+                                        .to_owned(),
+                                ),
+                                cpu_cores: host::cpu_cores(),
+                                ..benchmark::HardwareResult::default()
+                            };
+                            stuck = !send_line(&mut stdin, &ingress::hardware_line(&busy, id)).await;
                         }
                         Err(e) => debug!("ignoring an unknown request from the Ingress proxy: {e}"),
                     },
                     None => requests_open = false,
                 },
-                result = async {
+                (id, result) = async {
                     match hardware_job.as_mut() {
-                        Some(job) => job.await,
+                        Some((id, job)) => (*id, job.await),
                         None => std::future::pending().await,
                     }
                 }, if hardware_job.is_some() => {
@@ -895,7 +947,7 @@ async fn supervise_ingress(
                             if let Some(e) = &r.disk_error {
                                 warn!("speed test: {e}");
                             }
-                            stuck = !send_line(&mut stdin, &ingress::hardware_line(&r)).await;
+                            stuck = !send_line(&mut stdin, &ingress::hardware_line(&r, id)).await;
                         }
                         Err(e) => warn!("speed test: the disk test failed: {e}"),
                     }
@@ -1337,6 +1389,7 @@ async fn run_session(
             Ok(lease) => {
                 pmp.success();
                 session.apply_lease(&lease).await;
+                next_pmp = Instant::now() + natpmp::renew_after(lease.lifetime);
             }
             Err(e) => {
                 pmp.failure(&e, s.fallback_listen_port);
@@ -1364,6 +1417,7 @@ async fn run_session(
     health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     health.tick().await; // the first tick fires immediately
     let mut stale_since: Option<Instant> = None;
+    let mut handshakes = wireguard::HandshakeClock::default();
     let mut stale_escalated = false;
 
     loop {
@@ -1421,7 +1475,7 @@ async fn run_session(
                                 refresh_public_ip(f, &mut session).await;
                             }
                             session.apply_lease(&lease).await;
-                            next_pmp = Instant::now() + natpmp::RENEW_INTERVAL;
+                            next_pmp = Instant::now() + natpmp::renew_after(lease.lifetime);
                         }
                         Err(e) => {
                             pmp.failure(&e, s.fallback_listen_port);
@@ -1441,7 +1495,13 @@ async fn run_session(
                     session.publish();
                     continue;
                 };
-                let age = wireguard::handshake_age(runner, &vpn.wireguard).await;
+                let age = wireguard::handshake_timestamp(runner, &vpn.wireguard)
+                    .await
+                    .map(|ts| {
+                        ts.map(|ts| {
+                            handshakes.age(ts, wireguard::wall_secs(), std::time::Instant::now())
+                        })
+                    });
                 let fresh = matches!(age, Ok(Some(a)) if a <= HANDSHAKE_STALE_AFTER);
                 if fresh {
                     if !session.tunnel_healthy {

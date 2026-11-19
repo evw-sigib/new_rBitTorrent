@@ -29,6 +29,9 @@ NAT-PMP port forwarding.
   rtbit is compiled from source with the mimalloc allocator. Asks for
   `NET_ADMIN` only.
 
+Needs Home Assistant OS or Supervised on aarch64 or amd64, with
+Supervisor 2026.07 or newer.
+
 See the **Documentation** tab for setup, migration and leak protection.
 
 [aarch64-shield]: https://img.shields.io/badge/aarch64-yes-green.svg
