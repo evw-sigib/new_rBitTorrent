@@ -112,10 +112,11 @@ jobs:
 
   image:
     name: Image (${{ matrix.arch }})
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     needs: [supervisor, app-config, e2e]
-    # The aarch64 supervisor compiles natively under QEMU.
-    timeout-minutes: 60
+    # Both binaries (rtbit is compiled from source with mimalloc) build
+    # natively on each architecture's own runner: no QEMU emulation.
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
@@ -125,8 +126,10 @@ jobs:
         include:
           - arch: amd64
             platform: linux/amd64
+            runner: ubuntu-24.04
           - arch: aarch64
             platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
       - name: Read image name and version from config.yaml
@@ -138,7 +141,6 @@ jobs:
           print("version=" + str(c["version"]))
           print("image=" + c["image"].replace("{arch}", "${{ matrix.arch }}"))
           EOF
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: Build (load locally for tests)
         uses: docker/build-push-action@v6
@@ -171,6 +173,8 @@ jobs:
           run --entrypoint /usr/local/bin/rtbit "$IMG" --version
           run --entrypoint /usr/local/bin/rtbit "$IMG" --help | sed -n 1,20p
           run --entrypoint /usr/local/bin/rtbit "$IMG" server start --help | grep -E 'disable-upnp-port-forward|disable-lsd|bind-device|ipv4-only'
+          # rtbit is our own build: mimalloc is linked in as the allocator.
+          run --entrypoint /bin/sh "$IMG" -c 'grep -c mimalloc /usr/local/bin/rtbit' | grep -qv '^0$'
           echo "::endgroup::"
           echo "::group::tools"
           run --entrypoint ip "$IMG" -V | grep iproute2
@@ -197,15 +201,37 @@ jobs:
             file "$f" | grep -Eq 'statically linked|static-pie linked'
           done
           echo "::endgroup::"
-          echo "::group::fail-fast on bad configuration"
-          echo '{}' > options.json
+          echo "::group::fail-closed: VPN on without a WireGuard setup stops the app"
+          echo '{"vpn_enabled": true}' > options.json
           set +e
           out=$(run -v "$PWD/options.json:/data/options.json:ro" "$IMG" 2>&1); code=$?
           set -e
           echo "$out"
           test "$code" -eq 1
-          grep -qi 'wireguard' <<<"$out"
+          grep -q 'VPN mode is on' <<<"$out"
+          grep -qi 'wg0.conf' <<<"$out"
           if grep -qi 'panicked' <<<"$out"; then exit 1; fi
+          echo "::endgroup::"
+          echo "::group::direct mode: fresh install without a VPN"
+          echo '{}' > direct.json
+          docker run -d --name direct --platform "$PLATFORM" \
+            -v "$PWD/direct.json:/data/options.json:ro" "$IMG"
+          ok=0
+          for i in $(seq 1 90); do
+            if docker exec direct /usr/local/bin/rbittorrent-supervisor healthcheck; then ok=1; break; fi
+            sleep 1
+          done
+          docker logs direct 2>&1 | tail -n 60
+          test "$ok" -eq 1
+          docker logs direct 2>&1 | grep -q 'VPN OFF'
+          # The status bar data: vpn=false, the listen port, no tunnel.
+          docker exec direct /bin/sh -c 'wget -qO- http://127.0.0.1:8099/__health' | tee health.json
+          grep -q '"vpn":false' health.json
+          grep -q '"port":4240' health.json
+          docker stop -t 30 direct
+          test "$(docker inspect -f '{{.State.ExitCode}}' direct)" -eq 0
+          docker logs direct 2>&1 | grep -q 'shutdown complete'
+          docker rm direct >/dev/null
           echo "::endgroup::"
           size=$(docker image inspect -f '{{.Size}}' "$IMG")
           {

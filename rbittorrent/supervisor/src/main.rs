@@ -4,11 +4,20 @@
 //!
 //! 1. read + validate `/data/options.json` (and the pasted WireGuard `.conf`)
 //! 2. resolve the WireGuard endpoint once, while normal DNS still works
-//! 3. load the nftables kill-switch atomically (drop-by-default, no IPv6)
+//! 3. load the nftables kill-switch atomically (drop-by-default, no IPv6;
+//!    a static `listen_port` is opened on `wg0` right away when NAT-PMP is
+//!    off)
 //! 4. point `/etc/resolv.conf` at the in-tunnel DNS
 //! 5. create `wg0`, add split-return routes, wait for the first handshake
 //! 6. lease a port with NAT-PMP inside the tunnel, open it in the firewall
 //! 7. only then start rtbit (sandboxed, bound to `wg0`)
+//!
+//! VPN mode is on as soon as `vpn_enabled` is set or any WireGuard input
+//! exists (`/config/wg0.conf`, `wireguard_conf`, a `wg_*` field); an
+//! incomplete configuration is then an error, never a fallback. Without any
+//! of these (a fresh install) the app runs on a direct connection: steps 2-6
+//! are skipped, a loud warning says the traffic is unprotected, and rtbit
+//! listens on `listen_port`.
 //!
 //! The Web UI account is written into rtbit's credential store before rtbit
 //! ever starts, and the unprivileged Ingress proxy (port 8099: sidebar +
@@ -28,12 +37,12 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{debug, error, info, warn};
 
-use rbittorrent_supervisor::config::{Options, Paths, Secret, Settings};
+use rbittorrent_supervisor::config::{Options, Paths, Secret, Settings, VpnSettings};
 use rbittorrent_supervisor::exec::{Runner, SystemRunner};
 use rbittorrent_supervisor::firewall::RulesetSpec;
 use rbittorrent_supervisor::host::{self, PortState};
@@ -43,7 +52,7 @@ use rbittorrent_supervisor::natpmp::{Client, NatPmpError, PortDecision, PortForw
 use rbittorrent_supervisor::process::{Backoff, Rtbit, RtbitSpec};
 use rbittorrent_supervisor::wireguard::{TunnelPlan, WG_FWMARK, WG_IFACE};
 use rbittorrent_supervisor::{
-    config, firewall, ha_supervisor, init_logging, natpmp, process, wireguard,
+    benchmark, config, firewall, ha_supervisor, init_logging, natpmp, process, wireguard,
 };
 
 #[cfg(target_env = "musl")]
@@ -113,12 +122,13 @@ fn main() -> ExitCode {
 fn print_help() {
     println!(
         "rbittorrent-supervisor {VERSION}
-PID-1 supervisor for rustTorrent (rtbit) behind a fail-closed WireGuard kill-switch.
+rBittorrent: PID-1 supervisor running rustTorrent (rtbit) behind a fail-closed WireGuard kill-switch
+(or on a direct connection while no VPN is configured).
 
 USAGE:
     rbittorrent-supervisor              run as the app's init process
     rbittorrent-supervisor healthcheck  exit 0 when http://127.0.0.1:8099/__health reports healthy
-                                (rtbit running, fresh WireGuard handshake, Web UI answering)
+                                (rtbit running, fresh WireGuard handshake in VPN mode, Web UI answering)
     rbittorrent-supervisor ingress-proxy
                                 internal: the Home Assistant Ingress proxy, started by the
                                 supervisor itself (configuration arrives on stdin)
@@ -200,7 +210,25 @@ async fn run() -> ExitCode {
     for note in &settings.notes {
         warn!("config: {note}");
     }
-    info!("WireGuard configuration from {}", settings.wireguard_source);
+    match &settings.vpn {
+        Some(v) => info!(
+            "VPN mode ({}): WireGuard configuration from {}, {}",
+            v.reason,
+            v.source,
+            if v.nat_pmp.is_some() {
+                "NAT-PMP port forwarding".to_owned()
+            } else {
+                format!(
+                    "static port {} (NAT-PMP off)",
+                    settings.fallback_listen_port
+                )
+            }
+        ),
+        None => warn!(
+            "{}",
+            host::direct_mode_banner(settings.fallback_listen_port)
+        ),
+    }
 
     let shutdown = match spawn_signal_handlers() {
         Ok(rx) => rx,
@@ -293,7 +321,11 @@ async fn unless_shutdown<T>(
     }
 }
 
-async fn preflight(runner: &impl Runner) -> Result<()> {
+async fn preflight(runner: &impl Runner, vpn: bool) -> Result<()> {
+    if !vpn {
+        // Direct mode needs no tunnel tools.
+        return ensure_ipv6_sockets();
+    }
     let ip = runner
         .run("ip", &["-V"], None)
         .await
@@ -393,7 +425,7 @@ async fn supervise(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let runner = SystemRunner;
-    preflight(&runner).await?;
+    preflight(&runner, s.vpn.is_some()).await?;
     prepare_dirs(s)?;
     host::raise_udp_buffer_limits();
     // Supervisor API: before the kill-switch (it uses the normal network).
@@ -435,9 +467,15 @@ async fn supervise(
         }),
     };
 
+    let ingress_line = ingress_config_line(s, &password)?;
+    drop(password);
+    let Some(vpn) = s.vpn.as_ref() else {
+        return supervise_direct(s, &runner, rtbit_spec, migration, ingress_line, shutdown).await;
+    };
+
     // A. Endpoint resolution happens before DNS is locked down.
     let Some(endpoint) =
-        unless_shutdown(&mut shutdown, resolve_with_retry(&s.wireguard.endpoint)).await
+        unless_shutdown(&mut shutdown, resolve_with_retry(&vpn.wireguard.endpoint)).await
     else {
         return Ok(());
     };
@@ -446,6 +484,7 @@ async fn supervise(
     info!(gateway = %lan.gateway, dev = %lan.dev, "uplink detected");
 
     // B. Fail-closed kill-switch before anything else talks to the network.
+    // Static port mode opens `listen_port` in the very first ruleset.
     let ruleset = RulesetSpec {
         lan_iface: lan.dev.clone(),
         wg_iface: WG_IFACE.to_owned(),
@@ -455,7 +494,8 @@ async fn supervise(
         ingress_sources: config::HASSIO_NETWORK,
         endpoint,
         wg_fwmark: WG_FWMARK,
-        bt_ports: Vec::new(),
+        bt_ports: s.static_bt_ports(),
+        dns_servers: vpn.wireguard.dns.clone(),
     };
     firewall::install(&runner, &ruleset).await?;
     let cidrs: Vec<String> = s
@@ -471,9 +511,14 @@ async fn supervise(
         config::HASSIO_NETWORK,
         s.ingress_port
     );
+    if let [port] = ruleset.bt_ports.as_slice() {
+        info!(
+            "static port mode: TCP+UDP {port} opened on {WG_IFACE} (forward this port at your VPN provider)"
+        );
+    }
     let resolv = env_path("RBITTORRENT_RESOLV_CONF", DEFAULT_RESOLV_CONF);
-    wireguard::lock_resolv_conf(&resolv, &s.wireguard.dns)?;
-    info!("DNS locked to {:?} via the tunnel", s.wireguard.dns);
+    wireguard::lock_resolv_conf(&resolv, &vpn.wireguard.dns)?;
+    info!("DNS locked to {:?} via the tunnel", vpn.wireguard.dns);
 
     // The Ingress proxy (sidebar + watchdog) runs from here on, so the panel
     // shows a "starting" page instead of an error while the tunnel comes up.
@@ -483,63 +528,113 @@ async fn supervise(
     });
     let (stop_ingress, stop_rx) = watch::channel(false);
     let ingress_task = tokio::spawn(supervise_ingress(
-        ingress_config_line(s, &password)?,
+        ingress_line,
+        s.download_dir.clone(),
         health_rx,
         stop_rx,
     ));
-    drop(password);
 
     let result = run_tunnel(
         s,
+        vpn,
         &runner,
-        lan,
-        connected,
-        endpoint,
+        TunnelInputs {
+            lan,
+            connected,
+            endpoint,
+        },
         rtbit_spec,
         migration,
         &health,
         &mut shutdown,
     )
     .await;
-    let _ = stop_ingress.send(true);
-    if tokio::time::timeout(INGRESS_STOP_GRACE * 2, ingress_task)
+    stop_ingress_task(stop_ingress, ingress_task).await;
+    result
+}
+
+/// Direct connection (no VPN configured): no kill-switch, no tunnel, no
+/// NAT-PMP; rtbit listens on `listen_port` on the normal network.
+async fn supervise_direct(
+    s: &Settings,
+    runner: &SystemRunner,
+    rtbit_spec: RtbitSpec,
+    migration: MigrationRun,
+    ingress_line: String,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let (health, health_rx) = watch::channel(Health {
+        direct: true,
+        port: Some(s.fallback_listen_port),
+        detail: "starting rtbit on a direct connection (VPN off)".into(),
+        ..Health::default()
+    });
+    let (stop_ingress, stop_rx) = watch::channel(false);
+    let ingress_task = tokio::spawn(supervise_ingress(
+        ingress_line,
+        s.download_dir.clone(),
+        health_rx,
+        stop_rx,
+    ));
+    let result = run_session(
+        s,
+        None,
+        runner,
+        rtbit_spec,
+        migration,
+        &health,
+        &mut shutdown,
+    )
+    .await;
+    stop_ingress_task(stop_ingress, ingress_task).await;
+    result
+}
+
+async fn stop_ingress_task(stop: watch::Sender<bool>, task: tokio::task::JoinHandle<()>) {
+    let _ = stop.send(true);
+    if tokio::time::timeout(INGRESS_STOP_GRACE * 2, task)
         .await
         .is_err()
     {
         warn!("the Ingress proxy did not stop in time");
     }
-    result
+}
+
+/// What the tunnel needs from the uplink detection.
+struct TunnelInputs {
+    lan: wireguard::LanRoute,
+    connected: Vec<rbittorrent_supervisor::cidr::Ipv4Cidr>,
+    endpoint: SocketAddrV4,
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_tunnel(
     s: &Settings,
+    vpn: &VpnSettings,
     runner: &SystemRunner,
-    lan: wireguard::LanRoute,
-    connected: Vec<rbittorrent_supervisor::cidr::Ipv4Cidr>,
-    endpoint: SocketAddrV4,
+    uplink: TunnelInputs,
     rtbit_spec: RtbitSpec,
     migration: MigrationRun,
     health: &watch::Sender<Health>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     // C. Tunnel, retried until it works (rtbit never starts without it).
-    let nat_pmp_gateway = s.nat_pmp.as_ref().map(|n| n.gateway);
+    let nat_pmp_gateway = vpn.nat_pmp.as_ref().map(|n| n.gateway);
     let plan = TunnelPlan {
-        lan,
-        endpoint,
-        lan_routes: wireguard::plan_lan_routes(&s.local_allow_cidrs, &connected),
-        tunnel_hosts: wireguard::tunnel_hosts(&s.wireguard.dns, nat_pmp_gateway),
+        lan: uplink.lan,
+        endpoint: uplink.endpoint,
+        lan_routes: wireguard::plan_lan_routes(&s.local_allow_cidrs, &uplink.connected),
+        tunnel_hosts: wireguard::tunnel_hosts(&vpn.wireguard.dns, nat_pmp_gateway),
     };
     let probe_ip = nat_pmp_gateway
-        .or_else(|| s.wireguard.dns.first().copied())
+        .or_else(|| vpn.wireguard.dns.first().copied())
         .unwrap_or(config::PROTON_GATEWAY);
     let probe = SocketAddrV4::new(probe_ip, natpmp::NATPMP_PORT);
     let mut backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(300));
     loop {
         let attempt = async {
-            wireguard::bring_up(runner, &s.wireguard, &plan).await?;
-            wireguard::wait_for_handshake(runner, &s.wireguard, probe, HANDSHAKE_TIMEOUT).await
+            wireguard::bring_up(runner, &vpn.wireguard, &plan).await?;
+            wireguard::wait_for_handshake(runner, &vpn.wireguard, probe, HANDSHAKE_TIMEOUT).await
         };
         match unless_shutdown(shutdown, attempt).await {
             None => {
@@ -570,7 +665,16 @@ async fn run_tunnel(
     }
 
     // D. Port forwarding + rtbit.
-    let result = run_session(s, runner, rtbit_spec, migration, health, shutdown).await;
+    let result = run_session(
+        s,
+        Some(vpn),
+        runner,
+        rtbit_spec,
+        migration,
+        health,
+        shutdown,
+    )
+    .await;
     wireguard::tear_down(runner).await;
     result
 }
@@ -623,8 +727,9 @@ fn rtbit_spec(s: &Settings) -> RtbitSpec {
         download_dir: s.download_dir.clone(),
         completed_dir: s.completed_dir.clone(),
         webui_port: s.webui_port,
-        bind_device: WG_IFACE.to_owned(),
-        listen_ip: s.wireguard.address.addr(),
+        // VPN mode: bound to wg0 and its address; direct mode: any interface.
+        bind_device: s.vpn.as_ref().map(|_| WG_IFACE.to_owned()),
+        listen_ip: s.vpn.as_ref().map(|v| v.wireguard.address.addr()),
         log_level: s.log_level,
         dht: s.enable_dht,
         shutdown_timeout: RTBIT_INTERNAL_SHUTDOWN,
@@ -647,13 +752,17 @@ fn ingress_config_line(s: &Settings, password: &Secret) -> Result<String> {
         username: s.webui_username.clone(),
         password: password.expose().to_owned(),
         log_level: s.log_level,
+        speed_target: None,
+        peering: None,
     };
     serde_json::to_string(&cfg).context("cannot encode the Ingress configuration")
 }
 
-/// Keeps the Ingress proxy child running and feeds it health heartbeats.
+/// Keeps the Ingress proxy child running, feeds it health heartbeats and
+/// answers its requests (the disk half of the speed test).
 async fn supervise_ingress(
     config_line: String,
+    download_dir: PathBuf,
     mut health: watch::Receiver<Health>,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -671,7 +780,7 @@ async fn supervise_ingress(
             return;
         }
         let started = Instant::now();
-        let (mut child, mut stdin) = match process::spawn_ingress(&exe, &config_line, true).await {
+        let (mut child, pipes) = match process::spawn_ingress(&exe, &config_line, true).await {
             Ok(x) => x,
             Err(e) => {
                 error!("{e:#}");
@@ -684,8 +793,12 @@ async fn supervise_ingress(
                 continue;
             }
         };
+        let process::IngressPipes { mut stdin, stdout } = pipes;
+        let mut requests = tokio::io::BufReader::new(stdout).lines();
+        let mut requests_open = true;
+        let mut hardware_job: Option<tokio::task::JoinHandle<benchmark::HardwareResult>> = None;
         let current = health.borrow_and_update().clone();
-        send_health(&mut stdin, &current).await;
+        send_line(&mut stdin, &health_line(&current)).await;
         let status = loop {
             tokio::select! {
                 status = child.wait() => break Some(status),
@@ -695,7 +808,39 @@ async fn supervise_ingress(
                         continue;
                     }
                     let h = health.borrow_and_update().clone();
-                    send_health(&mut stdin, &h).await;
+                    send_line(&mut stdin, &health_line(&h)).await;
+                }
+                line = requests.next_line(), if requests_open => match line {
+                    Ok(Some(line)) => match serde_json::from_str::<ingress::ProxyRequest>(&line) {
+                        Ok(ingress::ProxyRequest::Hardware) if hardware_job.is_none() => {
+                            let dir = download_dir.clone();
+                            hardware_job = Some(tokio::task::spawn_blocking(move || {
+                                benchmark::run_hardware(&dir, host::cpu_cores())
+                            }));
+                        }
+                        Ok(ingress::ProxyRequest::Hardware) => {
+                            debug!("a disk speed test is already running");
+                        }
+                        Err(e) => debug!("ignoring an unknown request from the Ingress proxy: {e}"),
+                    },
+                    Ok(None) | Err(_) => requests_open = false,
+                },
+                result = async {
+                    match hardware_job.as_mut() {
+                        Some(job) => job.await,
+                        None => std::future::pending().await,
+                    }
+                }, if hardware_job.is_some() => {
+                    hardware_job = None;
+                    match result {
+                        Ok(r) => {
+                            if let Some(e) = &r.disk_error {
+                                warn!("speed test: {e}");
+                            }
+                            send_line(&mut stdin, &ingress::hardware_line(&r)).await;
+                        }
+                        Err(e) => warn!("speed test: the disk test failed: {e}"),
+                    }
                 }
                 () = stop_requested(&mut stop) => break None,
             }
@@ -732,13 +877,19 @@ async fn stop_requested(rx: &mut watch::Receiver<bool>) {
     let _ = rx.wait_for(|v| *v).await;
 }
 
-async fn send_health(stdin: &mut tokio::process::ChildStdin, h: &Health) {
-    let Ok(mut line) = serde_json::to_string(h) else {
+fn health_line(h: &Health) -> String {
+    serde_json::to_string(h).unwrap_or_default()
+}
+
+async fn send_line(stdin: &mut tokio::process::ChildStdin, line: &str) {
+    if line.is_empty() {
         return;
-    };
-    line.push('\n');
-    if let Err(e) = stdin.write_all(line.as_bytes()).await {
-        debug!("cannot send a heartbeat to the Ingress proxy: {e}");
+    }
+    let mut buf = Vec::with_capacity(line.len() + 1);
+    buf.extend_from_slice(line.as_bytes());
+    buf.push(b'\n');
+    if let Err(e) = stdin.write_all(&buf).await {
+        debug!("cannot send a line to the Ingress proxy: {e}");
     }
 }
 
@@ -788,6 +939,8 @@ struct Session<'a, R: Runner> {
     /// Last NAT-PMP port applied to firewall + rtbit (None = fallback port).
     applied_lease: Option<u16>,
     tunnel_healthy: bool,
+    /// Direct connection: no tunnel, no kill-switch.
+    direct: bool,
     nat_pmp: bool,
     public_ip: Option<Ipv4Addr>,
     download_dir: PathBuf,
@@ -818,18 +971,22 @@ impl<R: Runner> Session<'_, R> {
 
     /// Sends the current state to the Ingress proxy (`/__health`).
     fn publish(&self) {
-        let detail = if !self.tunnel_healthy {
+        let detail = if !self.direct && !self.tunnel_healthy {
             "the WireGuard tunnel has no recent handshake"
         } else if !self.rtbit.is_running() {
             "rtbit is not running (restarting)"
+        } else if self.direct {
+            "rtbit is running on a direct connection (VPN off)"
         } else {
             "rtbit is running behind the VPN"
         };
         let _ = self.health.send(Health {
             rtbit: self.rtbit.is_running(),
-            tunnel: self.tunnel_healthy,
+            tunnel: !self.direct && self.tunnel_healthy,
             port: Some(self.listen_port),
             detail: detail.into(),
+            direct: self.direct,
+            public_ip: self.public_ip,
         });
     }
 
@@ -855,6 +1012,9 @@ impl<R: Runner> Session<'_, R> {
     }
 
     fn port_state(&self) -> PortState {
+        if self.direct {
+            return PortState::Direct(self.listen_port);
+        }
         match (self.nat_pmp, self.applied_lease) {
             (false, _) => PortState::Static(self.listen_port),
             (true, Some(p)) => PortState::Forwarded(p),
@@ -925,6 +1085,7 @@ impl<R: Runner> Session<'_, R> {
 
 async fn run_session(
     s: &Settings,
+    vpn: Option<&VpnSettings>,
     runner: &impl Runner,
     rtbit_spec: RtbitSpec,
     migration: MigrationRun,
@@ -939,7 +1100,8 @@ async fn run_session(
         listen_port: s.fallback_listen_port,
         applied_lease: None,
         tunnel_healthy: true,
-        nat_pmp: s.nat_pmp.is_some(),
+        direct: vpn.is_none(),
+        nat_pmp: vpn.is_some_and(|v| v.nat_pmp.is_some()),
         public_ip: None,
         download_dir: s.download_dir.clone(),
         disk_checked: None,
@@ -949,16 +1111,21 @@ async fn run_session(
         health,
     };
     let _ = health.send(Health {
-        tunnel: true,
-        detail: "tunnel up; leasing a port and starting rtbit".into(),
+        tunnel: vpn.is_some(),
+        direct: vpn.is_none(),
+        detail: if vpn.is_some() {
+            "tunnel up; leasing a port and starting rtbit".into()
+        } else {
+            "starting rtbit on a direct connection (VPN off)".into()
+        },
         ..Health::default()
     });
 
     // NAT-PMP: verify the public IP through the tunnel, then lease a port.
-    let mut forwarder = match &s.nat_pmp {
-        Some(n) => {
+    let mut forwarder = match vpn.and_then(|v| v.nat_pmp.as_ref().map(|n| (v, n))) {
+        Some((v, n)) => {
             let gw = SocketAddrV4::new(n.gateway, natpmp::NATPMP_PORT);
-            let client = Client::connect(s.wireguard.address.addr(), gw)
+            let client = Client::connect(v.wireguard.address.addr(), gw)
                 .await
                 .with_context(|| format!("cannot open the NAT-PMP socket towards {gw}"))?;
             Some(PortForwarder::new(client))
@@ -994,12 +1161,17 @@ async fn run_session(
                 next_pmp = Instant::now() + pmp_retry.next_delay();
             }
         }
-    } else {
+    } else if vpn.is_some() {
+        // Static port mode: the kill-switch opened the port at install time.
         info!(
-            "NAT-PMP disabled: rtbit listens on {} (opened on {WG_IFACE} for providers with a static forwarded port)",
+            "NAT-PMP disabled: rtbit listens on the static port {} on {WG_IFACE}",
             s.fallback_listen_port
         );
-        firewall::set_bt_ports(runner, &[s.fallback_listen_port]).await?;
+    } else {
+        info!(
+            "direct connection: rtbit listens on port {} (TCP+UDP) on the normal network",
+            s.fallback_listen_port
+        );
     }
     session.start_rtbit();
     session.log_banner();
@@ -1083,7 +1255,12 @@ async fn run_session(
                 if session.rtbit.uptime().is_some_and(|u| u >= RTBIT_STABLE_AFTER) {
                     session.respawn.reset();
                 }
-                let age = wireguard::handshake_age(runner, &s.wireguard).await;
+                let Some(vpn) = vpn else {
+                    session.check_disk(false);
+                    session.publish();
+                    continue;
+                };
+                let age = wireguard::handshake_age(runner, &vpn.wireguard).await;
                 let fresh = matches!(age, Ok(Some(a)) if a <= HANDSHAKE_STALE_AFTER);
                 if fresh {
                     if !session.tunnel_healthy {
@@ -1106,7 +1283,7 @@ async fn run_session(
                         error!(
                             "the VPN server {} has not answered for 10 minutes; restart the app \
                              (re-resolves the endpoint) or generate a config for another Proton server",
-                            s.wireguard.endpoint
+                            vpn.wireguard.endpoint
                         );
                         stale_escalated = true;
                     }

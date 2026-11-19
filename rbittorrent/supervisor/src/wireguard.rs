@@ -411,6 +411,8 @@ mod tests {
         };
         Settings::from_options(&opts, &Paths::default())
             .unwrap()
+            .vpn
+            .expect("the wg_* fields switch the VPN on")
             .wireguard
     }
 

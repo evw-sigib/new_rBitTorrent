@@ -92,6 +92,9 @@ impl LogLevel {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Options {
+    /// VPN mode. Off by default so a fresh install starts (unprotected, with a
+    /// loud warning); any WireGuard material turns it on regardless.
+    pub vpn_enabled: bool,
     pub wireguard_conf: Option<String>,
     pub wg_private_key: Option<String>,
     pub wg_public_key: Option<String>,
@@ -118,6 +121,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            vpn_enabled: false,
             wireguard_conf: None,
             wg_private_key: None,
             wg_public_key: None,
@@ -166,6 +170,43 @@ impl Options {
 /// Returns the trimmed value when the option is present and non-blank.
 fn non_blank(v: &Option<String>) -> Option<&str> {
     v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Something (even an unreadable or empty file) exists at `path`. Errors other
+/// than "not found" count as present: when in doubt, the VPN stays on.
+pub fn path_present(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Why the app must run in VPN mode, or `None` for a direct connection.
+///
+/// Fail-closed: `vpn_enabled`, a `/config/wg0.conf` (also one copied over from
+/// qBittorrent), a pasted `wireguard_conf` or any `wg_*` field each switch the
+/// VPN on, and an incomplete configuration is then an error, never a silent
+/// fallback to the unprotected connection.
+pub fn vpn_intent(opts: &Options, wg_file_present: bool) -> Option<String> {
+    if opts.vpn_enabled {
+        return Some("`vpn_enabled` is on".to_owned());
+    }
+    if wg_file_present {
+        return Some(format!("auto-enabled: /config/{WG_CONF_FILE} exists"));
+    }
+    let fields = [
+        ("wireguard_conf", &opts.wireguard_conf),
+        ("wg_private_key", &opts.wg_private_key),
+        ("wg_public_key", &opts.wg_public_key),
+        ("wg_preshared_key", &opts.wg_preshared_key),
+        ("wg_endpoint", &opts.wg_endpoint),
+        ("wg_address", &opts.wg_address),
+        ("wg_dns", &opts.wg_dns),
+    ];
+    fields
+        .iter()
+        .find(|(_, v)| non_blank(v).is_some())
+        .map(|(name, _)| format!("auto-enabled: `{name}` is filled in"))
 }
 
 /// A secret string (Web UI password). `Debug` never prints it.
@@ -652,12 +693,26 @@ pub struct NatPmpSettings {
     pub gateway: Ipv4Addr,
 }
 
+/// VPN mode: the tunnel, its kill-switch and port forwarding.
+#[derive(Debug, Clone)]
+pub struct VpnSettings {
+    pub wireguard: WireGuardConfig,
+    /// `None`: static port mode (`listen_port` opened on wg0, e.g. for
+    /// providers that forward a fixed port).
+    pub nat_pmp: Option<NatPmpSettings>,
+    /// Where the WireGuard settings came from (for the log).
+    pub source: String,
+    /// Why VPN mode is on (see [`vpn_intent`]).
+    pub reason: String,
+}
+
 /// Everything the supervisor needs, fully validated.
 #[derive(Debug, Clone)]
 pub struct Settings {
-    pub wireguard: WireGuardConfig,
-    pub nat_pmp: Option<NatPmpSettings>,
-    /// rtbit listen port when NAT-PMP is disabled or has no lease (yet).
+    /// `None`: direct connection (no tunnel, no kill-switch, no NAT-PMP).
+    pub vpn: Option<VpnSettings>,
+    /// rtbit's BitTorrent port: the static port (direct mode, or VPN without
+    /// NAT-PMP), or the fallback until NAT-PMP leases one.
     pub fallback_listen_port: u16,
     pub download_dir: PathBuf,
     pub completed_dir: PathBuf,
@@ -677,8 +732,6 @@ pub struct Settings {
     pub enable_dht: bool,
     /// The app's private `/config` folder.
     pub config_root: PathBuf,
-    /// Where the WireGuard settings came from (for the log).
-    pub wireguard_source: String,
     /// Informational notes gathered while validating (logged at startup).
     pub notes: Vec<String>,
 }
@@ -809,211 +862,244 @@ fn validate_webui_credentials(opts: &Options) -> Result<(String, Option<Secret>)
     Ok((username.to_owned(), password))
 }
 
-impl Settings {
-    pub fn from_options(opts: &Options, paths: &Paths) -> Result<Self> {
-        let mut notes = Vec::new();
-
-        // Source 1: /config/wg0.conf, source 2: the pasted option.
-        let file_path = paths.config_root.join(WG_CONF_FILE);
-        let file_text = match std::fs::read_to_string(&file_path) {
-            Ok(t) if t.trim().is_empty() => {
-                notes.push(format!("ignoring empty /config/{WG_CONF_FILE}"));
-                None
+/// Resolves the three WireGuard setup methods (wg0.conf, paste, `wg_*`).
+fn resolve_vpn(
+    opts: &Options,
+    paths: &Paths,
+    reason: String,
+    notes: &mut Vec<String>,
+) -> Result<VpnSettings> {
+    // Source 1: /config/wg0.conf, source 2: the pasted option.
+    let file_path = paths.config_root.join(WG_CONF_FILE);
+    let file_text = match std::fs::read_to_string(&file_path) {
+        Ok(t) if t.trim().is_empty() => {
+            notes.push(format!("ignoring empty /config/{WG_CONF_FILE}"));
+            None
+        }
+        Ok(t) => Some(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => bail!("cannot read /config/{WG_CONF_FILE}: {e}"),
+    };
+    let pasted = non_blank(&opts.wireguard_conf);
+    let (conf, source) = match (file_text.as_deref(), pasted) {
+        (Some(text), pasted) => {
+            if pasted.is_some() {
+                notes.push(format!(
+                    "using /config/{WG_CONF_FILE}; the pasted `wireguard_conf` option is ignored"
+                ));
             }
-            Ok(t) => Some(t),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => bail!("cannot read /config/{WG_CONF_FILE}: {e}"),
-        };
-        let pasted = non_blank(&opts.wireguard_conf);
-        let (conf, source) = match (file_text.as_deref(), pasted) {
-            (Some(text), pasted) => {
-                if pasted.is_some() {
+            let c = parse_wg_conf(text)
+                .with_context(|| format!("cannot parse /config/{WG_CONF_FILE}"))?;
+            (c, format!("/config/{WG_CONF_FILE}"))
+        }
+        (None, Some(text)) => (
+            parse_wg_conf(text).context("cannot parse the `wireguard_conf` option")?,
+            "the `wireguard_conf` option".to_owned(),
+        ),
+        (None, None) => (WgConf::default(), "the `wg_*` options".to_owned()),
+    };
+    notes.extend(conf.warnings.iter().cloned());
+    let have_conf = file_text.is_some() || pasted.is_some();
+
+    // Source 3: structured fields only fill in what the .conf leaves out.
+    let mut pick = |field: &str, structured: &Option<String>, from_conf: &Option<String>| {
+        let from_conf = from_conf
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        match (from_conf, non_blank(structured)) {
+            (Some(c), Some(st)) => {
+                if c != st {
                     notes.push(format!(
-                        "using /config/{WG_CONF_FILE}; the pasted `wireguard_conf` option is ignored"
+                        "`{field}` is ignored because {source} already sets it"
                     ));
                 }
-                let c = parse_wg_conf(text)
-                    .with_context(|| format!("cannot parse /config/{WG_CONF_FILE}"))?;
-                (c, format!("/config/{WG_CONF_FILE}"))
+                Some(c.to_owned())
             }
-            (None, Some(text)) => (
-                parse_wg_conf(text).context("cannot parse the `wireguard_conf` option")?,
-                "the `wireguard_conf` option".to_owned(),
-            ),
-            (None, None) => (WgConf::default(), "the `wg_*` options".to_owned()),
-        };
-        notes.extend(conf.warnings.iter().cloned());
-        let have_conf = file_text.is_some() || pasted.is_some();
+            (Some(c), None) => Some(c.to_owned()),
+            (None, st) => st.map(str::to_owned),
+        }
+    };
 
-        // Source 3: structured fields only fill in what the .conf leaves out.
-        let mut pick = |field: &str, structured: &Option<String>, from_conf: &Option<String>| {
-            let from_conf = from_conf
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            match (from_conf, non_blank(structured)) {
-                (Some(c), Some(st)) => {
-                    if c != st {
-                        notes.push(format!(
-                            "`{field}` is ignored because {source} already sets it"
-                        ));
-                    }
-                    Some(c.to_owned())
-                }
-                (Some(c), None) => Some(c.to_owned()),
-                (None, st) => st.map(str::to_owned),
-            }
-        };
-
-        let missing = |what: &str, field: &str, conf_key: &str| {
-            let hint = if have_conf {
-                format!("{source} has no `{conf_key} = ...` line; add it or fill `{field}`")
-            } else {
-                format!(
-                    "Put your Proton VPN WireGuard .conf in /config/{WG_CONF_FILE}, paste it \
+    let missing = |what: &str, field: &str, conf_key: &str| {
+        let hint = if have_conf {
+            format!("{source} has no `{conf_key} = ...` line; add it or fill `{field}`")
+        } else {
+            format!(
+                "Put your Proton VPN WireGuard .conf in /config/{WG_CONF_FILE}, paste it \
                      into `wireguard_conf` (it contains `{conf_key} = ...`) or fill `{field}`"
-                )
-            };
-            anyhow!("no WireGuard {what} configured. {hint}")
+            )
         };
+        anyhow!("no WireGuard {what} configured. {hint}")
+    };
 
-        let private_key = pick("wg_private_key", &opts.wg_private_key, &conf.private_key)
-            .ok_or_else(|| missing("private key", "wg_private_key", "PrivateKey"))?;
-        let private_key = WgKey::parse("wg_private_key / PrivateKey", &private_key)?;
+    let private_key = pick("wg_private_key", &opts.wg_private_key, &conf.private_key)
+        .ok_or_else(|| missing("private key", "wg_private_key", "PrivateKey"))?;
+    let private_key = WgKey::parse("wg_private_key / PrivateKey", &private_key)?;
 
-        let peer_public_key = pick("wg_public_key", &opts.wg_public_key, &conf.peer_public_key)
-            .ok_or_else(|| missing("server public key", "wg_public_key", "PublicKey"))?;
-        let peer_public_key = WgKey::parse("wg_public_key / PublicKey", &peer_public_key)?;
-        if peer_public_key == private_key {
-            bail!(
-                "`wg_public_key` equals the private key; the public key must be the \
+    let peer_public_key = pick("wg_public_key", &opts.wg_public_key, &conf.peer_public_key)
+        .ok_or_else(|| missing("server public key", "wg_public_key", "PublicKey"))?;
+    let peer_public_key = WgKey::parse("wg_public_key / PublicKey", &peer_public_key)?;
+    if peer_public_key == private_key {
+        bail!(
+            "`wg_public_key` equals the private key; the public key must be the \
                  *server's* key from the [Peer] section"
-            );
-        }
+        );
+    }
 
-        let preshared_key = pick(
-            "wg_preshared_key",
-            &opts.wg_preshared_key,
-            &conf.preshared_key,
-        )
-        .map(|k| WgKey::parse("wg_preshared_key / PresharedKey", &k))
-        .transpose()?;
+    let preshared_key = pick(
+        "wg_preshared_key",
+        &opts.wg_preshared_key,
+        &conf.preshared_key,
+    )
+    .map(|k| WgKey::parse("wg_preshared_key / PresharedKey", &k))
+    .transpose()?;
 
-        let endpoint = pick("wg_endpoint", &opts.wg_endpoint, &conf.endpoint)
-            .ok_or_else(|| missing("endpoint", "wg_endpoint", "Endpoint"))?;
-        let endpoint = parse_endpoint(&endpoint)?;
+    let endpoint = pick("wg_endpoint", &opts.wg_endpoint, &conf.endpoint)
+        .ok_or_else(|| missing("endpoint", "wg_endpoint", "Endpoint"))?;
+    let endpoint = parse_endpoint(&endpoint)?;
 
-        let address_entries: Vec<String> =
-            match (conf.addresses.is_empty(), non_blank(&opts.wg_address)) {
-                (false, structured) => {
-                    if structured.is_some() {
-                        notes.push(format!(
-                            "`wg_address` is ignored because {source} already sets it"
-                        ));
-                    }
-                    conf.addresses.clone()
-                }
-                (true, Some(a)) => split_list(a).collect(),
-                (true, None) => Vec::new(),
-            };
-        if address_entries.is_empty() {
-            return Err(missing("tunnel address", "wg_address", "Address"));
-        }
-        let mut v4_addresses = Vec::new();
-        for entry in &address_entries {
-            match entry.parse::<Ipv4Cidr>() {
-                Ok(c) => v4_addresses.push(c),
-                Err(_) if entry.contains(':') => notes.push(format!(
-                    "ignoring IPv6 tunnel address {entry} (IPv6 is dropped by the kill-switch)"
-                )),
-                Err(e) => return Err(anyhow!(e)).context("invalid WireGuard `Address`"),
-            }
-        }
-        let address = *v4_addresses.first().ok_or_else(|| {
-            anyhow!("the WireGuard `Address` has no IPv4 address (Proton uses 10.2.0.2/32)")
-        })?;
-        if v4_addresses.len() > 1 {
-            notes.push(format!("using the first IPv4 tunnel address {address}"));
-        }
-        if address.addr().is_unspecified() || address.addr().is_loopback() {
-            bail!("the WireGuard `Address` {address} is not a usable tunnel address");
-        }
-
-        let dns_entries: Vec<String> = match (conf.dns.is_empty(), non_blank(&opts.wg_dns)) {
+    let address_entries: Vec<String> =
+        match (conf.addresses.is_empty(), non_blank(&opts.wg_address)) {
             (false, structured) => {
                 if structured.is_some() {
                     notes.push(format!(
-                        "`wg_dns` is ignored because {source} already sets it"
+                        "`wg_address` is ignored because {source} already sets it"
                     ));
                 }
-                conf.dns.clone()
+                conf.addresses.clone()
             }
-            (true, Some(d)) => split_list(d).collect(),
+            (true, Some(a)) => split_list(a).collect(),
             (true, None) => Vec::new(),
         };
-        let mut dns = parse_ipv4_list(dns_entries, "DNS server", &mut notes);
-        if dns.is_empty() {
-            notes.push(format!(
-                "no IPv4 DNS configured; using Proton's {PROTON_GATEWAY}"
-            ));
-            dns.push(PROTON_GATEWAY);
+    if address_entries.is_empty() {
+        return Err(missing("tunnel address", "wg_address", "Address"));
+    }
+    let mut v4_addresses = Vec::new();
+    for entry in &address_entries {
+        match entry.parse::<Ipv4Cidr>() {
+            Ok(c) => v4_addresses.push(c),
+            Err(_) if entry.contains(':') => notes.push(format!(
+                "ignoring IPv6 tunnel address {entry} (IPv6 is dropped by the kill-switch)"
+            )),
+            Err(e) => return Err(anyhow!(e)).context("invalid WireGuard `Address`"),
         }
+    }
+    let address = *v4_addresses.first().ok_or_else(|| {
+        anyhow!("the WireGuard `Address` has no IPv4 address (Proton uses 10.2.0.2/32)")
+    })?;
+    if v4_addresses.len() > 1 {
+        notes.push(format!("using the first IPv4 tunnel address {address}"));
+    }
+    if address.addr().is_unspecified() || address.addr().is_loopback() {
+        bail!("the WireGuard `Address` {address} is not a usable tunnel address");
+    }
 
-        if !conf.allowed_ips.is_empty() {
-            let v4: Vec<&String> = conf
-                .allowed_ips
-                .iter()
-                .filter(|a| !a.contains(':'))
-                .collect();
-            if conf.allowed_ips.len() != v4.len() {
-                notes.push(
-                    "ignoring IPv6 AllowedIPs (IPv6 is dropped by the kill-switch)".to_owned(),
-                );
-            }
-            if !v4.iter().any(|a| a.trim() == "0.0.0.0/0") {
-                notes.push(
-                    "AllowedIPs is not 0.0.0.0/0; split tunnelling is not supported, all IPv4 \
-                     traffic goes through the tunnel"
-                        .to_owned(),
-                );
-            }
-        }
-
-        let persistent_keepalive = match conf.persistent_keepalive {
-            Some(0) => {
+    let dns_entries: Vec<String> = match (conf.dns.is_empty(), non_blank(&opts.wg_dns)) {
+        (false, structured) => {
+            if structured.is_some() {
                 notes.push(format!(
-                    "PersistentKeepalive is off in the config; using {DEFAULT_KEEPALIVE}s so \
-                     NAT-PMP port forwarding keeps working"
+                    "`wg_dns` is ignored because {source} already sets it"
                 ));
-                DEFAULT_KEEPALIVE
             }
-            Some(k) => k,
-            None => DEFAULT_KEEPALIVE,
-        };
-
-        let mtu = conf.mtu.unwrap_or(DEFAULT_MTU);
-        if !(1280..=1500).contains(&mtu) {
-            bail!("WireGuard MTU {mtu} is out of range (1280-1500; leave it unset for 1420)");
+            conf.dns.clone()
         }
+        (true, Some(d)) => split_list(d).collect(),
+        (true, None) => Vec::new(),
+    };
+    let mut dns = parse_ipv4_list(dns_entries, "DNS server", notes);
+    if dns.is_empty() {
+        notes.push(format!(
+            "no IPv4 DNS configured; using Proton's {PROTON_GATEWAY}"
+        ));
+        dns.push(PROTON_GATEWAY);
+    }
 
-        let nat_pmp = if opts.enable_nat_pmp {
-            let gateway: Ipv4Addr = opts.nat_pmp_gateway.trim().parse().map_err(|_| {
-                anyhow!(
-                    "`nat_pmp_gateway` `{}` is not an IPv4 address (Proton: 10.2.0.1)",
-                    opts.nat_pmp_gateway
-                )
-            })?;
-            if conf.proton_nat_pmp == Some(false) {
-                notes.push(
-                    "your Proton WireGuard config says `NAT-PMP (Port Forwarding) = off`: \
+    if !conf.allowed_ips.is_empty() {
+        let v4: Vec<&String> = conf
+            .allowed_ips
+            .iter()
+            .filter(|a| !a.contains(':'))
+            .collect();
+        if conf.allowed_ips.len() != v4.len() {
+            notes.push("ignoring IPv6 AllowedIPs (IPv6 is dropped by the kill-switch)".to_owned());
+        }
+        if !v4.iter().any(|a| a.trim() == "0.0.0.0/0") {
+            notes.push(
+                "AllowedIPs is not 0.0.0.0/0; split tunnelling is not supported, all IPv4 \
+                     traffic goes through the tunnel"
+                    .to_owned(),
+            );
+        }
+    }
+
+    let persistent_keepalive = match conf.persistent_keepalive {
+        Some(0) => {
+            notes.push(format!(
+                "PersistentKeepalive is off in the config; using {DEFAULT_KEEPALIVE}s so \
+                     NAT-PMP port forwarding keeps working"
+            ));
+            DEFAULT_KEEPALIVE
+        }
+        Some(k) => k,
+        None => DEFAULT_KEEPALIVE,
+    };
+
+    let mtu = conf.mtu.unwrap_or(DEFAULT_MTU);
+    if !(1280..=1500).contains(&mtu) {
+        bail!("WireGuard MTU {mtu} is out of range (1280-1500; leave it unset for 1420)");
+    }
+
+    let nat_pmp = if opts.enable_nat_pmp {
+        let gateway: Ipv4Addr = opts.nat_pmp_gateway.trim().parse().map_err(|_| {
+            anyhow!(
+                "`nat_pmp_gateway` `{}` is not an IPv4 address (Proton: 10.2.0.1)",
+                opts.nat_pmp_gateway
+            )
+        })?;
+        if conf.proton_nat_pmp == Some(false) {
+            notes.push(
+                "your Proton WireGuard config says `NAT-PMP (Port Forwarding) = off`: \
                      regenerate it on account.protonvpn.com with NAT-PMP enabled, otherwise \
                      no port will be forwarded"
-                        .to_owned(),
-                );
+                    .to_owned(),
+            );
+        }
+        Some(NatPmpSettings { gateway })
+    } else {
+        None
+    };
+
+    Ok(VpnSettings {
+        wireguard: WireGuardConfig {
+            private_key,
+            peer_public_key,
+            preshared_key,
+            endpoint,
+            address,
+            dns,
+            persistent_keepalive,
+            mtu,
+        },
+        nat_pmp,
+        source,
+        reason,
+    })
+}
+
+impl Settings {
+    pub fn from_options(opts: &Options, paths: &Paths) -> Result<Self> {
+        let mut notes = Vec::new();
+        let wg_file_present = path_present(&paths.config_root.join(WG_CONF_FILE));
+        let vpn = match vpn_intent(opts, wg_file_present) {
+            Some(reason) => {
+                let why = reason.clone();
+                Some(
+                    resolve_vpn(opts, paths, reason, &mut notes)
+                        .with_context(|| format!("VPN mode is on ({why})"))?,
+                )
             }
-            Some(NatPmpSettings { gateway })
-        } else {
-            None
+            None => None,
         };
 
         if opts.listen_port == 0 {
@@ -1037,28 +1123,18 @@ impl Settings {
         let (webui_username, webui_password) = validate_webui_credentials(opts)?;
 
         let local_allow_cidrs = parse_local_cidrs(&opts.local_allow_cidrs, &mut notes)?;
-        for c in &local_allow_cidrs {
-            if c.contains_addr(address.addr()) {
+        if let Some(v) = &vpn {
+            let addr = v.wireguard.address.addr();
+            for c in local_allow_cidrs.iter().filter(|c| c.contains_addr(addr)) {
                 tracing::debug!(
-                    "local range {c} contains the tunnel address {}; tunnel traffic still \
-                     wins via host routes",
-                    address.addr()
+                    "local range {c} contains the tunnel address {addr}; tunnel traffic still \
+                     wins via host routes"
                 );
             }
         }
 
         Ok(Settings {
-            wireguard: WireGuardConfig {
-                private_key,
-                peer_public_key,
-                preshared_key,
-                endpoint,
-                address,
-                dns,
-                persistent_keepalive,
-                mtu,
-            },
-            nat_pmp,
+            vpn,
             fallback_listen_port: opts.listen_port,
             download_dir,
             completed_dir,
@@ -1072,9 +1148,19 @@ impl Settings {
             webui_password,
             enable_dht: opts.enable_dht,
             config_root: paths.config_root.clone(),
-            wireguard_source: source,
             notes,
         })
+    }
+
+    /// Ports opened on wg0 when the kill-switch is first loaded: the static
+    /// `listen_port` for VPN without NAT-PMP (providers with a fixed forwarded
+    /// port), none otherwise (NAT-PMP opens its leased port; direct mode has
+    /// no firewall).
+    pub fn static_bt_ports(&self) -> Vec<u16> {
+        match &self.vpn {
+            Some(v) if v.nat_pmp.is_none() => vec![self.fallback_listen_port],
+            _ => Vec::new(),
+        }
     }
 
     /// The Web UI password: the configured one, or a random one generated
@@ -1175,6 +1261,10 @@ Endpoint = 190.2.131.156:51820\r\n";
         Settings::from_options(opts, &Paths::default())
     }
 
+    fn vpn(s: &Settings) -> &VpnSettings {
+        s.vpn.as_ref().expect("VPN mode")
+    }
+
     #[test]
     fn key_validation() {
         assert!(decode_key(PRIV).is_some());
@@ -1201,7 +1291,7 @@ Endpoint = 190.2.131.156:51820\r\n";
         assert_eq!(c.proton_nat_pmp, Some(true));
 
         let s = settings(&opts_with_conf(PROTON_CONF)).unwrap();
-        let wg = &s.wireguard;
+        let wg = &vpn(&s).wireguard;
         assert_eq!(wg.address.to_string(), "10.2.0.2/32");
         assert_eq!(wg.dns, vec![Ipv4Addr::new(10, 2, 0, 1)]);
         assert_eq!(
@@ -1215,7 +1305,7 @@ Endpoint = 190.2.131.156:51820\r\n";
         assert!(s.notes.iter().any(|n| n.contains("IPv6 DNS server")));
         assert!(s.notes.iter().any(|n| n.contains("IPv6 AllowedIPs")));
         assert_eq!(
-            s.nat_pmp,
+            vpn(&s).nat_pmp,
             Some(NatPmpSettings {
                 gateway: PROTON_GATEWAY
             })
@@ -1228,7 +1318,7 @@ Endpoint = 190.2.131.156:51820\r\n";
             address =10.2.0.2/32\nMTU = 1380\n[PEER]\n  PUBLICKEY   =    xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\n\
             endpoint = nl-free-01.protonvpn.net\npersistentkeepalive = 15\npresharedkey = FpCyhws9cxwWoV4xELtfJvjJN+zQVRPISllRWgeopVE=\n";
         let s = settings(&opts_with_conf(conf)).unwrap();
-        let wg = &s.wireguard;
+        let wg = &vpn(&s).wireguard;
         assert_eq!(wg.mtu, 1380);
         assert_eq!(wg.persistent_keepalive, 15);
         assert_eq!(
@@ -1256,8 +1346,8 @@ Endpoint = 190.2.131.156:51820\r\n";
             );
             assert_eq!(c.proton_nat_pmp, Some(true));
             let s = settings(&opts_with_conf(&variant)).unwrap();
-            assert_eq!(s.wireguard.address.to_string(), "10.2.0.2/32");
-            assert_eq!(s.wireguard.dns, vec![PROTON_GATEWAY]);
+            assert_eq!(vpn(&s).wireguard.address.to_string(), "10.2.0.2/32");
+            assert_eq!(vpn(&s).wireguard.dns, vec![PROTON_GATEWAY]);
         }
     }
 
@@ -1272,7 +1362,7 @@ Endpoint = 190.2.131.156:51820\r\n";
             assert_eq!(c.private_key.as_deref(), Some(tricky), "{variant}");
             assert_eq!(c.mtu, None, "{variant}");
             let s = settings(&opts_with_conf(&variant)).unwrap();
-            assert_eq!(s.wireguard.private_key.as_base64(), tricky);
+            assert_eq!(vpn(&s).wireguard.private_key.as_base64(), tricky);
         }
     }
 
@@ -1315,7 +1405,7 @@ Endpoint = 190.2.131.156:51820\r\n";
         o.wg_endpoint = Some("ch-de-5.protonvpn.net:51820".into());
         let s = settings(&o).unwrap();
         assert_eq!(
-            s.wireguard.endpoint.host,
+            vpn(&s).wireguard.endpoint.host,
             EndpointHost::Ip(Ipv4Addr::new(190, 2, 131, 156))
         );
         assert!(
@@ -1325,7 +1415,7 @@ Endpoint = 190.2.131.156:51820\r\n";
             "{:?}",
             s.notes
         );
-        assert_eq!(s.wireguard_source, "the `wireguard_conf` option");
+        assert_eq!(vpn(&s).source, "the `wireguard_conf` option");
 
         // A .conf without DNS gets it from `wg_dns`.
         let no_dns = PROTON_CONF.replace("DNS = 10.2.0.1, 2a07:b944::2:1\r\n", "");
@@ -1333,21 +1423,24 @@ Endpoint = 190.2.131.156:51820\r\n";
         o.wg_dns = Some("10.2.0.1, 1.1.1.1".into());
         let s = settings(&o).unwrap();
         assert_eq!(
-            s.wireguard.dns,
+            vpn(&s).wireguard.dns,
             vec![PROTON_GATEWAY, Ipv4Addr::new(1, 1, 1, 1)]
         );
 
         // Structured fields alone are a complete configuration.
         let structured = structured_options();
         let s = settings(&structured).unwrap();
-        assert_eq!(s.wireguard.dns, vec![PROTON_GATEWAY]);
-        assert_eq!(s.wireguard.address.to_string(), "10.2.0.2/32");
-        assert_eq!(s.wireguard_source, "the `wg_*` options");
+        assert_eq!(vpn(&s).wireguard.dns, vec![PROTON_GATEWAY]);
+        assert_eq!(vpn(&s).wireguard.address.to_string(), "10.2.0.2/32");
+        assert_eq!(vpn(&s).source, "the `wg_*` options");
 
         // A bare address becomes /32.
         let mut bare = structured.clone();
         bare.wg_address = Some("10.2.0.2".into());
-        assert_eq!(settings(&bare).unwrap().wireguard.address.prefix(), 32);
+        assert_eq!(
+            vpn(&settings(&bare).unwrap()).wireguard.address.prefix(),
+            32
+        );
     }
 
     fn structured_options() -> Options {
@@ -1386,10 +1479,10 @@ Endpoint = 190.2.131.156:51820\r\n";
         // File alone.
         let s = Settings::from_options(&Options::default(), &paths).unwrap();
         assert_eq!(
-            s.wireguard.endpoint.host,
+            vpn(&s).wireguard.endpoint.host,
             EndpointHost::Ip(Ipv4Addr::new(185, 159, 157, 10))
         );
-        assert_eq!(s.wireguard_source, "/config/wg0.conf");
+        assert_eq!(vpn(&s).source, "/config/wg0.conf");
         assert_eq!(s.data_home, root.join("db"));
 
         // File beats the pasted option and the structured fields.
@@ -1397,7 +1490,7 @@ Endpoint = 190.2.131.156:51820\r\n";
         o.wg_endpoint = Some("1.2.3.4:51820".into());
         let s = Settings::from_options(&o, &paths).unwrap();
         assert_eq!(
-            s.wireguard.endpoint.host,
+            vpn(&s).wireguard.endpoint.host,
             EndpointHost::Ip(Ipv4Addr::new(185, 159, 157, 10))
         );
         assert!(
@@ -1409,7 +1502,7 @@ Endpoint = 190.2.131.156:51820\r\n";
         // An empty file is ignored, the paste is used.
         std::fs::write(root.join(WG_CONF_FILE), "  \n").unwrap();
         let s = Settings::from_options(&opts_with_conf(PROTON_CONF), &paths).unwrap();
-        assert_eq!(s.wireguard_source, "the `wireguard_conf` option");
+        assert_eq!(vpn(&s).source, "the `wireguard_conf` option");
 
         // A broken file is an error that names the file.
         std::fs::write(root.join(WG_CONF_FILE), "[Interface]\ngarbage\n").unwrap();
@@ -1436,7 +1529,7 @@ Endpoint = 190.2.131.156:51820\r\n";
             assert_eq!(c.dns, vec!["10.2.0.1", "2a07:b944::2:1"], "{sep:?}");
             assert_eq!(c.proton_nat_pmp, Some(true), "{sep:?}");
             let s = settings(&opts_with_conf(&flat)).unwrap();
-            assert_eq!(s.wireguard.address.to_string(), "10.2.0.2/32");
+            assert_eq!(vpn(&s).wireguard.address.to_string(), "10.2.0.2/32");
         }
     }
 
@@ -1526,7 +1619,15 @@ Endpoint = 190.2.131.156:51820\r\n";
 
     #[test]
     fn missing_or_invalid_credentials_fail_with_guidance() {
-        let err = settings(&Options::default()).unwrap_err().to_string();
+        let on = Options {
+            vpn_enabled: true,
+            ..Options::default()
+        };
+        let err = format!("{:#}", settings(&on).unwrap_err());
+        assert!(
+            err.contains("VPN mode is on (`vpn_enabled` is on)"),
+            "{err}"
+        );
         assert!(err.contains("wg0.conf"), "{err}");
         assert!(err.contains("wireguard_conf"), "{err}");
         assert!(err.contains("wg_private_key"), "{err}");
@@ -1547,9 +1648,7 @@ Endpoint = 190.2.131.156:51820\r\n";
 
         // A conf missing a value names the source and the fallback field.
         let no_endpoint = PROTON_CONF.replace("Endpoint = 190.2.131.156:51820\r\n", "");
-        let err = settings(&opts_with_conf(&no_endpoint))
-            .unwrap_err()
-            .to_string();
+        let err = format!("{:#}", settings(&opts_with_conf(&no_endpoint)).unwrap_err());
         assert!(
             err.contains("wireguard_conf") && err.contains("wg_endpoint"),
             "{err}"
@@ -1576,7 +1675,8 @@ Endpoint = 190.2.131.156:51820\r\n";
         assert_eq!(o.log_level, LogLevel::Debug);
         assert_eq!(o.listen_port, DEFAULT_LISTEN_PORT);
         let s = settings(&o).unwrap();
-        assert!(s.nat_pmp.is_none());
+        assert!(vpn(&s).nat_pmp.is_none(), "static port mode");
+        assert_eq!(s.static_bt_ports(), vec![DEFAULT_LISTEN_PORT]);
         assert_eq!(s.download_dir, PathBuf::from("/share/rt/incomplete"));
         assert_eq!(s.data_home, PathBuf::from("/config/db"));
         assert_eq!(s.cache_home, PathBuf::from("/config/cache"));
@@ -1652,13 +1752,164 @@ Endpoint = 190.2.131.156:51820\r\n";
     fn keepalive_off_is_forced_on_and_mtu_validated() {
         let conf = format!("{PROTON_CONF}PersistentKeepalive = off\n");
         assert_eq!(
-            settings(&opts_with_conf(&conf))
-                .unwrap()
+            vpn(&settings(&opts_with_conf(&conf)).unwrap())
                 .wireguard
                 .persistent_keepalive,
             DEFAULT_KEEPALIVE
         );
         let conf = PROTON_CONF.replace("DNS =", "MTU = 9000\r\nDNS =");
         assert!(settings(&opts_with_conf(&conf)).is_err());
+    }
+
+    #[test]
+    fn vpn_is_off_on_a_fresh_install_and_needs_nothing() {
+        let root = temp_dir("direct");
+        let paths = Paths {
+            config_root: root.clone(),
+        };
+        let s = Settings::from_options(&Options::default(), &paths).unwrap();
+        assert!(
+            s.vpn.is_none(),
+            "zero-config first boot is a direct connection"
+        );
+        assert_eq!(s.fallback_listen_port, DEFAULT_LISTEN_PORT);
+        assert!(s.static_bt_ports().is_empty(), "no firewall in direct mode");
+        assert_eq!(vpn_intent(&Options::default(), false), None);
+
+        // Blank fields (the add-on UI leaves empty strings) do not count.
+        let blank = Options {
+            wireguard_conf: Some("  \n".into()),
+            wg_private_key: Some(String::new()),
+            wg_dns: Some(" ".into()),
+            ..Options::default()
+        };
+        assert_eq!(vpn_intent(&blank, false), None);
+        assert!(
+            Settings::from_options(&blank, &paths)
+                .unwrap()
+                .vpn
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn any_wireguard_input_auto_promotes_vpn_mode() {
+        let one = |f: fn(&mut Options)| {
+            let mut o = Options::default();
+            f(&mut o);
+            vpn_intent(&o, false)
+        };
+        let expect = |field: &str| Some(format!("auto-enabled: `{field}` is filled in"));
+        assert_eq!(
+            one(|o| o.wireguard_conf = Some("x".into())),
+            expect("wireguard_conf")
+        );
+        assert_eq!(
+            one(|o| o.wg_private_key = Some("x".into())),
+            expect("wg_private_key")
+        );
+        assert_eq!(
+            one(|o| o.wg_public_key = Some("x".into())),
+            expect("wg_public_key")
+        );
+        assert_eq!(
+            one(|o| o.wg_preshared_key = Some("x".into())),
+            expect("wg_preshared_key")
+        );
+        assert_eq!(
+            one(|o| o.wg_endpoint = Some("x".into())),
+            expect("wg_endpoint")
+        );
+        assert_eq!(
+            one(|o| o.wg_address = Some("x".into())),
+            expect("wg_address")
+        );
+        assert_eq!(one(|o| o.wg_dns = Some("x".into())), expect("wg_dns"));
+        assert_eq!(
+            vpn_intent(&Options::default(), true),
+            Some("auto-enabled: /config/wg0.conf exists".to_owned())
+        );
+
+        // A complete configuration with vpn_enabled left off: VPN mode.
+        let s = settings(&structured_options()).unwrap();
+        assert_eq!(
+            vpn(&s).reason,
+            "auto-enabled: `wg_private_key` is filled in"
+        );
+        let s = settings(&opts_with_conf(PROTON_CONF)).unwrap();
+        assert_eq!(
+            vpn(&s).reason,
+            "auto-enabled: `wireguard_conf` is filled in"
+        );
+    }
+
+    #[test]
+    fn incomplete_wireguard_input_never_falls_back_to_direct() {
+        // One stray field: VPN mode is on, so the gap is an error.
+        let o = Options {
+            wg_dns: Some("10.2.0.1".into()),
+            ..Options::default()
+        };
+        let err = format!("{:#}", settings(&o).unwrap_err());
+        assert!(
+            err.contains("VPN mode is on (auto-enabled: `wg_dns` is filled in)"),
+            "{err}"
+        );
+
+        let root = temp_dir("failclosed");
+        let paths = Paths {
+            config_root: root.clone(),
+        };
+        // An empty wg0.conf (e.g. a half-finished copy) still means VPN.
+        std::fs::write(root.join(WG_CONF_FILE), "").unwrap();
+        let err = format!(
+            "{:#}",
+            Settings::from_options(&Options::default(), &paths).unwrap_err()
+        );
+        assert!(
+            err.contains("auto-enabled: /config/wg0.conf exists"),
+            "{err}"
+        );
+        // So does an unreadable one (here: a directory).
+        std::fs::remove_file(root.join(WG_CONF_FILE)).unwrap();
+        std::fs::create_dir(root.join(WG_CONF_FILE)).unwrap();
+        assert!(path_present(&root.join(WG_CONF_FILE)));
+        assert!(Settings::from_options(&Options::default(), &paths).is_err());
+        // A dangling symlink is present too.
+        std::fs::remove_dir(root.join(WG_CONF_FILE)).unwrap();
+        std::os::unix::fs::symlink(root.join("gone"), root.join(WG_CONF_FILE)).unwrap();
+        assert!(path_present(&root.join(WG_CONF_FILE)));
+        assert!(Settings::from_options(&Options::default(), &paths).is_err());
+        assert!(!path_present(&root.join("nothing-here")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn static_port_mode_opens_listen_port_on_wg0() {
+        // TorGuard / AirVPN / Windscribe: a fixed forwarded port, no NAT-PMP.
+        let mut o = opts_with_conf(PROTON_CONF);
+        o.enable_nat_pmp = false;
+        o.listen_port = 51413;
+        let s = settings(&o).unwrap();
+        assert!(vpn(&s).nat_pmp.is_none());
+        assert_eq!(s.fallback_listen_port, 51413);
+        assert_eq!(s.static_bt_ports(), vec![51413]);
+
+        // With NAT-PMP the leased port is opened later, never a static one.
+        o.enable_nat_pmp = true;
+        let s = settings(&o).unwrap();
+        assert!(vpn(&s).nat_pmp.is_some());
+        assert!(s.static_bt_ports().is_empty());
+
+        // `vpn_enabled` alone with a full config behaves the same.
+        o.vpn_enabled = true;
+        o.enable_nat_pmp = false;
+        let s = settings(&o).unwrap();
+        assert_eq!(vpn(&s).reason, "`vpn_enabled` is on");
+        assert_eq!(s.static_bt_ports(), vec![51413]);
+
+        o.listen_port = 0;
+        assert!(settings(&o).is_err());
     }
 }

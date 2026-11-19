@@ -1,5 +1,16 @@
 ---
 configuration:
+  vpn_enabled:
+    name: VPN (WireGuard kill-switch)
+    description: >-
+      On: all torrent traffic goes through WireGuard behind a fail-closed
+      kill-switch; if the tunnel is down, nothing leaks, rtbit simply waits.
+      Switched on automatically as soon as /config/wg0.conf exists (also one
+      taken over from qBittorrent) or any WireGuard field below is filled
+      in; an incomplete WireGuard setup then stops the app instead of
+      falling back. Off with no WireGuard setup at all (a fresh install):
+      rtbit uses your normal internet connection and your own IP address is
+      visible to peers and trackers; the log and the sidebar say so.
   wireguard_conf:
     name: WireGuard configuration (paste)
     description: >-
@@ -82,14 +93,20 @@ configuration:
       Lease a public port from the VPN gateway (RFC 6886) and pass it to
       rtbit, so other peers can connect to you. Needs a Proton plan with
       port forwarding, a P2P server and a config generated with NAT-PMP on.
+      Turn off for providers that forward one fixed port (TorGuard, AirVPN,
+      Windscribe, ...): set that port as the listen port and it is opened on
+      the tunnel instead (static port mode).
   nat_pmp_gateway:
     name: NAT-PMP gateway
     description: Gateway inside the tunnel that answers NAT-PMP. Proton uses 10.2.0.1.
   listen_port:
-    name: Fallback listen port
+    name: Listen port
     description: >-
-      BitTorrent port used when NAT-PMP is off or has no lease yet. With
-      NAT-PMP active, the leased port replaces it automatically.
+      rtbit's BitTorrent port. VPN off: the port on your normal connection
+      (map 4240 in the Network section and on your router for inbound
+      peers). VPN with NAT-PMP off: the fixed port your provider forwards
+      to you, opened on the tunnel only. With NAT-PMP, the leased port
+      replaces it automatically (this one is used until the first lease).
   download_dir:
     name: Download folder
     description: >-
@@ -122,3 +139,10 @@ network:
     for LAN browsers, Sonarr/Radarr/Prowlarr, qBitController and the
     qBittorrent integration (password-protected). The sidebar does not need
     this port.
+  4240/tcp: >-
+    BitTorrent peers on a direct connection (VPN off) only. Keep it equal to
+    the listen port. Unused with the VPN on: the tunnel carries all torrent
+    traffic.
+  4240/udp: >-
+    BitTorrent peers (uTP) and DHT on a direct connection (VPN off) only.
+    Keep it equal to the listen port.

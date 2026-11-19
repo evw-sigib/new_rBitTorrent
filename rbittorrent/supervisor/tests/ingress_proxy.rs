@@ -23,8 +23,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::oneshot;
 
+use rbittorrent_supervisor::benchmark::{self, PeeringTarget, SpeedTarget};
 use rbittorrent_supervisor::config::LogLevel;
-use rbittorrent_supervisor::ingress::{self, Health, Proxy, ProxyConfig};
+use rbittorrent_supervisor::ingress::{self, Health, Proxy, ProxyConfig, ProxyRequest};
 
 const PASSWORD: &str = "p@ss w&rd=1";
 const PREFIX: &str = "/api/hassio_ingress/Zx9-tok_en";
@@ -311,6 +312,15 @@ async fn start_mock() -> (SocketAddr, Arc<Mock>) {
 }
 
 async fn start_proxy(upstream: SocketAddr, password: &str) -> (SocketAddr, Arc<Proxy>) {
+    start_proxy_with(upstream, password, None, None).await
+}
+
+async fn start_proxy_with(
+    upstream: SocketAddr,
+    password: &str,
+    speed_target: Option<SpeedTarget>,
+    peering: Option<Vec<PeeringTarget>>,
+) -> (SocketAddr, Arc<Proxy>) {
     let cfg = ProxyConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         upstream,
@@ -318,6 +328,8 @@ async fn start_proxy(upstream: SocketAddr, password: &str) -> (SocketAddr, Arc<P
         username: "admin".into(),
         password: password.into(),
         log_level: LogLevel::Info,
+        speed_target,
+        peering,
     };
     let proxy = Proxy::new(&cfg).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -429,6 +441,11 @@ async fn index_html_gets_base_href_and_shim_for_the_ingress_path() {
         html.contains(&format!("href=\"{PREFIX}/swagger/\"")),
         "absolute link prefixed"
     );
+    // The status bar comes with the web UI.
+    assert!(html.contains("rbittorrent-status-bar"), "{html}");
+    assert!(html.contains("Direct Connection (Unprotected)"));
+    assert!(html.contains(&format!("D=\"{}\"", ingress::DOCS_URL)));
+    assert!(html.is_ascii(), "injected markup is pure ASCII");
 }
 
 #[tokio::test]
@@ -690,6 +707,7 @@ async fn health_endpoint_follows_rtbit_and_the_tunnel() {
         tunnel: false,
         port: None,
         detail: "connecting the WireGuard tunnel".into(),
+        ..Health::default()
     });
     let (status, v) = check().await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -700,6 +718,7 @@ async fn health_endpoint_follows_rtbit_and_the_tunnel() {
         tunnel: true,
         port: Some(45678),
         detail: String::new(),
+        ..Health::default()
     });
     let (status, v) = check().await;
     assert_eq!(status, StatusCode::OK, "{v}");
@@ -718,6 +737,7 @@ async fn health_endpoint_follows_rtbit_and_the_tunnel() {
         tunnel: false,
         port: Some(45678),
         detail: String::new(),
+        ..Health::default()
     });
     let (status, v) = check().await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -749,4 +769,289 @@ async fn rtbit_down_shows_a_starting_page_never_a_blank_one() {
             .starts_with("text/plain")
     );
     assert!(String::from_utf8_lossy(&body).contains("not reachable yet"));
+}
+
+#[tokio::test]
+async fn health_in_direct_mode_needs_no_tunnel() {
+    let (up, mock) = start_mock().await;
+    let (proxy, state) = start_proxy(up, PASSWORD).await;
+    state.set_health(Health {
+        rtbit: true,
+        tunnel: false,
+        port: Some(4240),
+        direct: true,
+        ..Health::default()
+    });
+    let (status, _, body) = body_of(send(proxy, get(ingress::HEALTH_PATH, &[])).await).await;
+    let v = json(&body);
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["vpn"], false);
+    assert_eq!(v["port"], 4240);
+    assert_eq!(
+        v["message"],
+        "rtbit is running on a direct connection (VPN off)"
+    );
+
+    // Still unhealthy when rtbit itself is down.
+    mock.healthz.store(500, Ordering::SeqCst);
+    let (status, _, _) = body_of(send(proxy, get(ingress::HEALTH_PATH, &[])).await).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    // VPN mode reports the exit address for the status bar.
+    mock.healthz.store(200, Ordering::SeqCst);
+    state.set_health(Health {
+        rtbit: true,
+        tunnel: true,
+        port: Some(45678),
+        public_ip: Some("185.159.156.1".parse().unwrap()),
+        ..Health::default()
+    });
+    let (status, _, body) = body_of(send(proxy, get(ingress::HEALTH_PATH, &[])).await).await;
+    let v = json(&body);
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["vpn"], true);
+    assert_eq!(v["public_ip"], "185.159.156.1");
+}
+
+/// A plain-HTTP stand-in for Cloudflare's speed-test endpoints.
+async fn start_speed_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(|req: Request<Incoming>| async move {
+                    let path = req.uri().path().to_owned();
+                    let query = req.uri().query().unwrap_or_default().to_owned();
+                    let resp: Response<Body> = if path == "/cdn-cgi/trace" {
+                        Response::new(full("fl=1\nip=203.0.113.7\ncolo=TST\nloc=BE\n"))
+                    } else if path == "/__down" {
+                        let n: u64 = query
+                            .strip_prefix("bytes=")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap();
+                        let (mut tx, body) = Channel::<Bytes, Infallible>::new(4);
+                        tokio::spawn(async move {
+                            let chunk = Bytes::from(vec![7u8; 256 << 10]);
+                            let mut left = n;
+                            while left > 0 {
+                                let take = left.min(chunk.len() as u64);
+                                let part = chunk.slice(..usize::try_from(take).unwrap());
+                                if tx.send(Frame::data(part)).await.is_err() {
+                                    return;
+                                }
+                                left -= take;
+                                // ~1 GB/s at most: enough to measure, gentle on CI.
+                                tokio::time::sleep(Duration::from_micros(250)).await;
+                            }
+                        });
+                        Response::new(body.boxed_unsync())
+                    } else {
+                        let mut r = Response::new(full("not found"));
+                        *r.status_mut() = StatusCode::NOT_FOUND;
+                        r
+                    };
+                    Ok::<_, Infallible>(resp)
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+fn post_benchmark(headers: &[(&str, &str)]) -> Request<Body> {
+    let mut r = Request::builder()
+        .method(Method::POST)
+        .uri(ingress::BENCHMARK_PATH)
+        .body(full("{}"))
+        .unwrap();
+    r.headers_mut()
+        .insert("x-ingress-path", HeaderValue::from_static(PREFIX));
+    for (k, v) in headers {
+        r.headers_mut().insert(
+            hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+            HeaderValue::from_str(v).unwrap(),
+        );
+    }
+    r
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn speed_test_measures_network_disk_and_hashing_on_demand() {
+    let (up, _mock) = start_mock().await;
+    let speed = start_speed_server().await;
+    let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = peer_listener.local_addr().unwrap();
+    let (proxy, state) = start_proxy_with(
+        up,
+        PASSWORD,
+        Some(SpeedTarget {
+            host: "speed.test".into(),
+            port: speed.port(),
+            tls: false,
+            connect_to: Some(speed),
+        }),
+        Some(vec![PeeringTarget {
+            name: "Local".into(),
+            addr: peer,
+        }]),
+    )
+    .await;
+
+    // The supervisor's half: a real disk test in a temporary folder.
+    let dir = std::env::temp_dir().join(format!("rbt-ingress-bench-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    state.connect_supervisor(tx);
+    let link = state.clone();
+    let work_dir = dir.clone();
+    tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            let req: ProxyRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(req, ProxyRequest::Hardware);
+            let d = work_dir.clone();
+            let r = tokio::task::spawn_blocking(move || benchmark::run_hardware(&d, 2))
+                .await
+                .unwrap();
+            link.deliver_hardware(r);
+        }
+    });
+
+    // Only POST, only JSON, never cross-site.
+    let (status, h, _) = body_of(send(proxy, get(ingress::BENCHMARK_PATH, &[])).await).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(h["allow"], "POST");
+    let (status, _, _) = body_of(send(proxy, post_benchmark(&[])).await).await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let (status, _, _) = body_of(
+        send(
+            proxy,
+            post_benchmark(&[
+                ("content-type", "application/json"),
+                ("sec-fetch-site", "cross-site"),
+            ]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Direct mode: download, latency, public IP, peering, disk and SHA-1.
+    state.set_health(Health {
+        rtbit: true,
+        direct: true,
+        port: Some(4240),
+        ..Health::default()
+    });
+    let started = std::time::Instant::now();
+    let (status, _, body) = body_of(
+        send(
+            proxy,
+            post_benchmark(&[
+                ("content-type", "application/json"),
+                ("sec-fetch-site", "same-origin"),
+            ]),
+        )
+        .await,
+    )
+    .await;
+    let v = json(&body);
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert!(
+        started.elapsed() >= benchmark::DOWNLOAD_WINDOW,
+        "6 s window"
+    );
+    assert!(started.elapsed() < Duration::from_secs(20), "{v}");
+    assert_eq!(v["mode"], "direct");
+    assert_eq!(v["route"], "eth0");
+    let n = &v["network"];
+    assert!(n["download_mbps"].as_f64().unwrap() > 1.0, "{v}");
+    assert!(n["downloaded_bytes"].as_u64().unwrap() > 1_000_000, "{v}");
+    assert!(n["latency_ms"].as_f64().is_some(), "{v}");
+    assert_eq!(n["colo"], "TST");
+    assert_eq!(n["country"], "BE");
+    assert_eq!(n["public_ip"], "203.0.113.7");
+    assert_eq!(n["streams"], benchmark::STREAMS);
+    assert!(n["error"].is_null(), "{v}");
+    assert_eq!(n["peering"][0]["name"], "Local");
+    assert!(n["peering"][0]["ms"].as_f64().is_some(), "{v}");
+    let hw = &v["hardware"];
+    assert!(hw["disk_write_mb_s"].as_f64().unwrap() > 0.0, "{v}");
+    assert!(hw["sha1_mb_s"].as_f64().unwrap() > 0.0, "{v}");
+    assert_eq!(hw["cpu_cores"], 2);
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        0,
+        "test file deleted"
+    );
+
+    // A cooldown between runs.
+    let (status, h, _) = body_of(
+        send(
+            proxy,
+            post_benchmark(&[("content-type", "application/json")]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(h.contains_key("retry-after"));
+
+    // VPN mode with the tunnel down: the kill-switch blocks the network
+    // half, the disk half still runs, and peering is never probed.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    state.set_health(Health {
+        rtbit: false,
+        tunnel: false,
+        ..Health::default()
+    });
+    let (status, _, body) = body_of(
+        send(
+            proxy,
+            post_benchmark(&[("content-type", "application/json")]),
+        )
+        .await,
+    )
+    .await;
+    let v = json(&body);
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["route"], "wg0");
+    assert!(
+        v["network"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("kill-switch"),
+        "{v}"
+    );
+    assert!(v["network"]["peering"].as_array().unwrap().is_empty());
+    assert!(v["hardware"]["sha1_mb_s"].as_f64().is_some());
+    drop(peer_listener);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn speed_test_without_the_supervisor_link_reports_why() {
+    let (up, _mock) = start_mock().await;
+    let (proxy, state) = start_proxy(up, PASSWORD).await;
+    state.set_health(Health {
+        rtbit: false,
+        tunnel: false,
+        ..Health::default()
+    });
+    let (status, _, body) = body_of(
+        send(
+            proxy,
+            post_benchmark(&[("content-type", "application/json")]),
+        )
+        .await,
+    )
+    .await;
+    let v = json(&body);
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert!(v["hardware"].is_null());
+    assert_eq!(v["hardware_error"], "not connected to the supervisor");
 }

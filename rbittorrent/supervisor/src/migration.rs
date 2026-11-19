@@ -1253,8 +1253,12 @@ mod tests {
             resume(&save.display().to_string()),
         )
         .unwrap();
-        let (data, info) =
-            prepare_upload(&t, &t.with_extension("fastresume"), &[base.clone()]).unwrap();
+        let (data, info) = prepare_upload(
+            &t,
+            &t.with_extension("fastresume"),
+            std::slice::from_ref(&base),
+        )
+        .unwrap();
         assert_eq!(data, b"d4:infod4:name1:xee");
         assert_eq!(info.content_layout, "Original");
         assert!(!path_allowed("/share/../etc", &default_data_roots()));

@@ -20,18 +20,27 @@
 //! * answers with a self-refreshing "starting" page while rtbit is down
 //!   (waiting for the VPN, port change), never with a blank page,
 //! * serves `GET /__health` for Home Assistant's watchdog: `200` only while
-//!   rtbit runs, the WireGuard handshake is fresh and rtbit answers.
+//!   rtbit runs, the WireGuard handshake is fresh (VPN mode) and rtbit
+//!   answers,
+//! * adds a status bar to the web UI: a dismissible "Direct Connection
+//!   (Unprotected)" notice with setup links while the VPN is off, a green
+//!   "VPN Protected" pill while it is on, both with a speed-test button,
+//! * serves `POST /__benchmark`, the on-demand speed test (see
+//!   [`crate::benchmark`]): nothing of it exists until the button is pressed.
 //!
 //! It runs as its own process with uid/gid 65534 and no capabilities. Its
 //! stdin is a pipe from the supervisor: the first line is the configuration
-//! (including the password), every further line a [`Health`] heartbeat.
+//! (including the password), every further line a [`Health`] heartbeat or
+//! the answer to a request. Its stdout is a pipe the other way, for requests
+//! ([`ProxyRequest`]: the disk half of the speed test needs the supervisor's
+//! access to the download folder); its log goes to stderr.
 
 use std::convert::Infallible;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -45,9 +54,10 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
+use crate::benchmark::{self, HardwareResult, PeeringTarget, SpeedTarget};
 use crate::cidr::Ipv4Cidr;
 use crate::config::LogLevel;
 
@@ -79,6 +89,15 @@ const HEALTH_STALE_AFTER: Duration = Duration::from_secs(90);
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Path of the watchdog endpoint (`watchdog:` in config.yaml).
 pub const HEALTH_PATH: &str = "/__health";
+/// Path of the on-demand speed test.
+pub const BENCHMARK_PATH: &str = "/__benchmark";
+/// After a speed test, wait this long before the next one.
+const BENCHMARK_COOLDOWN: Duration = Duration::from_secs(10);
+/// How long the supervisor may take for the disk/SHA-1 half.
+const HARDWARE_TIMEOUT: Duration = Duration::from_secs(20);
+/// The setup guides the status bar links to.
+pub const DOCS_URL: &str =
+    "https://github.com/evw-sigib/new_rbittorrent/blob/main/rbittorrent/DOCS.md";
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// Body type used for every request and response the proxy produces.
@@ -99,6 +118,12 @@ pub struct ProxyConfig {
     pub password: String,
     #[serde(default)]
     pub log_level: LogLevel,
+    /// Speed-test server; `None` is Cloudflare (only tests change it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_target: Option<SpeedTarget>,
+    /// Regional peering targets; `None` is [`benchmark::default_peering`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peering: Option<Vec<PeeringTarget>>,
 }
 
 impl fmt::Debug for ProxyConfig {
@@ -127,6 +152,33 @@ pub struct Health {
     /// Human-readable state, e.g. "waiting for the WireGuard handshake".
     #[serde(default)]
     pub detail: String,
+    /// Direct connection: the VPN is off (no tunnel to check).
+    #[serde(default)]
+    pub direct: bool,
+    /// The VPN exit address NAT-PMP reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_ip: Option<Ipv4Addr>,
+}
+
+/// A request from the proxy to the supervisor (one JSON line on stdout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "request", rename_all = "snake_case")]
+pub enum ProxyRequest {
+    /// Run [`benchmark::run_hardware`] and answer with [`hardware_line`].
+    Hardware,
+}
+
+/// A line from the supervisor after the configuration.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum SupervisorLine {
+    Hardware { hardware: HardwareResult },
+    Health(Health),
+}
+
+/// The supervisor's answer to [`ProxyRequest::Hardware`].
+pub fn hardware_line(r: &HardwareResult) -> String {
+    serde_json::json!({ "hardware": r }).to_string()
 }
 
 /// Entry point of `rbittorrent-supervisor ingress-proxy`.
@@ -182,7 +234,8 @@ async fn run_from_stdin() -> ExitCode {
         }
     };
     line.clear();
-    crate::init_logging(cfg.log_level);
+    // stdout belongs to the request channel.
+    crate::init_logging_stderr(cfg.log_level);
     match run(cfg, stdin).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -196,6 +249,22 @@ async fn run(cfg: ProxyConfig, mut status: impl tokio::io::AsyncBufRead + Unpin)
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).context("SIGTERM handler")?;
     let proxy = Proxy::new(&cfg)?;
+    match stdout_pipe() {
+        Ok(mut out) => {
+            let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+            proxy.connect_supervisor(tx);
+            tokio::spawn(async move {
+                while let Some(mut line) = rx.recv().await {
+                    line.push('\n');
+                    if let Err(e) = out.write_all(line.as_bytes()).await {
+                        debug!("request pipe to the supervisor: {e}");
+                        return;
+                    }
+                }
+            });
+        }
+        Err(e) => debug!("no request pipe to the supervisor ({e}); the disk speed test is off"),
+    }
     let listener = TcpListener::bind(cfg.listen)
         .await
         .with_context(|| format!("cannot listen on {}", cfg.listen))?;
@@ -215,8 +284,9 @@ async fn run(cfg: ProxyConfig, mut status: impl tokio::io::AsyncBufRead + Unpin)
                 .await
             {
                 Ok(0) => return "the supervisor closed the status pipe",
-                Ok(_) => match serde_json::from_str::<Health>(line.trim()) {
-                    Ok(h) => proxy.set_health(h),
+                Ok(_) => match serde_json::from_str::<SupervisorLine>(line.trim()) {
+                    Ok(SupervisorLine::Health(h)) => proxy.set_health(h),
+                    Ok(SupervisorLine::Hardware { hardware }) => proxy.deliver_hardware(hardware),
                     Err(e) => debug!("ignoring a malformed status line: {e}"),
                 },
                 Err(e) => {
@@ -237,6 +307,15 @@ async fn run(cfg: ProxyConfig, mut status: impl tokio::io::AsyncBufRead + Unpin)
             Ok(())
         }
     }
+}
+
+/// stdout as a non-blocking pipe for requests to the supervisor.
+fn stdout_pipe() -> std::io::Result<tokio::net::unix::pipe::Sender> {
+    use std::os::fd::AsFd;
+    std::io::stdout()
+        .as_fd()
+        .try_clone_to_owned()
+        .and_then(tokio::net::unix::pipe::Sender::from_owned_fd)
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +386,25 @@ pub struct Proxy {
     rejected: AtomicU64,
     last_reject_log: std::sync::Mutex<Option<Instant>>,
     health: std::sync::Mutex<Option<(Health, Instant)>>,
+    speed_target: SpeedTarget,
+    peering: Vec<PeeringTarget>,
+    supervisor_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>,
+    hardware_waiter: std::sync::Mutex<Option<oneshot::Sender<HardwareResult>>>,
+    benchmark_busy: AtomicBool,
+    benchmark_done: std::sync::Mutex<Option<Instant>>,
+}
+
+/// Clears the "speed test running" flag however the test ends.
+struct BusyGuard<'a>(&'a AtomicBool);
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl fmt::Debug for Proxy {
@@ -345,7 +443,130 @@ impl Proxy {
             rejected: AtomicU64::new(0),
             last_reject_log: std::sync::Mutex::new(None),
             health: std::sync::Mutex::new(None),
+            speed_target: cfg.speed_target.clone().unwrap_or_default(),
+            peering: cfg
+                .peering
+                .clone()
+                .unwrap_or_else(benchmark::default_peering),
+            supervisor_tx: std::sync::Mutex::new(None),
+            hardware_waiter: std::sync::Mutex::new(None),
+            benchmark_busy: AtomicBool::new(false),
+            benchmark_done: std::sync::Mutex::new(None),
         }))
+    }
+
+    /// Where requests to the supervisor go (see [`ProxyRequest`]).
+    pub fn connect_supervisor(&self, tx: mpsc::UnboundedSender<String>) {
+        *lock(&self.supervisor_tx) = Some(tx);
+    }
+
+    /// The supervisor's answer to [`ProxyRequest::Hardware`].
+    pub fn deliver_hardware(&self, r: HardwareResult) {
+        if let Some(waiter) = lock(&self.hardware_waiter).take() {
+            let _ = waiter.send(r);
+        }
+    }
+
+    async fn request_hardware(&self) -> Result<HardwareResult, String> {
+        let tx = lock(&self.supervisor_tx)
+            .clone()
+            .ok_or_else(|| "not connected to the supervisor".to_owned())?;
+        let (waiter, answer) = oneshot::channel();
+        *lock(&self.hardware_waiter) = Some(waiter);
+        let line = serde_json::to_string(&ProxyRequest::Hardware).map_err(|e| e.to_string())?;
+        tx.send(line)
+            .map_err(|_| "the link to the supervisor is closed".to_owned())?;
+        match tokio::time::timeout(HARDWARE_TIMEOUT, answer).await {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(_)) => Err("the supervisor did not answer".to_owned()),
+            Err(_) => Err(format!(
+                "the disk test took longer than {}s",
+                HARDWARE_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
+    /// `POST /__benchmark`: one test at a time, JSON-only (a plain form or
+    /// link from another site cannot trigger it), with a short cooldown.
+    async fn benchmark_response(&self, h: &HeaderMap) -> Response<ProxyBody> {
+        let is_json = h
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("application/json")
+            });
+        if !is_json {
+            return json_error(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "send the request with Content-Type: application/json",
+            );
+        }
+        if let Some(site) = h.get("sec-fetch-site").and_then(|v| v.to_str().ok())
+            && !matches!(site, "same-origin" | "none")
+        {
+            return json_error(StatusCode::FORBIDDEN, "cross-site requests are refused");
+        }
+        if self.benchmark_busy.swap(true, Ordering::AcqRel) {
+            return too_many("a speed test is already running", 10);
+        }
+        let _busy = BusyGuard(&self.benchmark_busy);
+        if let Some(done) = *lock(&self.benchmark_done) {
+            let wait = BENCHMARK_COOLDOWN.saturating_sub(done.elapsed());
+            if !wait.is_zero() {
+                return too_many(
+                    "please wait a few seconds between tests",
+                    wait.as_secs().max(1),
+                );
+            }
+        }
+
+        let health = self.current_health().map(|(h, _)| h);
+        let direct = health.as_ref().is_some_and(|h| h.direct);
+        let route = if direct { "eth0" } else { "wg0" };
+        info!("speed test started (route {route})");
+        let started = Instant::now();
+        // Disk and SHA-1 first (well under a second), so they never compete
+        // with the download for the CPU.
+        let (hardware, hardware_error) = match self.request_hardware().await {
+            Ok(r) => (Some(r), None),
+            Err(e) => (None, Some(e)),
+        };
+        let network = if !direct && !health.as_ref().is_some_and(|h| h.tunnel) {
+            benchmark::NetworkResult {
+                error: Some(
+                    "the VPN tunnel is down, so the kill-switch blocks all traffic; \
+                     try again once it is connected"
+                        .to_owned(),
+                ),
+                ..benchmark::NetworkResult::default()
+            }
+        } else {
+            let peering = if direct {
+                self.peering.clone()
+            } else {
+                Vec::new()
+            };
+            benchmark::run_network(self.speed_target.clone(), peering).await
+        };
+        *lock(&self.benchmark_done) = Some(Instant::now());
+        info!(
+            "speed test finished in {:.1}s: download {} Mbit/s, disk {} MB/s, SHA-1 {} MB/s",
+            started.elapsed().as_secs_f64(),
+            opt_num(network.download_mbps),
+            opt_num(hardware.as_ref().and_then(|h| h.disk_write_mb_s)),
+            opt_num(hardware.as_ref().and_then(|h| h.sha1_mb_s)),
+        );
+        let body = serde_json::json!({
+            "mode": if direct { "direct" } else { "vpn" },
+            "route": route,
+            "network": network,
+            "hardware": hardware,
+            "hardware_error": hardware_error,
+            "seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+        });
+        json(StatusCode::OK, &body.to_string())
     }
 
     /// Records the supervisor's latest view of rtbit and the tunnel.
@@ -364,8 +585,8 @@ impl Proxy {
             .map(|(h, at)| (h.clone(), at.elapsed()))
     }
 
-    /// `GET /__health`: 200 only when rtbit runs, the tunnel is fresh, the
-    /// supervisor is alive and rtbit's own `/healthz` answers.
+    /// `GET /__health`: 200 only when rtbit runs, the tunnel is fresh (VPN
+    /// mode), the supervisor is alive and rtbit's own `/healthz` answers.
     async fn health_response(&self) -> Response<ProxyBody> {
         let (health, age) = match self.current_health() {
             Some(x) => x,
@@ -376,7 +597,7 @@ impl Proxy {
                 "no status from the supervisor for {}s",
                 age.as_secs()
             ))
-        } else if !health.tunnel {
+        } else if !health.direct && !health.tunnel {
             Some(non_empty(
                 &health.detail,
                 "the WireGuard tunnel has no recent handshake",
@@ -388,6 +609,11 @@ impl Proxy {
         };
         match problem {
             Some(p) => health_json(false, &p, Some(&health)),
+            None if health.direct => health_json(
+                true,
+                "rtbit is running on a direct connection (VPN off)",
+                Some(&health),
+            ),
             None => health_json(true, "rtbit is running behind the VPN", Some(&health)),
         }
     }
@@ -649,6 +875,15 @@ impl Proxy {
         if path == HEALTH_PATH && matches!(method, Method::GET | Method::HEAD) {
             return self.health_response().await;
         }
+        if path == BENCHMARK_PATH {
+            if method != Method::POST {
+                let mut r = json_error(StatusCode::METHOD_NOT_ALLOWED, "use POST");
+                r.headers_mut()
+                    .insert(header::ALLOW, HeaderValue::from_static("POST"));
+                return r;
+            }
+            return self.benchmark_response(req.headers()).await;
+        }
 
         // The sidebar is already signed in: tell the web UI that no login is needed.
         if method == Method::GET && path == "/auth/status" && self.bearer().await.is_some() {
@@ -772,7 +1007,7 @@ impl Proxy {
                 return text(StatusCode::BAD_GATEWAY, "rtbit sent an unreadable page");
             }
         };
-        let out = Bytes::from(rewrite_html(&html, prefix, base_dir(path)));
+        let out = Bytes::from(rewrite_page(&html, prefix, base_dir(path), is_web_ui(path)));
         for h in [
             header::CONTENT_LENGTH,
             header::ETAG,
@@ -1134,6 +1369,79 @@ function nav(e){var a=e.target&&e.target.closest?e.target.closest("a[href],area[
 document.addEventListener("click",nav,true);document.addEventListener("auxclick",nav,true);
 document.addEventListener("submit",function(e){var f=e.target;if(!f||!f.getAttribute)return;var a=f.getAttribute("action"),n=fix(a);if(a&&n!==a)f.setAttribute("action",n);},true);})();"##;
 
+/// The status bar on top of the web UI (Ingress only). It polls
+/// `/__health`, shows the VPN state and opens the speed-test dialog. All
+/// text is set with `textContent`, styles live in a shadow root so neither
+/// the bar nor rtbit's UI can restyle the other, and the "Dismiss" choice is
+/// kept per browser in `localStorage`. ASCII only (emoji as `\u` escapes).
+const STATUS_BAR: &str = r##"(function(){var P=__INGRESS_PATH__,D=__DOCS__,K="rbittorrent.directBarDismissed";
+if(!document.head)return;
+function store(v){try{if(v===undefined)return localStorage.getItem(K);localStorage.setItem(K,v);}catch(e){}return null;}
+var g=document.createElement("style");g.textContent="html.rbt-bar body{padding-top:var(--rbt-bar-h)!important;box-sizing:border-box}html.rbt-bar .h-dvh,html.rbt-bar .h-screen{height:calc(100dvh - var(--rbt-bar-h))!important}";document.head.appendChild(g);
+var CSS=":host{all:initial}*{box-sizing:border-box;font:13px/1.25 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}"+
+".bar{display:flex;align-items:center;gap:8px;padding:0 12px;overflow-x:auto;white-space:nowrap;scrollbar-width:none}.bar::-webkit-scrollbar{display:none}"+
+".direct{height:36px;background:#fff4e5;color:#5c3400;border-bottom:1px solid #ffb74d}.vpn{height:32px;background:#f1f8f2;color:#1b5e20;border-bottom:1px solid #c8e6c9}"+
+".label{font-weight:600;flex:none}.pill{flex:none;font-weight:600;color:#fff;background:#2e7d32;border-radius:999px;padding:3px 10px}.pill.down{background:#a15c00}"+
+".b{flex:none;font-weight:500;color:inherit;background:transparent;border:1px solid currentColor;border-radius:6px;padding:4px 10px;cursor:pointer;text-decoration:none}"+
+".b:hover{background:rgba(127,127,127,.12)}.b:focus-visible,.l:focus-visible{outline:2px solid #1565c0;outline-offset:2px}"+
+".primary{background:#1565c0;border-color:#1565c0;color:#fff}.primary:hover{background:#0d47a1}.l{flex:none;color:inherit;text-decoration:underline}.x{margin-left:auto}"+
+".overlay{position:fixed;inset:0;z-index:2147483001;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,.45)}"+
+".modal{width:100%;max-width:440px;max-height:90vh;overflow:auto;background:#fff;color:#212121;border-radius:12px;padding:16px 18px;box-shadow:0 10px 40px rgba(0,0,0,.3)}"+
+".modal h2{font-size:16px;font-weight:700;margin:0 0 10px}.modal h3{font-size:13px;font-weight:700;margin:14px 0 4px}"+
+".row{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px solid rgba(127,127,127,.2)}.k{color:#666}.v{font-weight:600;text-align:right;white-space:normal}"+
+".muted{color:#666;white-space:normal}.err{color:#c62828;white-space:normal}.foot{display:flex;justify-content:flex-end;margin-top:14px}.modal .b{border-color:rgba(127,127,127,.6)}"+
+".spin{width:26px;height:26px;margin:12px auto;border:3px solid rgba(127,127,127,.3);border-top-color:#1565c0;border-radius:50%;animation:s 1s linear infinite}@keyframes s{to{transform:rotate(360deg)}}"+
+"@media (prefers-color-scheme:dark){.direct{background:#2b1d00;color:#ffcc80;border-color:#7a4f00}.vpn{background:#0f2214;color:#a5d6a7;border-color:#1e4620}"+
+".modal{background:#1e1e1e;color:#e6e6e6}.k,.muted{color:#aaa}.err{color:#ef9a9a}}";
+var host=null,root=null,bar=null,modal=null,state="",last=null;
+function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e;}
+function btn(c,x,f){var b=el("button",c,x);b.type="button";b.addEventListener("click",f);return b;}
+function link(c,x,h){var a=el("a",c,x);a.href=h;a.target="_blank";a.rel="noopener noreferrer";return a;}
+function offset(px){var d=document.documentElement;if(px){d.style.setProperty("--rbt-bar-h",px+"px");d.classList.add("rbt-bar");}else d.classList.remove("rbt-bar");}
+function ensure(){if(host)return true;if(!document.body)return false;host=el("div");host.id="rbittorrent-status-bar";host.style.cssText="position:fixed;top:0;left:0;right:0;z-index:2147483000";
+root=host.attachShadow?host.attachShadow({mode:"open"}):host;var s=el("style");s.textContent=CSS;root.appendChild(s);bar=el("div","bar");root.appendChild(bar);document.body.appendChild(host);return true;}
+function render(h){var key="";
+if(h&&h.vpn===false)key=store()==="1"?"":"direct";else if(h&&h.vpn===true)key=h.tunnel?"vpn|"+(h.public_ip||"")+"|"+(h.port||""):"down";
+if(key===state&&(!key||host))return;if(key&&!ensure())return;state=key;
+if(!key){if(host)host.style.display="none";offset(0);return;}
+host.style.display="";bar.textContent="";
+if(key==="direct"){bar.className="bar direct";bar.setAttribute("role","status");
+bar.appendChild(el("span","label","\uD83D\uDD13 Direct Connection (Unprotected)"));
+bar.appendChild(btn("b","\u26A1 Speed Test",speed));
+bar.appendChild(link("b primary","\uD83D\uDCD8 Proton VPN Setup",D+"#proton-vpn-setup"));
+bar.appendChild(link("l","Custom / Static WireGuard",D+"#other-wireguard-providers-static-port"));
+var x=btn("b x","\u2715 Dismiss",function(){store("1");render(last);});x.title="Hide this notice for good in this browser";bar.appendChild(x);offset(36);}
+else{bar.className="bar vpn";bar.setAttribute("role","status");var p=el("span",key==="down"?"pill down":"pill");
+if(key==="down")p.textContent="\uD83D\uDD12 VPN reconnecting (kill-switch on)";
+else{var d=[];if(h.public_ip)d.push(h.public_ip);if(h.port)d.push("Port "+h.port);p.textContent="\uD83D\uDD12 VPN Protected"+(d.length?" ("+d.join(" \u2022 ")+")":"");}
+bar.appendChild(p);if(key!=="down")bar.appendChild(btn("b","\u26A1 Test VPN Speed",speed));offset(32);}}
+function row(t,k,v){var r=el("div","row");r.appendChild(el("span","k",k));r.appendChild(el("span","v",v));t.appendChild(r);}
+function num(v,u){return typeof v==="number"?v.toLocaleString(undefined,{maximumFractionDigits:1})+" "+u:"\u2014";}
+function shut(){if(modal){root.removeChild(modal);modal=null;document.removeEventListener("keydown",esc,true);}}
+function esc(e){if(e.key==="Escape")shut();}
+function show(b,st,j){b.textContent="";if(st!==200||!j){b.appendChild(el("p","err",(j&&j.error)||("The test could not run (HTTP "+st+").")));return;}
+var n=j.network||{},hw=j.hardware,t=el("div");
+row(t,"Route",j.route==="wg0"?"wg0 (VPN tunnel)":"eth0 (direct)");
+row(t,"Download",num(n.download_mbps,"Mbit/s"));
+row(t,"Latency",typeof n.latency_ms==="number"?num(n.latency_ms,"ms")+(n.colo?" ("+n.colo+(n.country?", "+n.country:"")+")":""):"\u2014");
+row(t,"Public IP",n.public_ip||"\u2014");
+if(hw){row(t,"Disk write",typeof hw.disk_write_mb_s==="number"?num(hw.disk_write_mb_s,"MB/s"):(hw.disk_error||"\u2014"));row(t,"SHA-1 hashing",num(hw.sha1_mb_s,"MB/s")+" ("+hw.cpu_cores+" cores)");}
+else row(t,"Disk / CPU",j.hardware_error||"\u2014");
+b.appendChild(t);
+if(n.peering&&n.peering.length){b.appendChild(el("h3",null,"Regional peering"));var q=el("div");n.peering.forEach(function(x){row(q,x.name+" ("+x.address+")",typeof x.ms==="number"?num(x.ms,"ms"):"no answer");});b.appendChild(q);}
+if(n.error)b.appendChild(el("p","err",n.error));
+b.appendChild(el("p","muted",j.route==="wg0"?"Measured through the VPN tunnel with Cloudflare's speed test.":"Measured on your normal connection with Cloudflare's speed test. With the VPN on, the test runs through the tunnel."));}
+function speed(){if(modal||!ensure())return;modal=el("div","overlay");var box=el("div","modal");box.setAttribute("role","dialog");box.setAttribute("aria-modal","true");box.setAttribute("aria-label","Speed test");
+box.appendChild(el("h2",null,"\u26A1 Speed test"));var b=el("div");b.appendChild(el("p","muted","Measuring download, latency, disk and hashing speed (about 10 seconds)\u2026"));b.appendChild(el("div","spin"));box.appendChild(b);
+var f=el("div","foot"),c=btn("b","Close",shut);f.appendChild(c);box.appendChild(f);modal.appendChild(box);
+modal.addEventListener("click",function(e){if(e.target===modal)shut();});document.addEventListener("keydown",esc,true);root.appendChild(modal);c.focus();
+fetch(P+"/__benchmark",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}",cache:"no-store",credentials:"same-origin"})
+.then(function(r){return r.json().then(function(j){return[r.status,j];},function(){return[r.status,null];});})
+.then(function(x){show(b,x[0],x[1]);},function(e){b.textContent="";b.appendChild(el("p","err","The test could not run: "+e));});}
+function poll(){fetch(P+"/__health",{cache:"no-store",credentials:"same-origin"}).then(function(r){return r.json();}).then(function(h){last=h;render(h);},function(){})
+.then(function(){setTimeout(poll,document.hidden?60000:15000);});}
+if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",poll);else poll();})();"##;
+
 /// Directory of a request path (`/web/index.html` -> `/web/`).
 fn base_dir(path: &str) -> &str {
     path.rfind('/').and_then(|i| path.get(..=i)).unwrap_or("/")
@@ -1236,14 +1544,34 @@ fn prefix_root_relative_attrs(html: &[u8], prefix: &[u8]) -> Vec<u8> {
 /// Injects `<base href>` and the URL shim and prefixes root-relative
 /// attributes. `prefix` must come from [`ingress_prefix`].
 pub fn rewrite_html(html: &[u8], prefix: &str, dir: &str) -> Vec<u8> {
+    rewrite_page(html, prefix, dir, false)
+}
+
+/// The web UI itself (not Swagger or other pages): gets the status bar.
+fn is_web_ui(path: &str) -> bool {
+    path == "/web" || path.starts_with("/web/")
+}
+
+/// [`rewrite_html`], plus the status bar when `status_bar` is set.
+pub fn rewrite_page(html: &[u8], prefix: &str, dir: &str, status_bar: bool) -> Vec<u8> {
     let body = prefix_root_relative_attrs(html, prefix.as_bytes());
     let at = injection_point(&body);
     let prefix_js = serde_json::to_string(prefix).unwrap_or_else(|_| "\"\"".to_owned());
-    let snippet = format!(
+    let mut snippet = format!(
         "<base href=\"{}\"><script>{}</script>",
         html_escape(&format!("{prefix}{dir}")),
         SHIM.replace("__INGRESS_PATH__", &prefix_js)
     );
+    if status_bar {
+        let docs_js = serde_json::to_string(DOCS_URL).unwrap_or_else(|_| "\"\"".to_owned());
+        snippet.push_str("<script>");
+        snippet.push_str(
+            &STATUS_BAR
+                .replace("__INGRESS_PATH__", &prefix_js)
+                .replace("__DOCS__", &docs_js),
+        );
+        snippet.push_str("</script>");
+    }
     let mut out = Vec::with_capacity(body.len() + snippet.len());
     out.extend_from_slice(body.get(..at).unwrap_or_default());
     out.extend_from_slice(snippet.as_bytes());
@@ -1289,6 +1617,9 @@ fn health_json(ok: bool, message: &str, h: Option<&Health>) -> Response<ProxyBod
         "rtbit": h.is_some_and(|h| h.rtbit),
         "tunnel": h.is_some_and(|h| h.tunnel),
         "port": h.and_then(|h| h.port),
+        // Unknown (null) until the supervisor's first heartbeat.
+        "vpn": h.map(|h| !h.direct),
+        "public_ip": h.and_then(|h| h.public_ip),
     })
     .to_string();
     let status = if ok {
@@ -1307,6 +1638,21 @@ fn json(status: StatusCode, body: &str) -> Response<ProxyBody> {
     respond(status, "application/json", body)
 }
 
+fn json_error(status: StatusCode, message: &str) -> Response<ProxyBody> {
+    json(status, &serde_json::json!({ "error": message }).to_string())
+}
+
+fn too_many(message: &str, retry_after_secs: u64) -> Response<ProxyBody> {
+    let mut r = json_error(StatusCode::TOO_MANY_REQUESTS, message);
+    r.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(retry_after_secs));
+    r
+}
+
+fn opt_num(v: Option<f64>) -> String {
+    v.map_or_else(|| "-".to_owned(), |v| format!("{v:.1}"))
+}
+
 const STARTING_PAGE: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="5">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1319,9 +1665,9 @@ main{max-width:36rem;margin:12vh auto;padding:0 16px}
 p{color:var(--muted)}
 </style></head><body><main>
 <h1>rBittorrent is starting&hellip;</h1>
-<p>The torrent engine is not reachable yet. It only starts once the Proton VPN
-tunnel is up and the kill-switch is active, and it restarts for a few seconds
-when the forwarded port changes.</p>
+<p>The torrent engine is not reachable yet. With the VPN on, it only starts
+once the WireGuard tunnel is up and the kill-switch is active, and it restarts
+for a few seconds when the forwarded port changes.</p>
 <p>This page reloads every 5 seconds. If it stays here, open the app's
 <strong>Log</strong> tab in Home Assistant.</p>
 </main></body></html>
@@ -1546,6 +1892,8 @@ mod tests {
             username: "admin".into(),
             password: "pw".into(),
             log_level: LogLevel::Info,
+            speed_target: None,
+            peering: None,
         };
         assert!(!format!("{cfg:?}").contains("pw\""));
         let p = Proxy::new(&cfg).unwrap();
@@ -1572,6 +1920,89 @@ mod tests {
     fn form_values_are_percent_encoded() {
         assert_eq!(form_encode("p@ss w&rd=1"), "p%40ss%20w%26rd%3D1");
         assert_eq!(form_encode("a-b.c_d~"), "a-b.c_d~");
+    }
+
+    #[test]
+    fn status_bar_only_on_the_web_ui() {
+        for (path, bar) in [
+            ("/web", true),
+            ("/web/", true),
+            ("/web/index.html", true),
+            ("/swagger/", false),
+            ("/", false),
+            ("/webx", false),
+        ] {
+            assert_eq!(is_web_ui(path), bar, "{path}");
+        }
+        let html = b"<html><head><meta charset=\"UTF-8\"></head><body></body></html>";
+        let with = String::from_utf8(rewrite_page(html, P, "/web/", true)).unwrap();
+        let without = String::from_utf8(rewrite_page(html, P, "/web/", false)).unwrap();
+        assert_eq!(
+            without,
+            String::from_utf8(rewrite_html(html, P, "/web/")).unwrap()
+        );
+        for needle in [
+            "rbittorrent-status-bar",
+            "#proton-vpn-setup",
+            "#other-wireguard-providers-static-port",
+            "Custom / Static WireGuard",
+            "Test VPN Speed",
+            "/__benchmark",
+            "localStorage",
+        ] {
+            assert!(with.contains(needle), "{needle}");
+            assert!(!without.contains(needle), "{needle}");
+        }
+        assert!(with.contains(&format!("D=\"{DOCS_URL}\"")));
+        assert!(!with.contains("__DOCS__") && !with.contains("__INGRESS_PATH__"));
+        assert!(with.is_ascii());
+        assert!(
+            !STATUS_BAR.contains("innerHTML"),
+            "text only via textContent"
+        );
+        assert!(
+            !STATUS_BAR.contains("</script"),
+            "cannot break out of its tag"
+        );
+    }
+
+    #[test]
+    fn supervisor_lines_and_requests() {
+        let h: SupervisorLine =
+            serde_json::from_str(r#"{"rtbit":true,"tunnel":true,"port":5,"detail":""}"#).unwrap();
+        assert_eq!(
+            h,
+            SupervisorLine::Health(Health {
+                rtbit: true,
+                tunnel: true,
+                port: Some(5),
+                ..Health::default()
+            }),
+            "lines from before the direct mode still parse"
+        );
+        let hw = HardwareResult {
+            disk_write_mb_s: Some(12.5),
+            disk_path: "/media/x".into(),
+            sha1_mb_s: Some(900.0),
+            cpu_cores: 4,
+            ..HardwareResult::default()
+        };
+        let line = hardware_line(&hw);
+        assert_eq!(
+            serde_json::from_str::<SupervisorLine>(&line).unwrap(),
+            SupervisorLine::Hardware { hardware: hw }
+        );
+        assert_eq!(
+            serde_json::to_string(&ProxyRequest::Hardware).unwrap(),
+            r#"{"request":"hardware"}"#
+        );
+        let direct = Health {
+            direct: true,
+            public_ip: Some(Ipv4Addr::new(1, 2, 3, 4)),
+            ..Health::default()
+        };
+        let back: Health = serde_json::from_str(&serde_json::to_string(&direct).unwrap()).unwrap();
+        assert_eq!(back, direct);
     }
 
     #[test]

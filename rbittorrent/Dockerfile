@@ -1,20 +1,50 @@
 # syntax=docker/dockerfile:1.7
 #
-# rbittorrent: rtbit + a Rust PID-1 supervisor that owns WireGuard,
-# nftables and NAT-PMP. No shell scripts, no s6, no wg-quick.
+# rBittorrent: rtbit + a Rust PID-1 supervisor that owns WireGuard,
+# nftables and NAT-PMP. No shell scripts at runtime, no s6, no wg-quick.
 #
-# Build (CI does this per arch with buildx):
+# Build (CI does this natively per arch, no QEMU):
 #   docker buildx build --platform linux/arm64 --build-arg BUILD_ARCH=aarch64 .
 
 ARG ALPINE_VERSION=3.24
 ARG RUST_VERSION=1.99
 
-# Upstream rustTorrent release, pinned by digest (multi-arch index:
-# linux/amd64 + linux/arm64). The image ships a static musl /bin/rtbit.
-ARG RTBIT_IMAGE=ghcr.io/thedancingdeveloper-org/rusttorrent:v0.2.0-beta.4@sha256:839e6dac7e6d591364a14e99d51905e8333db5d4fab6242c1ec27cbf8f36039a
-
 # ---------------------------------------------------------------------------
-FROM ${RTBIT_IMAGE} AS rtbit
+# rtbit, compiled from the pinned upstream release with exactly one change:
+# mimalloc as #[global_allocator] (rtbit/mimalloc.patch). musl's own
+# allocator serialises every thread on one lock and holds on to freed
+# memory; mimalloc has per-thread heaps and returns pages to the kernel, so
+# rtbit's multi-threaded runtime scales over all cores and its RSS drops
+# again after a burst (4 GB Raspberry Pis). The tag is cloned shallowly and
+# its commit verified, so a moved tag fails the build instead of shipping
+# other code. Release profile: opt-level 3, thin LTO, one codegen unit,
+# stripped, panic=abort (upstream's own setting).
+FROM rust:${RUST_VERSION}-alpine${ALPINE_VERSION} AS rtbit
+ARG TARGETARCH
+ARG RTBIT_REPO=https://github.com/TheDancingDeveloper-org/rustTorrent.git
+ARG RTBIT_TAG=v0.2.0-beta.4
+ARG RTBIT_COMMIT=be9bbfe5bb406575376a97e827212deff5fe5b8e
+# The same build dependencies as upstream's Dockerfile: npm builds the web
+# UI (embedded in the binary), OpenSSL is linked statically.
+RUN apk add --no-cache clang lld git npm pkgconf musl-dev openssl-dev openssl-libs-static
+WORKDIR /src
+RUN git clone --depth 1 --branch "${RTBIT_TAG}" "${RTBIT_REPO}" . \
+ && test "$(git rev-parse HEAD)" = "${RTBIT_COMMIT}"
+COPY rtbit/mimalloc.patch /tmp/mimalloc.patch
+RUN git apply --verbose /tmp/mimalloc.patch \
+ && grep -q 'static GLOBAL: mimalloc::MiMalloc' crates/rtbit/src/main.rs
+ENV OPENSSL_STATIC=1 \
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
+    CARGO_PROFILE_RELEASE_OPT_LEVEL=3 \
+    CARGO_PROFILE_RELEASE_LTO=thin \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+    CARGO_PROFILE_RELEASE_STRIP=symbols
+# --locked: the dependency versions are upstream's Cargo.lock plus mimalloc.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/src/target,id=rtbit-${TARGETARCH},sharing=locked \
+    cargo build --release --locked -p rtbit \
+ && install -D -m 0755 target/release/rtbit /out/rtbit \
+ && /out/rtbit --version
 
 # ---------------------------------------------------------------------------
 # The supervisor is built natively for the target platform: the mimalloc
@@ -49,14 +79,14 @@ RUN apk add --no-cache \
       tzdata \
  && rm -rf /var/cache/apk/* /usr/share/man /usr/share/doc
 
-COPY --from=rtbit /bin/rtbit /usr/local/bin/rtbit
+COPY --from=rtbit /out/rtbit /usr/local/bin/rtbit
 COPY --from=supervisor /out/rbittorrent-supervisor /usr/local/bin/rbittorrent-supervisor
 
 ENV RUST_BACKTRACE=0
 
 LABEL \
     io.hass.name="rBittorrent" \
-    io.hass.description="rtbit behind a fail-closed Proton VPN WireGuard kill-switch with NAT-PMP" \
+    io.hass.description="rtbit behind a fail-closed WireGuard kill-switch with NAT-PMP (or a direct connection)" \
     io.hass.type="app" \
     io.hass.version="${BUILD_VERSION}" \
     io.hass.arch="${BUILD_ARCH}" \

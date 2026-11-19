@@ -3,7 +3,7 @@ name = "rbittorrent-supervisor"
 version = "1.0.0"
 edition = "2024"
 rust-version = "1.88"
-description = "PID-1 supervisor for rustTorrent (rtbit) behind a fail-closed Proton VPN WireGuard tunnel with RFC 6886 NAT-PMP port forwarding"
+description = "rBittorrent: PID-1 supervisor for rustTorrent (rtbit) behind a fail-closed Proton VPN WireGuard tunnel with RFC 6886 NAT-PMP port forwarding"
 license = "Apache-2.0"
 publish = false
 
@@ -29,8 +29,16 @@ tokio = { version = "1.48.0", default-features = false, features = [
     "signal",
     "sync",
     "io-util",
+    "rt-multi-thread",
 ] }
 tracing = { version = "0.1.41", default-features = false, features = ["std"] }
+# On-demand speed test only (POST /__benchmark): TLS to Cloudflare with ring
+# (no OpenSSL, no aws-lc C build) and Mozilla's roots compiled in. ring's
+# SHA-1 is also what the hash benchmark measures (ARMv8 SHA / SHA-NI asm).
+ring = { version = "0.17.14", default-features = false, features = ["alloc"] }
+rustls = { version = "0.23.31", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1.0.2"
 tracing-subscriber = { version = "0.3.20", default-features = false, features = [
     "fmt",
     "std",
@@ -68,9 +76,10 @@ todo = "deny"
 
 [profile.release]
 # Speed over size: the supervisor is tiny either way, and opt-level 3 keeps
-# loops vectorised. (rtbit itself is upstream's opt-level 3 build; its SHA-1
-# uses ring/OpenSSL with runtime ARMv8-SHA / x86 SHA-NI detection, so no
-# target-cpu flags are needed and Pi 3/4 without crypto extensions still work.)
+# loops vectorised. (rtbit is compiled from source in the Dockerfile with
+# opt-level 3 and mimalloc; its SHA-1 uses OpenSSL with runtime ARMv8-SHA /
+# x86 SHA-NI detection, so no target-cpu flags are needed and Pi 3/4 without
+# crypto extensions still work.)
 opt-level = 3
 lto = "fat"
 codegen-units = 1

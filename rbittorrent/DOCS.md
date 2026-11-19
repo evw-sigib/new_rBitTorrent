@@ -1,61 +1,240 @@
 # rBittorrent
 
-[rustTorrent](https://github.com/thedancingdeveloper-org/rusttorrent) (`rtbit`)
-running behind a **fail-closed Proton VPN WireGuard tunnel**, with automatic
-**NAT-PMP port forwarding** and a sidebar panel through Home Assistant
-Ingress.
+A **drop-in replacement for the qBittorrent app**. It runs the
+[rustTorrent](https://github.com/thedancingdeveloper-org/rusttorrent)
+(`rtbit`) engine behind a **fail-closed Proton VPN WireGuard tunnel**, with
+automatic **NAT-PMP port forwarding** and a sidebar panel through Home
+Assistant Ingress. Other WireGuard providers work too, with a
+[static forwarded port](#other-wireguard-providers-static-port).
 
-Everything is done by one small Rust program, `rbittorrent-supervisor`, which runs as
-PID 1. It sets up kernel WireGuard, loads an nftables kill-switch, leases the
-forwarded port, and starts and stops rtbit. There are no shell scripts and no
-s6-overlay, OpenVPN, wg-quick, Gluetun or C NAT-PMP library in the image.
+- Same port as qBittorrent (**8080**) and a qBittorrent-compatible API, so
+  Sonarr, Radarr, Prowlarr, qBitController and Home Assistant's qBittorrent
+  integration keep working.
+- On the first start it **takes over an existing qBittorrent app**: its
+  WireGuard file, save folders, user name and categories, and optionally its
+  torrents (they keep seeding from where they are).
+
+- A fresh install starts on your **normal connection** and says so loudly,
+  in the log and in a bar on top of the sidebar panel. As soon as a
+  WireGuard configuration exists, the VPN is on and **fail-closed**: see
+  [VPN on or off](#vpn-on-or-off).
+- A built-in **speed test** measures your line, the disk and the CPU, see
+  [Speed test](#speed-test).
+
+Everything is done by one small Rust program, `rbittorrent-supervisor`,
+which runs as PID 1:
+- sets up kernel WireGuard,
+- loads an nftables kill-switch,
+- leases the forwarded port,
+- imports qBittorrent,
+- starts and stops rtbit,
+- serves the sidebar.
+
+The image has no shell scripts and no s6-overlay, OpenVPN, wg-quick, Gluetun
+or C NAT-PMP library.
 
 ## Before you start
 
-- **Proton VPN plan with port forwarding** (Plus or higher) if you want other
-  peers to be able to connect to you. Without it, downloads still work but
-  are slower, and you should switch `enable_nat_pmp` off.
-- **A WireGuard configuration from Proton**:
-  [account.protonvpn.com](https://account.protonvpn.com) → *Downloads* →
-  *WireGuard configuration*:
-  - platform **GNU/Linux** (or Router),
-  - turn **NAT-PMP (Port Forwarding)** on,
-  - pick a **P2P** server (the double-arrow icon). Leave *VPN Accelerator*
-    and *Moderate NAT* as you like.
-
-  Keep the file private: it contains your private key.
+- **A VPN (recommended).** Without one, peers and trackers see your own IP
+  address. Best: a **Proton VPN plan with port forwarding** (Plus or
+  higher), so other peers can connect to you; see
+  [Proton VPN setup](#proton-vpn-setup). Any other WireGuard provider with a
+  fixed forwarded port works too. Skip this if your qBittorrent app already
+  has a WireGuard file: it is taken over, see
+  [Moving from qBittorrent](#moving-from-qbittorrent).
 - **Home Assistant OS** (or Supervised) on aarch64 (Raspberry Pi 4/5, ...) or
-  amd64. WireGuard is built into the HAOS kernel. Nothing has to be loaded
-  and the app never asks for `SYS_MODULE`.
+  amd64. WireGuard is built into the HAOS kernel; the app never loads kernel
+  modules.
 - Do not boot the host with `ipv6.disable=1`: rtbit needs IPv6 *sockets* to
-  start. All IPv6 *traffic* is still dropped, see [Leak protection](#leak-protection).
+  start. All IPv6 *traffic* is still dropped, see
+  [Leak protection](#leak-protection).
+
+## Moving from qBittorrent
+
+1. Install rBittorrent. Do **not** start it yet.
+2. Stop the qBittorrent app, and turn off its *Start on boot*. Both apps
+   want host port 8080, and they must not seed the same files at once.
+3. If you want your torrents to continue, set **Import active torrents** on.
+   If your old qBittorrent used its own Web UI password, enter it as
+   `webui_password`: then Sonarr and Radarr need no changes at all.
+4. Start rBittorrent and open the log. You should see:
+
+```
+qBittorrent import: found /app_configs/db21ed7f_qbittorrent (settings: yes, categories: yes, torrents: yes, WireGuard files: 1)
+qBittorrent import: copied the WireGuard config .../wireguard/wg0.conf to /config/wg0.conf
+...
+| qBittorrent     from db21ed7f_qbittorrent: WireGuard, folders /media/torrents (incomplete: /media/torrents/incomplete), Web UI user `pi`, 4 categories, torrents (after rtbit starts)
+...
+qBittorrent import finished: 4 categories (4 new), 37/38 torrents re-added (verifying existing files)
+```
+
+### Where it looks
+
+The app reads, **read-only**, from these places:
+- every app configuration folder whose name contains `qbittorrent`
+  (`/addon_configs/*qbittorrent*` in Samba; inside the app it is
+  `/app_configs`),
+- `/share/qBittorrent`,
+- `/config/qBittorrent`.
+
+It never changes or deletes anything there.
+
+### What is taken over
+
+| What | From | When |
+|---|---|---|
+| WireGuard file | `wireguard/*.conf` or any `wg0.conf` in the profile | Only if this app has no `wg0.conf` and the VPN options are empty. Copied to `/config/wg0.conf` (mode 0600) and used as [method 1](#method-1-a-wg0conf-file-recommended). |
+| Completed folder | `Session\DefaultSavePath` in `qBittorrent.conf` | Only while `download_dir` and `completed_dir` are both at their defaults. |
+| Download folder | `Session\TempPath`, if the temp folder was enabled; otherwise `<save path>/incomplete` | As above. |
+| Web UI user name | `WebUI\Username` | Only while `webui_username` is `admin`. |
+| Categories | `categories.json`, with their save paths | Always; existing categories are left alone. |
+| Torrents | `BT_backup/*.torrent` + `.fastresume` (save path, category, layout, paused state) | Only with `import_active_torrents` on. |
+
+- Your own option values always win.
+- Folders must be below `/media`, `/share` or `/config`. A folder elsewhere,
+  e.g. a qBittorrent-internal `/downloads`, is skipped with a note in the log;
+  set the folders yourself then.
+- The **password cannot be imported**: qBittorrent stores only a PBKDF2 hash.
+  Enter the old password as `webui_password`, or leave it empty and update
+  Sonarr/Radarr with the generated one.
+- Torrents are re-added at their **old save path**. rtbit verifies the
+  existing files and continues seeding without downloading again. A torrent
+  whose save path does not exist, e.g. a disk that is not mounted, is
+  skipped and listed in the log.
+- qBittorrent 5 profiles that store torrents only in `torrents.db` (SQLite)
+  are not supported. Their categories and settings are still taken over.
+
+### Running it once, and again
+
+- After the categories are in rtbit, `/config/.migrated` records what was
+  taken over. Later starts apply the same folders and user name, but never
+  scan again.
+- Imported torrents are recorded in `/config/.torrents_migrated`. You can
+  turn `import_active_torrents` on later; it then runs once on the next
+  start.
+- To import again, delete the file and restart the app.
+- If rtbit refuses the sign-in, e.g. after a wrong `webui_password`, nothing
+  is recorded and the next start tries again.
+- Turn off **Import from qBittorrent** to skip all of this.
+
+### Checks against the Supervisor
+
+The app uses Home Assistant's Supervisor API with the *default* role, the
+lowest one, before the kill-switch is loaded:
+- **Conflict warning:** if a qBittorrent app is still running, the log shows
+  a large `!!` banner. It says when that app holds host port 8080.
+- **Discovery:** the app offers itself to Home Assistant's **qBittorrent**
+  integration on port 8080. If Home Assistant does not pick it up, add the
+  integration yourself: URL `http://<home-assistant-ip>:8080`, with the Web UI
+  user name and password.
+
+Both are best effort and never stop the app.
+
+## VPN on or off
+
+The app runs in one of three modes. The log says which one at every start,
+and so does the bar on top of the sidebar panel.
+
+| Mode | When | Torrent traffic |
+|---|---|---|
+| **Direct connection** (VPN off) | A fresh install: `vpn_enabled` off and no WireGuard setup anywhere | Your normal connection. Peers and trackers see your own IP. rtbit listens on `listen_port`. |
+| **VPN with NAT-PMP** (Proton) | `vpn_enabled` on, or any WireGuard setup exists | Only through WireGuard, behind the kill-switch. The forwarded port is leased automatically. |
+| **VPN with a static port** | As above, with `enable_nat_pmp` off | Only through WireGuard. `listen_port` is opened on the tunnel. For TorGuard, AirVPN, Windscribe and others. |
+
+**The VPN switches itself on.** VPN mode starts as soon as any of these
+exists, even with `vpn_enabled` off:
+- `/config/wg0.conf` (also one taken over from qBittorrent),
+- a pasted `wireguard_conf`,
+- any `wg_*` field.
+
+**Fail-closed, never a fallback.** Once VPN mode is on, a broken or
+incomplete WireGuard setup stops the app with an error such as
+`VPN mode is on (auto-enabled: /config/wg0.conf exists): ...`. A tunnel that
+goes down later blocks all torrent traffic until it is back. The app never
+falls back to your normal connection. To really go back to the direct
+connection, remove the WireGuard setup (delete `/config/wg0.conf`, empty the
+WireGuard options) and turn `vpn_enabled` off.
+
+On a direct connection, the log shows this at every start:
+
+```
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! VPN OFF: rBittorrent uses your normal internet connection.
+!! Peers and trackers see your real IP address, and no kill-switch
+...
+```
+
+- There is no kill-switch and no tunnel. rtbit listens on `listen_port`
+  (default 4240), TCP and UDP.
+- For inbound peers, map port 4240 in the app's *Network* section and
+  forward it on your router. Keep `listen_port` and the mapping the same.
+  UPnP stays off: the app never opens router ports by itself.
+
+## Proton VPN setup
+
+1. Go to [account.protonvpn.com](https://account.protonvpn.com) →
+   *Downloads* → *WireGuard configuration*:
+   - platform **GNU/Linux** (or Router),
+   - turn **NAT-PMP (Port Forwarding)** on,
+   - pick a **P2P** server (the double-arrow icon). Port forwarding needs
+     Proton VPN Plus or higher.
+2. Download the `.conf` file. Keep it private: it contains your private
+   key.
+3. Give it to the app, preferably as `/config/wg0.conf`
+   ([method 1](#method-1-a-wg0conf-file-recommended)). In Samba that is
+   `addon_configs/<id>_rbittorrent/wg0.conf`. Pasting it into the
+   *Configuration* tab works too ([method 2](#method-2-paste-the-configuration)).
+4. Leave `enable_nat_pmp` on and `nat_pmp_gateway` at `10.2.0.1`.
+5. Restart the app. The log shows `VPN mode (auto-enabled: ...)`,
+   `kill-switch active`, `VPN exit verified: public IPv4 ...` and
+   `NAT-PMP forwarded port ...`. The sidebar bar turns into a green
+   **VPN Protected** pill with the exit IP and the port.
+
+## Other WireGuard providers (static port)
+
+Providers such as **TorGuard**, **AirVPN** and **Windscribe** forward one
+fixed port that you choose in their web panel, instead of NAT-PMP.
+
+1. In the provider's panel, create a WireGuard configuration and a forwarded
+   port, e.g. `51413`. Some providers tie the port to one server or device:
+   use the configuration that belongs to it.
+2. Give the `.conf` file to the app, like Proton's (`/config/wg0.conf` or the
+   paste field). Its `DNS =` line is used; without one, set `wg_dns` to the
+   provider's in-tunnel DNS server.
+3. Set **`enable_nat_pmp` off** and **`listen_port`** to the forwarded port.
+4. Restart. The log shows
+   `static port mode: TCP+UDP 51413 opened on wg0`. The port is part of the
+   very first kill-switch ruleset (`@bt_port`), on `wg0` only.
+
+Everything else stays the same: the kill-switch, the DNS lock, the
+handshake check before rtbit starts. A provider without any port forwarding
+also works. Peers then cannot connect to you, so downloads are slower.
 
 ## Setting up the VPN: three methods
 
-The app uses the **first** method that is present and ignores the others. The
-log names the method it chose (`WireGuard configuration from ...`).
+The app uses the **first** method that is present and ignores the others.
+The log names the method it chose: `VPN mode (...): WireGuard configuration
+from ...`.
 
 ### Method 1: a `wg0.conf` file (recommended)
 
-Copy the Proton file to the app's configuration folder as `wg0.conf`.
-- With the *Samba share* or *Studio Code Server* app, the folder is
-  `addon_configs/<id>_rbittorrent/`.
+Put the Proton file in the app's configuration folder as `wg0.conf`.
+- With the *Samba share* or *Studio Code Server* app, that is
+  `addon_configs/<id>_rbittorrent/wg0.conf`.
 - Inside the app it is `/config/wg0.conf`.
 
-The key then stays out of the app's options page.
+The key stays out of the options page. The qBittorrent import fills in this
+file for you.
 
 ### Method 2: paste the configuration
 
-Open the file in a text editor, copy everything, and paste it into **WireGuard
-configuration (paste)** on the *Configuration* tab.
-- Home Assistant sometimes turns the line breaks into spaces. That is fine: a
-  single line, or entries separated by `; `, is understood too.
-- The structured fields below (method 3) only fill in values the paste does
-  not contain.
+Open the file in a text editor, copy everything, and paste it into
+**WireGuard configuration (paste)** on the *Configuration* tab.
+- Home Assistant sometimes turns the line breaks into spaces. That is fine:
+  a single line, or one with `; ` between entries, works too.
+- The fields of method 3 only fill in values the paste lacks.
 
 ### Method 3: separate fields
-
-Copy the values from the `.conf` file into the fields:
 
 | `.conf` line | Option |
 |---|---|
@@ -66,216 +245,314 @@ Copy the values from the `.conf` file into the fields:
 | `[Peer] Endpoint` | `wg_endpoint` (e.g. `190.2.131.156:51820`) |
 | `[Peer] PresharedKey` | `wg_preshared_key` (Proton does not use one) |
 
-Details that apply to every method:
+For every method:
 - An endpoint hostname is resolved once at startup, before DNS is locked to
   the tunnel.
-- IPv6 addresses in the configuration are ignored.
-- The MTU is 1420 unless the configuration sets one.
+- IPv6 addresses are ignored.
+- The MTU is 1420 unless the file sets one.
 - Keepalive is 25 s.
 
 ## Using the Web UI
 
 ### Sidebar (Ingress)
 
-Click **rustTorrent** in the sidebar. The panel is served by a small proxy
-inside the app on port 8099. The proxy:
+Click **rBittorrent** in the sidebar. A small proxy inside the app on port
+8099 serves the panel. It:
 - **signs you in automatically** with the Web UI account, so there is no
   second login after Home Assistant's,
 - keeps all links, API calls and live updates inside
-  `/api/hassio_ingress/<token>/`, so the panel never shows a blank page,
-- streams large `.torrent` uploads and downloads instead of buffering them,
-- shows a "rBittorrent is starting..." page that refreshes itself while rtbit
+  `/api/hassio_ingress/<token>/`, so the panel never turns blank,
+- streams large `.torrent` uploads and downloads; only small HTML pages are
+  buffered, to rewrite them,
+- shows a self-refreshing "rBittorrent is starting..." page while rtbit
   starts or restarts,
-- answers **only Home Assistant's Supervisor (172.30.32.2)**. The firewall
-  already limits port 8099 to Home Assistant's internal network; the proxy
-  also refuses other apps on that network, so they cannot use the automatic
-  sign-in. Port 8099 is never reachable from your LAN or through the VPN.
+- adds the [status bar](#status-bar) on top of the Web UI,
+- answers **only Home Assistant's Supervisor** (172.30.32.2).
 
-The proxy runs as an unprivileged user (`nobody`) with no Linux capabilities.
+The firewall already limits port 8099 to Home Assistant's internal network.
+The proxy also refuses other apps there, so they cannot use the automatic
+sign-in. Port 8099 is never reachable from your LAN or through the VPN. The
+proxy runs as user `nobody`, with no Linux capabilities.
 
-### Directly on your network (port 8080)
+### Status bar
+
+The sidebar panel has a slim bar on top of rtbit's Web UI. It refreshes
+every 15 seconds from `/__health`.
+
+- **VPN off:** an orange bar, `🔓 Direct Connection (Unprotected)`, with:
+  - **⚡ Speed Test**: see [Speed test](#speed-test),
+  - **📘 Proton VPN Setup**: opens [Proton VPN setup](#proton-vpn-setup),
+  - **Custom / Static WireGuard**: opens
+    [Other WireGuard providers](#other-wireguard-providers-static-port),
+  - **✕ Dismiss**: hides the bar for good in this browser (kept in the
+    browser's local storage). The log keeps warning.
+- **VPN on:** a green pill,
+  `🔒 VPN Protected (185.159.156.1 • Port 45678)`, with
+  **⚡ Test VPN Speed**. The IP is the exit address NAT-PMP reports, so in
+  static port mode only the port is shown. While the tunnel reconnects, the
+  pill reads `VPN reconnecting (kill-switch on)`.
+
+The bar lives in its own shadow DOM, so it cannot change rtbit's styling. It
+only appears in the sidebar, never on port 8080, so it never gets in the way
+of Sonarr or Radarr.
+
+### Speed test
+
+**⚡ Speed Test** in the status bar runs a test of about 10 seconds and
+shows the results in a dialog:
+
+| Result | How |
+|---|---|
+| Download | [Cloudflare's speed test](https://speed.cloudflare.com), 4 parallel HTTPS streams for 6 seconds, over the active route: `wg0` with the VPN, `eth0` without. |
+| Latency | Median of 5 small requests, plus the Cloudflare location that answered. |
+| Public IP | The address Cloudflare saw: the VPN exit IP when the VPN is on. |
+| Disk write | One 4 MiB file in `download_dir`, written, flushed to disk with `fsync` and deleted immediately. |
+| SHA-1 hashing | 64 MiB hashed, the piece hash BitTorrent uses. It shows how fast rtbit can verify downloads (ARMv8 crypto or SHA-NI when the CPU has them). |
+| Regional peering | VPN off only: TCP connect time to Cloudflare (1.1.1.1), Google (8.8.8.8) and Quad9 (9.9.9.9), best of 3. |
+
+- Nothing of the test runs or uses memory until you press the button. The
+  threads and buffers are gone again afterwards.
+- One test at a time, with 10 seconds between tests.
+- It runs as `POST /__benchmark` on port 8099, reachable only through
+  Ingress. It only accepts JSON requests from the panel itself.
+- With the VPN on but the tunnel down, the kill-switch blocks the download
+  test. The dialog says so, and still shows the disk and CPU results.
+
+### On your network (port 8080)
 
 `http://<home-assistant-ip>:8080/web/` serves the same Web UI and rtbit's
 **qBittorrent-compatible API**, for:
-- Sonarr, Radarr and Prowlarr (download client type *qBittorrent*, host = your
-  Home Assistant IP, port 8080),
+- Sonarr, Radarr and Prowlarr: download client *qBittorrent*, host = your
+  Home Assistant IP, port 8080, the Web UI user name and password,
 - Home Assistant's **qBittorrent** integration,
 - browsers on your LAN.
 
-This port always asks for the Web UI username and password. Only the networks
-in `local_allow_cidrs` can reach it, and they only ever get replies: torrent
-traffic never leaves through your LAN. To turn the port off, clear the host
-port on the *Network* section of the app page.
+It always asks for the user name and password. Only the networks in
+`local_allow_cidrs` can reach it, and they only ever get replies: torrent
+traffic never leaves through your LAN.
+
+To use another host port, change it in the *Network* section of the app
+page. Clear it to close the port. Inside the container it stays 8080.
 
 ### The Web UI account
 
-- `webui_username` defaults to `admin`.
-- `webui_password`: set your own, 8 to 256 characters. If you leave it empty,
-  the app generates a random 24-character password once and stores it in
-  `/config/.webui-password` (file mode 0600). The log tells you where it is,
-  but never prints the password itself.
-- The account is written to rtbit on every start, through rtbit's own
+- `webui_username` defaults to `admin`, or to the imported qBittorrent user
+  name.
+- `webui_password`: 8 to 256 characters. Leave it empty and the app
+  generates a random 24-character password once, in
+  `/config/.webui-password` (mode 0600). The log says where it is, never
+  what it is.
+- The account is written to rtbit on every start through rtbit's own
   `auth reset-password` command. The password goes on stdin, never on a
-  command line or in the environment. Changing the option and restarting the
-  app is therefore all it takes to change the password.
+  command line or in the environment. To change it, change the option and
+  restart.
 
 ## Options
 
 | Option | Default | What it does |
 |---|---|---|
+| `vpn_enabled` | `false` | Force VPN mode. Also switched on automatically by any WireGuard setup, see [VPN on or off](#vpn-on-or-off). |
 | `wireguard_conf` | empty | Method 2, see above. |
 | `wg_*` | empty | Method 3, see above. |
 | `webui_username` | `admin` | Web UI / qBittorrent API account. |
 | `webui_password` | empty (generated) | See [The Web UI account](#the-web-ui-account). |
+| `import_from_qbittorrent` | `true` | Take over a qBittorrent app on the first start. |
+| `import_active_torrents` | `false` | Also re-add its torrents at their old save paths. |
 | `enable_dht` | `true` | BitTorrent DHT. Turn off for private trackers that forbid it. |
 | `enable_nat_pmp` | `true` | Lease a forwarded port from the VPN gateway (RFC 6886). |
 | `nat_pmp_gateway` | `10.2.0.1` | NAT-PMP gateway inside the tunnel (Proton's). |
-| `listen_port` | `4240` | BitTorrent port while there is no lease, or with NAT-PMP off. |
+| `listen_port` | `4240` | BitTorrent port: the direct connection's port, the provider's fixed port with NAT-PMP off, or the port used until the first NAT-PMP lease. |
 | `download_dir` | `/media/rbittorrent/downloads` | Incomplete downloads. Below `/media`, `/share` or `/config`. |
 | `completed_dir` | `/media/rbittorrent/completed` | Finished torrents. Same rules. |
-| `local_allow_cidrs` | private ranges | LAN networks allowed to reach port 8080. Only private IPv4 ranges are accepted, and `172.30.32.0/23` is always added. |
+| `local_allow_cidrs` | `172.30.32.0/23`, `172.16.0.0/12`, `192.168.0.0/16`, `10.0.0.0/8` | Networks that may reach port 8080. Private IPv4 ranges only; `172.30.32.0/23` is always added. |
 | `log_level` | `info` | `trace`, `debug`, `info`, `warn`, `error`. |
 
-Downloads to a USB disk or SSD: mount it in Home Assistant (*Settings* →
-*System* → *Storage*), then point `download_dir` and `completed_dir` below
-`/media/<disk name>/`.
+Notes:
+- **USB disk or SSD:** mount it in Home Assistant (*Settings* → *System* →
+  *Storage*), then use folders below `/media/<disk name>/`.
+- **`10.0.0.0/8` and Proton:** Proton's in-tunnel addresses (`10.2.0.1` for
+  DNS and NAT-PMP) are in that range, but they always stay inside the tunnel.
+  The LAN list only lets those networks *reach* port 8080.
 
 ## Port forwarding (NAT-PMP)
 
 With `enable_nat_pmp` on, the supervisor itself speaks NAT-PMP (RFC 6886,
 written in Rust, no libnatpmp):
-1. It asks the gateway (`10.2.0.1`) for a TCP and a UDP mapping with a
-   60-second lease, and renews it every 45 seconds.
-2. It opens exactly that port in the kill-switch and starts rtbit with it.
-3. If Proton hands out a different port (after a server-side reset), the
-   firewall is updated and rtbit is restarted on the new port, cleanly. The
-   log shows `forwarded port changed A -> B` and a fresh status box.
+1. It asks the gateway for its public address, which verifies that traffic
+   leaves through Proton.
+2. It requests a TCP and a UDP mapping with a 60-second lease, and renews
+   them every 45 seconds. Retries start at 250 ms and double, 4 attempts.
+3. It opens exactly that port in the kill-switch and starts rtbit with it.
+4. If Proton hands out a different port, e.g. after a server-side reset, the
+   firewall is updated and rtbit restarts on the new port. The log shows
+   `forwarded port changed A -> B` and a fresh status box. Renewals that keep
+   the port never restart rtbit.
+
+With `enable_nat_pmp` off, see
+[Other WireGuard providers (static port)](#other-wireguard-providers-static-port).
 
 If Proton never answers, the log repeats a hint every 30 minutes. The usual
-causes are:
+causes:
 - the configuration was generated with *NAT-PMP* off,
 - the server is not a P2P server,
 - the plan has no port forwarding.
 
-rtbit keeps running on the fallback port in the meantime, but inbound peers
-are blocked.
+rtbit keeps running on the fallback port meanwhile, with inbound peers
+blocked.
 
-## The startup status box
+## The status box
 
-At startup and every time the forwarded port changes, the log shows:
+At startup and whenever the forwarded port changes, the log shows:
 
 ```
 +------------------------- rBittorrent -------------------------+
 | VPN public IP   185.159.156.1 (verified through the tunnel via NAT-PMP)
 | Forwarded port  45678 TCP+UDP (NAT-PMP, peers can connect)
+| qBittorrent     done earlier (from db21ed7f_qbittorrent)
 | CPU cores       4 (all available to rtbit)
-| Storage         412.3 GiB free on /media/rbittorrent/downloads
+| Storage         412.3 GiB free on /media/torrents/incomplete
 +---------------------------------------------------------------+
 ```
 
 The public IP is the one the VPN gateway reports through the tunnel, not
-your home IP.
+your home IP. On a direct connection the box says
+`VPN OFF: direct connection, your own IP is visible`, and the port line
+reads `4240 (direct; map it in the Network section for inbound peers)`.
 
 ## Health and the Watchdog
 
-- `GET /__health` on port 8099 returns **200** only when rtbit is running
-  **and** the WireGuard handshake is recent (under 3 minutes). Otherwise it
-  returns **503** with a JSON reason.
-- `config.yaml` points Home Assistant's **Watchdog** at it. Turn on
-  *Watchdog* on the app page and Home Assistant restarts the app after two
-  failed checks. A restart also resolves the VPN server again.
-- The Docker `HEALTHCHECK` runs `rbittorrent-supervisor healthcheck`, which gives the
-  same verdict.
-- Independently, the supervisor restarts rtbit itself if it crashes. If the
-  handshake stays stale for 10 minutes, the log shows an error that names
-  the VPN server.
+- `GET /__health` on port 8099 returns **200** only while rtbit runs **and**,
+  with the VPN on, the WireGuard handshake is recent (under 3 minutes).
+  Otherwise it returns **503** with a JSON reason. The JSON also carries
+  `vpn`, `port` and `public_ip` for the status bar.
+- Turn on *Watchdog* on the app page: Home Assistant then restarts the app
+  after two failed checks, which also resolves the VPN server again.
+- The Docker `HEALTHCHECK` runs `rbittorrent-supervisor healthcheck`, with
+  the same verdict.
+- The supervisor restarts rtbit itself if it crashes. If the handshake stays
+  stale for 10 minutes, the log shows an error naming the VPN server.
 
 ## Disk space guard
 
-Before rtbit starts, and every 10 minutes while it runs, the free space on
+Before rtbit starts, and every 10 minutes while it runs, the free space of
 `download_dir` is checked. Below **1 GiB** the log shows a large
-`LOW DISK SPACE` banner, repeated every hour. A common cause on a Raspberry
-Pi is a USB disk that is no longer mounted, so the downloads fill the SD card.
+`LOW DISK SPACE` banner, repeated every hour. On a Raspberry Pi this often
+means a USB disk is no longer mounted and the downloads fill the SD card.
 
 ## Leak protection
 
-The kill-switch is a single nftables table, `inet killswitch`. It is loaded
-atomically **before** the tunnel comes up and stays in place while rtbit
-runs:
-- **Default drop** in both directions.
-- **All IPv6 is dropped**, inbound and outbound.
-- **Outbound** traffic may only:
-  - go into `wg0`,
-  - be the encrypted WireGuard packets to the one VPN server (marked by the
-    kernel),
-  - be replies on port 8080 to the allowed LAN networks,
-  - be replies on port 8099 to the Supervisor's network.
-- **Inbound** traffic may only:
-  - reach the forwarded port through `wg0`,
-  - reach port 8080 from the allowed LAN networks,
-  - reach port 8099 from `172.30.32.0/23`,
-  - be replies.
-- **DNS** is pinned to the tunnel's DNS server. The container's
-  `/etc/resolv.conf` is replaced, and nothing else may reach port 53.
-- rtbit itself runs without capabilities and with `no_new_privs`, and its
-  UPnP, LSD and IPv6 are switched off.
-- If the tunnel goes down, traffic stops. Nothing falls back to your normal
-  connection.
+This section is about VPN mode. On a direct connection there is no
+kill-switch, see [VPN on or off](#vpn-on-or-off).
 
-To verify the protection from your own setup:
+The kill-switch is a single nftables table, `inet killswitch`. It is loaded
+atomically, with `nft -f -`, **before** the tunnel comes up. It stays in
+place while rtbit runs:
+- **Default drop** on input, forward and output.
+- **All IPv6 is dropped**, right after loopback.
+- Named sets:
+  - `@bt_port`: the forwarded port (NAT-PMP), or `listen_port` in static
+    port mode, already in the first ruleset,
+  - `@ui_ports`: `{ 8080, 8099 }`,
+  - `@lan_cidrs`: `local_allow_cidrs` plus Home Assistant's network.
+
+| Direction | What is allowed |
+|---|---|
+| In | Port 8099 from `172.30.32.0/23` only; port 8080 from `@lan_cidrs`; `@bt_port` through `wg0`; replies. |
+| Out | Replies from `@ui_ports` to `@lan_cidrs` (`ct state established,related`); the encrypted WireGuard packets to the one VPN server (kernel fwmark); everything else only through `wg0`. |
+| DNS | Only to the tunnel's DNS servers, through `wg0`. `/etc/resolv.conf` is replaced too. |
+
+Routing:
+- Only the VPN server's address (`/32`) and your LAN ranges use the normal
+  gateway.
+- Everything else goes through `wg0`, as two `/1` routes.
+- rtbit starts only after a WireGuard handshake is verified.
+
+rtbit itself runs without capabilities and with `no_new_privs`. Its UPnP, LSD
+and IPv6 are off. If the tunnel goes down, traffic stops: nothing falls back
+to your normal connection.
+
+To check it yourself:
 1. Add a magnet with a tracker that reports your IP, e.g. *ipleak.net* →
    *Torrent Address detection*. Only the VPN IP from the status box may
    appear.
-2. Stop the VPN server side, e.g. by deleting the WireGuard key in your
-   Proton account. Downloads stop, and `/__health` turns 503.
+2. Revoke the WireGuard key in your Proton account. Downloads stop and
+   `/__health` turns 503.
 
 ## Performance notes
 
 - The supervisor and the Ingress proxy each use a single-threaded runtime
-  and about 2 MB of RAM (measured: 1.9 MB idle, 2.6 MB after 400 proxied
-  requests). rtbit's own thread pool is not limited: it uses every CPU core
-  the container gets.
+  and about 2 MB of RAM (1.9 MB idle, 2.6 MB after 400 proxied requests).
+  rtbit's own thread pool is not limited: it gets every CPU core.
 - Both are built with `opt-level = 3`, fat LTO, one codegen unit, static musl
   and the **mimalloc** allocator. mimalloc's transparent-huge-page hint is
   off, because it quadrupled idle memory.
-- rtbit is the upstream static musl binary, pinned by digest. Its SHA-1 piece
-  hashing already picks ARMv8 or SHA-NI instructions at runtime. The image
-  sets no `target-cpu` flags, so it also runs on a Raspberry Pi 3 or 4.
+- **rtbit is compiled from source** in the image build: the pinned upstream
+  release `v0.2.0-beta.4`, commit-checked, with one change, **mimalloc** as
+  its global allocator (`rtbit/mimalloc.patch`). musl's own allocator makes
+  all threads wait on one lock and keeps freed memory. mimalloc uses
+  per-thread heaps and returns memory to the kernel, so rtbit scales over
+  all cores and shrinks again after a burst, which matters on a 4 GB Pi.
+  It is built with `opt-level = 3`, thin LTO and one codegen unit.
+- Its SHA-1 piece hashing picks ARMv8 or SHA-NI instructions at runtime. No
+  `target-cpu` flags are set, so it also runs on a Raspberry Pi 3 or 4.
+- The [speed test](#speed-test) costs nothing while idle: its threads and
+  buffers exist only while it runs.
 - The proxy sets `TCP_NODELAY` on both sides and streams every body. Only
-  HTML pages up to 4 MiB are buffered, because they are rewritten for
-  Ingress.
+  HTML pages up to 4 MiB are buffered, for the Ingress rewrite.
 - WireGuard stays at MTU 1420.
-- The supervisor tries to raise `net.core.rmem_max` and `net.core.wmem_max`
-  to 7 MiB for fast UDP (uTP, DHT). Home Assistant mounts `/proc/sys`
-  read-only inside apps, so the log normally says `read-only here`. That is
-  expected and harmless.
-- At `log_level: info`, rtbit's chatty per-peer and DHT logs are limited to
-  warnings, which saves SD card writes. Use `debug` to see everything.
+- The supervisor tries to raise `net.core.rmem_max` and `wmem_max` to 7 MiB
+  for fast UDP (uTP, DHT). Home Assistant mounts `/proc/sys` read-only, so
+  the log normally says `read-only here`. That is harmless.
+- At `log_level: info`, rtbit's per-peer and DHT logs are limited to
+  warnings (`RUST_LOG=info,librtbit=warn`), sparing SD cards. Use `debug` to
+  see everything.
 
 ## Security summary
 
-- The app asks for `NET_ADMIN` only. It uses no `SYS_ADMIN`, `SYS_MODULE`,
+- **Capabilities:** `NET_ADMIN` only. No `SYS_ADMIN`, `SYS_MODULE`,
   `full_access` or host network.
-- `/dev/net/tun` is mapped as the app policy requires. Kernel WireGuard does
-  not use it.
-- The WireGuard private key is handed to `wg` on stdin only. It is never in
-  a command line, the environment or the log.
-- The Web UI password follows the same rule.
-- The proxy, rtbit and helper processes run without capabilities. The proxy
-  also runs as uid 65534.
+- **Supervisor API:** `hassio_api` with the default role, for the conflict
+  warning and discovery. The Supervisor token never reaches rtbit.
+- **Other apps' folders:** mapped read-only (`all_app_configs`), only to find
+  a qBittorrent profile.
+- **`/dev/net/tun`:** mapped as the app policy requires; kernel WireGuard
+  does not use it.
+- **Secrets:** the WireGuard private key goes to `wg` on stdin only, never on
+  a command line, in the environment or in the log. The Web UI password
+  follows the same rule.
+- **Processes:** the proxy, rtbit and the helpers run without capabilities.
+  The proxy also runs as uid 65534.
+- **Direct connection:** without a VPN, the app runs without a kill-switch
+  and says so in the log and the sidebar. Any WireGuard setup switches the
+  VPN on, and from then on it never falls back.
+- **Speed test:** contacts only `speed.cloudflare.com` (and, with the VPN
+  off, 1.1.1.1, 8.8.8.8 and 9.9.9.9 for a TCP connect), and only when you
+  press the button.
 
 ## Troubleshooting
 
 | Log message | Meaning |
 |---|---|
-| `no WireGuard private key configured` (or endpoint, address, ...) | None of the three methods is filled in, or the value is missing from your file. |
+| `VPN mode is on (...)` followed by an error | A WireGuard setup exists but is incomplete or broken. The app stops instead of running unprotected. Fix the file or options, or remove them all for the direct connection. |
+| `no WireGuard private key configured` (or endpoint, address, ...) | VPN mode is on, but no method is filled in, or the value is missing from your file. |
+| `VPN OFF: rBittorrent uses your normal internet connection` | No WireGuard setup was found. See [Proton VPN setup](#proton-vpn-setup). |
+| `qBittorrent is still running` | Stop the old app and turn off its *Start on boot*. |
+| `qBittorrent import: ... is outside /media, /share and /config` | Set `download_dir` / `completed_dir` yourself. |
+| `rtbit refused the Web UI login` | The import retries on the next start. Check `webui_username` / `webui_password`. |
 | `no WireGuard handshake with ...` | Wrong key or endpoint, or the configuration was revoked in your Proton account. Generate a new one. |
-| `has not answered for 10 minutes` | The Proton server is down or your key was revoked. Restart the app, or generate a configuration for another server. |
+| `has not answered for 10 minutes` | The Proton server is down or your key was revoked. Restart the app, or use another server. |
 | `Proton VPN did not grant a forwarded port` | See [Port forwarding](#port-forwarding-nat-pmp). |
 | `rtbit needs IPv6 sockets to start` | Remove `ipv6.disable=1` from the host kernel command line. |
 | `LOW DISK SPACE` | See [Disk space guard](#disk-space-guard). |
-| Sidebar says *rBittorrent is starting...* for minutes | rtbit keeps exiting. Check the log, e.g. a download folder that does not exist on a missing disk. |
-| Sonarr gets `401` / `403` | Wrong Web UI username or password, or Sonarr's IP is not in `local_allow_cidrs`. |
+| Sidebar shows *rBittorrent is starting...* for minutes | rtbit keeps exiting. Check the log, e.g. for a folder on a missing disk. |
+| Sonarr gets `401` / `403` | Wrong user name or password, or Sonarr's IP is not in `local_allow_cidrs`. |
 
-Report problems with the log at `log_level: debug`. It never contains keys or
-passwords.
+When reporting a problem, include the log at `log_level: debug`. It never
+contains keys or passwords.
+
+## Credits
+
+The BitTorrent engine is
+[rustTorrent](https://github.com/thedancingdeveloper-org/rusttorrent)
+(`rtbit`), built from its release source with one change: the mimalloc
+allocator.

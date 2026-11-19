@@ -340,8 +340,9 @@ pub fn parse_uid(status: &str) -> Option<u32> {
 // Ingress proxy child
 // ---------------------------------------------------------------------------
 
-/// `<exe> ingress-proxy`, unprivileged, with a piped stdin for the config
-/// and heartbeats.
+/// `<exe> ingress-proxy`, unprivileged. stdin carries the config and the
+/// supervisor's messages, stdout the proxy's requests (benchmark); its log
+/// goes to stderr.
 pub fn ingress_command(exe: &Path, sandbox: bool) -> Command {
     let mut cmd = Command::new(exe);
     cmd.arg("ingress-proxy")
@@ -349,6 +350,7 @@ pub fn ingress_command(exe: &Path, sandbox: bool) -> Command {
         .env("PATH", "/usr/bin:/bin")
         .current_dir("/")
         .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
     if let Ok(tz) = std::env::var("TZ") {
@@ -364,13 +366,19 @@ pub fn ingress_command(exe: &Path, sandbox: bool) -> Command {
     cmd
 }
 
-/// Starts the Ingress proxy and sends it its configuration line. The
-/// returned stdin carries the health heartbeats afterwards.
+/// The Ingress proxy's pipes: heartbeats/replies go in, requests come out.
+#[derive(Debug)]
+pub struct IngressPipes {
+    pub stdin: tokio::process::ChildStdin,
+    pub stdout: tokio::process::ChildStdout,
+}
+
+/// Starts the Ingress proxy and sends it its configuration line.
 pub async fn spawn_ingress(
     exe: &Path,
     config_line: &str,
     sandbox: bool,
-) -> Result<(TrackedChild, tokio::process::ChildStdin)> {
+) -> Result<(TrackedChild, IngressPipes)> {
     let mut cmd = ingress_command(exe, sandbox);
     let mut child = spawn_tracked(&mut cmd)
         .with_context(|| format!("cannot start {} ingress-proxy", exe.display()))?;
@@ -379,6 +387,11 @@ pub async fn spawn_ingress(
         .stdin
         .take()
         .context("the Ingress proxy has no stdin pipe")?;
+    let stdout = child
+        .inner_mut()
+        .stdout
+        .take()
+        .context("the Ingress proxy has no stdout pipe")?;
     stdin
         .write_all(format!("{config_line}\n").as_bytes())
         .await
@@ -395,7 +408,7 @@ pub async fn spawn_ingress(
         }
         info!(pid, "Ingress proxy started (uid {NOBODY}, no capabilities)");
     }
-    Ok((child, stdin))
+    Ok((child, IngressPipes { stdin, stdout }))
 }
 
 // ---------------------------------------------------------------------------
@@ -412,8 +425,10 @@ pub struct RtbitSpec {
     pub download_dir: PathBuf,
     pub completed_dir: PathBuf,
     pub webui_port: u16,
-    pub bind_device: String,
-    pub listen_ip: std::net::Ipv4Addr,
+    /// `Some("wg0")` in VPN mode; `None` on a direct connection.
+    pub bind_device: Option<String>,
+    /// The tunnel address in VPN mode; `None` listens on every address.
+    pub listen_ip: Option<std::net::Ipv4Addr>,
     pub log_level: LogLevel,
     /// DHT on (the default) or off (`RTBIT_DHT_DISABLE`).
     pub dht: bool,
@@ -440,8 +455,12 @@ impl RtbitSpec {
                 format!("0.0.0.0:{}", self.webui_port),
             ),
             ("RTBIT_LISTEN_PORT".into(), listen_port.to_string()),
-            ("RTBIT_LISTEN_IP".into(), self.listen_ip.to_string()),
-            ("RTBIT_BIND_DEVICE".into(), self.bind_device.clone()),
+            (
+                "RTBIT_LISTEN_IP".into(),
+                self.listen_ip
+                    .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED)
+                    .to_string(),
+            ),
             ("RTBIT_IPV4_ONLY".into(), "true".into()),
             // Port mapping is the supervisor's job (NAT-PMP inside the tunnel).
             ("RTBIT_UPNP_PORT_FORWARD_DISABLE".into(), "true".into()),
@@ -462,6 +481,9 @@ impl RtbitSpec {
                 self.log_level.as_str().into(),
             ),
         ];
+        if let Some(dev) = &self.bind_device {
+            env.push(("RTBIT_BIND_DEVICE".into(), dev.clone()));
+        }
         if let Some(filter) = rust_log(self.log_level) {
             env.push(("RUST_LOG".into(), filter.into()));
         }
@@ -719,8 +741,8 @@ mod tests {
             download_dir: "/media/rbittorrent/downloads".into(),
             completed_dir: "/media/rbittorrent/completed".into(),
             webui_port: 8080,
-            bind_device: "wg0".into(),
-            listen_ip: Ipv4Addr::new(10, 2, 0, 2),
+            bind_device: Some("wg0".into()),
+            listen_ip: Some(Ipv4Addr::new(10, 2, 0, 2)),
             log_level: LogLevel::Info,
             dht: true,
             shutdown_timeout: Duration::from_secs(12),
@@ -839,6 +861,22 @@ mod tests {
             spec("x").args(),
             vec!["server", "start", "/media/rbittorrent/downloads"]
         );
+    }
+
+    #[test]
+    fn direct_mode_environment_has_no_tunnel_binding() {
+        let mut sp = spec("x");
+        sp.bind_device = None;
+        sp.listen_ip = None;
+        let env = sp.env(4240);
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("RTBIT_BIND_DEVICE"), None);
+        assert_eq!(get("RTBIT_LISTEN_IP"), Some("0.0.0.0"));
+        assert_eq!(get("RTBIT_LISTEN_PORT"), Some("4240"));
+        // Still no UPnP/LSD/IPv6 on a direct connection.
+        assert_eq!(get("RTBIT_UPNP_PORT_FORWARD_DISABLE"), Some("true"));
+        assert_eq!(get("RTBIT_LSD_DISABLE"), Some("true"));
+        assert_eq!(get("RTBIT_IPV4_ONLY"), Some("true"));
     }
 
     #[test]

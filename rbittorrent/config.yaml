@@ -4,7 +4,8 @@ version: "1.0.0"
 slug: rbittorrent
 description: >-
   Drop-in qBittorrent replacement: the rustTorrent (rtbit) engine behind a
-  fail-closed Proton VPN WireGuard kill-switch with NAT-PMP port forwarding.
+  fail-closed Proton VPN WireGuard kill-switch with NAT-PMP port forwarding
+  (or any WireGuard provider with a static port).
 url: https://github.com/evw-sigib/new_rbittorrent
 arch:
   - aarch64
@@ -46,14 +47,23 @@ panel_title: rBittorrent
 # qBittorrent's default port, so Sonarr/Radarr/Prowlarr, qBitController and
 # Home Assistant's qBittorrent integration keep working unchanged
 # (password-protected, LAN only). Set the host port to empty to disable it.
+#
+# 4240 is the BitTorrent port for the direct connection (VPN off) only: map
+# it (and forward it on your router) for inbound peers. With the VPN on, the
+# kill-switch drops everything that does not come through the tunnel, so a
+# mapping here is never used.
 ports:
   8080/tcp: 8080
+  4240/tcp: null
+  4240/udp: null
 ports_description:
   8080/tcp: Web UI + qBittorrent API (qBittorrent's port; LAN only, password-protected)
+  4240/tcp: BitTorrent peers, VPN off only (keep equal to listen_port)
+  4240/udp: BitTorrent peers and DHT, VPN off only (keep equal to listen_port)
 webui: http://[HOST]:[PORT:8080]/web/
-# 200 only while rtbit runs and the WireGuard handshake is fresh, so the
-# Watchdog toggle restarts the app (and re-resolves the VPN server) when the
-# tunnel stalls.
+# 200 only while rtbit runs and (VPN mode) the WireGuard handshake is
+# fresh, so the Watchdog toggle restarts the app (and re-resolves the VPN
+# server) when the tunnel stalls.
 watchdog: http://[HOST]:[PORT:8099]/__health
 
 map:
@@ -75,6 +85,7 @@ backup_exclude:
   - "cache/*"
 
 options:
+  vpn_enabled: false
   wireguard_conf: ""
   webui_username: admin
   import_from_qbittorrent: true
@@ -93,6 +104,7 @@ options:
   log_level: info
 
 schema:
+  vpn_enabled: bool
   wireguard_conf: str?
   wg_private_key: password?
   wg_public_key: str?

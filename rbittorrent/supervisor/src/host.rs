@@ -92,7 +92,10 @@ pub fn warn_if_low_disk(path: &Path) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortState {
     Forwarded(u16),
+    /// VPN without NAT-PMP: this port is opened on wg0.
     Static(u16),
+    /// No VPN: rtbit listens on this port of the normal connection.
+    Direct(u16),
     /// NAT-PMP is enabled but has no lease yet; rtbit uses the fallback port.
     Pending(u16),
 }
@@ -105,13 +108,19 @@ pub fn status_banner(
     cores: usize,
     storage: &str,
 ) -> String {
-    let ip = match public_ip {
-        Some(ip) => format!("{ip} (verified through the tunnel via NAT-PMP)"),
-        None => "not verified (NAT-PMP disabled or not answering)".to_owned(),
+    let ip = match (port, public_ip) {
+        (PortState::Direct(_), _) => {
+            "VPN OFF: direct connection, your own IP is visible".to_owned()
+        }
+        (_, Some(ip)) => format!("{ip} (verified through the tunnel via NAT-PMP)"),
+        (_, None) => "not verified (NAT-PMP disabled or not answering)".to_owned(),
     };
     let port = match port {
         PortState::Forwarded(p) => format!("{p} TCP+UDP (NAT-PMP, peers can connect)"),
-        PortState::Static(p) => format!("{p} (static, NAT-PMP disabled)"),
+        PortState::Static(p) => format!("{p} TCP+UDP (static, opened on wg0; NAT-PMP off)"),
+        PortState::Direct(p) => {
+            format!("{p} (direct; map it in the Network section for inbound peers)")
+        }
         PortState::Pending(p) => {
             format!("none yet (NAT-PMP retrying; rtbit listens on {p}, inbound peers blocked)")
         }
@@ -125,6 +134,21 @@ pub fn status_banner(
     let _ = writeln!(s, "| Storage         {storage}");
     s.push_str("+---------------------------------------------------------------+");
     s
+}
+
+/// The warning logged at every start without the VPN.
+pub fn direct_mode_banner(listen_port: u16) -> String {
+    let rule = "!".repeat(72);
+    format!(
+        "\n{rule}\n\
+         !! VPN OFF: rBittorrent uses your normal internet connection.\n\
+         !! Peers and trackers see your real IP address, and no kill-switch\n\
+         !! protects you. rtbit listens on port {listen_port}.\n\
+         !! To use Proton VPN, put its WireGuard file in /config/wg0.conf, paste\n\
+         !! it into `wireguard_conf` or fill the `wg_*` fields, and restart:\n\
+         !! the VPN then turns on by itself (fail-closed, no fallback).\n\
+         {rule}"
+    )
 }
 
 /// Best effort: raise `net.core.{r,w}mem_max` so large UDP buffers are
@@ -193,7 +217,18 @@ mod tests {
         let b = status_banner(None, PortState::Pending(4240), "off", 1, "x");
         assert!(b.contains("not verified") && b.contains("none yet"));
         assert!(
-            status_banner(None, PortState::Static(4240), "off", 1, "x").contains("4240 (static")
+            status_banner(None, PortState::Static(4240), "off", 1, "x")
+                .contains("4240 TCP+UDP (static, opened on wg0")
         );
+        let d = status_banner(None, PortState::Direct(4240), "off", 1, "x");
+        assert!(d.contains("VPN OFF") && d.contains("4240 (direct"), "{d}");
+    }
+
+    #[test]
+    fn direct_mode_banner_is_loud_and_explains_the_fix() {
+        let b = direct_mode_banner(4240);
+        assert!(b.contains("VPN OFF") && b.contains("real IP address"));
+        assert!(b.contains("port 4240") && b.contains("/config/wg0.conf"));
+        assert!(b.lines().filter(|l| l.starts_with("!!")).count() >= 6);
     }
 }

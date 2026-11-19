@@ -5,7 +5,7 @@
 //! never a moment with a half-written firewall.
 
 use std::fmt::Write as _;
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use anyhow::{Context, Result, bail};
 
@@ -40,6 +40,8 @@ pub struct RulesetSpec {
     pub wg_fwmark: u32,
     /// Initially open BitTorrent ports (normally empty until NAT-PMP answers).
     pub bt_ports: Vec<u16>,
+    /// The tunnel's DNS servers: the only destinations for port 53.
+    pub dns_servers: Vec<Ipv4Addr>,
 }
 
 /// Linux interface names: 1-15 bytes, no whitespace, quotes or `/`.
@@ -103,6 +105,16 @@ pub fn render_ruleset(spec: &RulesetSpec) -> Result<String> {
         .collect::<Vec<_>>()
         .join(", ");
     let bt_elems = port_elements(&spec.bt_ports);
+    let mut dns = spec.dns_servers.clone();
+    dns.sort_unstable();
+    dns.dedup();
+    // `ip daddr != { }` is invalid, so no DNS server means no DNS at all.
+    let dns_match = if dns.is_empty() {
+        String::new()
+    } else {
+        let list = dns.iter().map(Ipv4Addr::to_string).collect::<Vec<_>>();
+        format!(" ip daddr != {{ {} }}", list.join(", "))
+    };
 
     let mut s = String::with_capacity(4096);
     // `write!` into a String cannot fail; results are discarded explicitly.
@@ -213,6 +225,10 @@ pub fn render_ruleset(spec: &RulesetSpec) -> Result<String> {
     );
     let _ = writeln!(
         s,
+        "\t\toifname \"{wg}\" meta l4proto {{ tcp, udp }} th dport 53{dns_match} counter drop comment \"DNS only to the tunnel's DNS servers\""
+    );
+    let _ = writeln!(
+        s,
         "\t\toifname \"{wg}\" accept comment \"everything else: tunnel only\""
     );
     let _ = writeln!(s, "\t\tcounter comment \"output: dropped by policy\"");
@@ -296,6 +312,7 @@ mod tests {
             endpoint: SocketAddrV4::new(Ipv4Addr::new(190, 2, 131, 156), 51820),
             wg_fwmark: 0xca6c,
             bt_ports: vec![],
+            dns_servers: vec![Ipv4Addr::new(10, 2, 0, 1)],
         }
     }
 
@@ -397,6 +414,34 @@ mod tests {
     }
 
     #[test]
+    fn dns_is_locked_to_the_tunnel_dns_servers() {
+        let rule = |spec: &RulesetSpec| {
+            let r = render_ruleset(spec).unwrap();
+            let out = chain(&r, "output");
+            let dns = out.iter().position(|l| l.contains("th dport 53")).unwrap();
+            let wg = out
+                .iter()
+                .position(|l| l.starts_with("oifname \"wg0\" accept"))
+                .unwrap();
+            assert!(dns < wg, "the DNS rule must come before the tunnel accept");
+            out[dns].to_owned()
+        };
+        let mut sp = spec();
+        assert_eq!(
+            rule(&sp),
+            "oifname \"wg0\" meta l4proto { tcp, udp } th dport 53 ip daddr != { 10.2.0.1 } counter drop comment \"DNS only to the tunnel's DNS servers\""
+        );
+        sp.dns_servers = vec![
+            Ipv4Addr::new(10, 2, 0, 1),
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(10, 2, 0, 1),
+        ];
+        assert!(rule(&sp).contains("ip daddr != { 1.1.1.1, 10.2.0.1 } counter drop"));
+        sp.dns_servers.clear();
+        assert!(rule(&sp).contains("th dport 53 counter drop"));
+    }
+
+    #[test]
     fn input_rules() {
         let r = render_ruleset(&spec()).unwrap();
         let inp = chain(&r, "input");
@@ -455,6 +500,31 @@ mod tests {
         assert_eq!(
             render_bt_port_update(&[]),
             "flush set inet killswitch bt_port\n"
+        );
+    }
+
+    #[test]
+    fn static_port_mode_is_open_on_wg0_from_the_first_ruleset() {
+        // TorGuard / AirVPN / Windscribe: `Settings::static_bt_ports()` is
+        // `[listen_port]` when NAT-PMP is off, and it goes into the very
+        // first (atomic) ruleset, never as a later, separate step.
+        let mut sp = spec();
+        sp.bt_ports = vec![4240];
+        let r = render_ruleset(&sp).unwrap();
+        assert!(r.contains("set bt_port {\n\t\ttype inet_service\n\t\telements = { 4240 }"));
+        let input: Vec<&str> = r
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("@bt_port"))
+            .collect();
+        assert_eq!(input.len(), 2, "{input:?}");
+        assert!(
+            input.iter().all(|l| l.starts_with("iifname \"wg0\"")),
+            "only on the tunnel: {input:?}"
+        );
+        assert!(
+            !r.contains("iifname \"eth0\" tcp dport @bt_port"),
+            "never on the LAN side"
         );
     }
 
@@ -541,6 +611,7 @@ mod tests {
         // 172.30.32.0/23 is covered by 172.16.0.0/12 and collapsed into it.
         assert!(out.contains("elements = { 172.16.0.0/12, 192.168.0.0/16 }"));
         assert!(out.contains("meta nfproto ipv6 drop") || out.contains("nfproto ipv6"));
+        assert!(out.contains("th dport 53 ip daddr != 10.2.0.1"), "{out}");
         set_bt_ports(&runner, &[]).await.unwrap();
         let out = runner
             .run(

@@ -5,6 +5,7 @@
 //! tests in `tests/` can drive the real components (e.g. the Ingress proxy
 //! against a mock rtbit).
 
+pub mod benchmark;
 pub mod bencode;
 pub mod cidr;
 pub mod config;
@@ -25,5 +26,16 @@ pub fn init_logging(level: config::LogLevel) {
         .with_max_level(level.as_tracing())
         .with_target(false)
         .with_writer(std::io::stdout)
+        .init();
+}
+
+/// The same logs on stderr, for the Ingress proxy, whose stdout carries
+/// requests to the supervisor (its stderr is inherited, so the lines still
+/// reach the log tab).
+pub fn init_logging_stderr(level: config::LogLevel) {
+    tracing_subscriber::fmt()
+        .with_max_level(level.as_tracing())
+        .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 }

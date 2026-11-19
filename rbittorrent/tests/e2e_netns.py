@@ -13,6 +13,15 @@ The real supervisor runs in e2e-cli with a stand-in rtbit (fake_rtbit.py).
 The test checks the kill-switch from the outside: nothing may leave e2e-cli
 except the WireGuard envelope and Web UI replies to the LAN.
 
+The app starts with no VPN options at all: it takes the WireGuard file,
+folders, user name, categories and torrents over from a fake qBittorrent
+app's config folder, the way a real user moving from qBittorrent would
+(the copied wg0.conf switches VPN mode on by itself).
+
+A second scenario starts a fresh install with no WireGuard setup anywhere:
+the direct connection (VPN off) must run rtbit on `listen_port` without a
+kill-switch, a tunnel or NAT-PMP, and say loudly that it is unprotected.
+
 Usage: sudo python3 e2e_netns.py --supervisor PATH [--keep]
 """
 
@@ -43,6 +52,14 @@ INGRESS_PORT = 8099
 SUPERVISOR_IP, OTHER_APP_IP = "172.30.32.2", "172.30.32.3"
 PORT_A, PORT_B = 45678, 45679
 CANARY_TCP, CANARY_UDP = 8081, 53
+
+# The old qBittorrent app's config folder (as mounted at /app_configs).
+LEGACY_SLUG = "db21ed7f_qbittorrent"
+LEGACY_USER = "legacyadmin"
+QBT_SAVE = MEDIA / "qbt"
+QBT_TEMP = MEDIA / "qbt" / "incomplete-qbt"
+QBT_TV = MEDIA / "qbt" / "tv"
+HASH_OK, HASH_GONE = "a" * 40, "b" * 40
 
 HERE = Path(__file__).resolve().parent
 FAILURES = []
@@ -311,6 +328,46 @@ def log_text():
     return (WORK / "supervisor.log").read_text(errors="replace")
 
 
+def api_events(path):
+    return [r for r in runs() if r["event"] == "api" and r["path"] == path]
+
+
+def bstr(s):
+    b = s.encode()
+    return str(len(b)).encode() + b":" + b
+
+
+def write_legacy_qbittorrent(root: Path, wg_conf: str):
+    """A qBittorrent app profile like alexbelgium's, with a WireGuard file."""
+    (root / "wireguard").mkdir(parents=True)
+    wg = root / "wireguard" / "wg0.conf"
+    wg.write_text(wg_conf)
+    wg.chmod(0o600)
+    qbt = root / "qBittorrent"
+    (qbt / "BT_backup").mkdir(parents=True)
+    (qbt / "qBittorrent.conf").write_text(
+        "[BitTorrent]\n"
+        f"Session\\DefaultSavePath={QBT_SAVE}/\n"
+        f"Session\\TempPath={QBT_TEMP}\n"
+        "Session\\TempPathEnabled=true\n\n"
+        "[Preferences]\n"
+        f"WebUI\\Username={LEGACY_USER}\n"
+        "WebUI\\Port=8080\n"
+    )
+    (qbt / "categories.json").write_text(json.dumps({
+        "tv-sonarr": {"save_path": str(QBT_TV)},
+        "radarr": {"save_path": ""},
+    }))
+    torrent = (b"d4:infod6:lengthi1e4:name5:a.mkv12:piece lengthi16384e"
+               b"6:pieces20:" + b"x" * 20 + b"ee")
+    for h, save in ((HASH_OK, QBT_TV), (HASH_GONE, MEDIA / "unmounted-disk")):
+        (qbt / "BT_backup" / f"{h}.torrent").write_bytes(torrent)
+        (qbt / "BT_backup" / f"{h}.fastresume").write_bytes(
+            b"d9:save_path" + bstr(str(save)) + b"12:qBt-category" + bstr("tv-sonarr")
+            + b"17:qBt-contentLayout" + bstr("Original") + b"e"
+        )
+
+
 def nft_bt_ports():
     out = sh("nft", "list", "set", "inet", "killswitch", "bt_port", ns=NS_CLI, check=False).stdout
     return out
@@ -326,6 +383,8 @@ def run_test(supervisor: Path):
     shutil.rmtree(WORK, ignore_errors=True)
     (WORK / "data").mkdir(parents=True)
     (WORK / "config").mkdir()
+    (WORK / "share").mkdir()
+    QBT_TV.mkdir(parents=True)
 
     step("network namespaces + WireGuard server")
     cli_priv, cli_pub = wg_keypair()
@@ -356,13 +415,14 @@ PublicKey = {srv_pub}
 AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = {ENDPOINT_IP}:51820
 """
+    write_legacy_qbittorrent(WORK / "app_configs" / LEGACY_SLUG, conf)
+    # No VPN options, default folders and user: everything comes from qBittorrent.
     options = {
-        "wireguard_conf": conf,
+        "import_from_qbittorrent": True,
+        "import_active_torrents": True,
         "enable_nat_pmp": True,
         "nat_pmp_gateway": TUNNEL_GW,
         "listen_port": 4240,
-        "download_dir": str(MEDIA / "downloads"),
-        "completed_dir": str(MEDIA / "completed"),
         "local_allow_cidrs": ["10.99.0.0/24"],
         "enable_dht": False,
         "log_level": "debug",
@@ -389,6 +449,8 @@ Endpoint = {ENDPOINT_IP}:51820
         "RBITTORRENT_CONFIG_ROOT": str(WORK / "config"),
         "RBITTORRENT_RTBIT": str(fake),
         "RBITTORRENT_RESOLV_CONF": str(resolv),
+        "RBITTORRENT_APP_CONFIGS": str(WORK / "app_configs"),
+        "RBITTORRENT_SHARE": str(WORK / "share"),
     }
     sup = subprocess.Popen(
         ["ip", "netns", "exec", NS_CLI, str(supervisor)],
@@ -433,12 +495,25 @@ def checks(sup, cli_priv):
     check(env.get("RTBIT_DHT_DISABLE") == "true", "enable_dht: false -> RTBIT_DHT_DISABLE=true")
     check("RUST_LOG" not in env, "log_level debug passes rtbit's full logs (no RUST_LOG filter)")
 
+    step("qBittorrent takeover (before rtbit starts)")
+    wg0 = WORK / "config" / "wg0.conf"
+    check(wg0.is_file() and (wg0.stat().st_mode & 0o777) == 0o600,
+          "WireGuard file copied to /config/wg0.conf (0600)")
+    check("copied the WireGuard config" in text, "WireGuard takeover logged")
+    check(f"found {WORK / 'app_configs' / LEGACY_SLUG}" in text, "old qBittorrent app found")
+    check(env.get("RTBIT_COMPLETED_FOLDER") == str(QBT_SAVE),
+          f"completed folder = qBittorrent save path ({env.get('RTBIT_COMPLETED_FOLDER')})")
+    check(env.get("RTBIT_DOWNLOAD_FOLDER") == str(QBT_TEMP),
+          f"download folder = qBittorrent temp path ({env.get('RTBIT_DOWNLOAD_FOLDER')})")
+    check("| qBittorrent     from " in text, "status box shows the qBittorrent import")
+
     step("Web UI account set before rtbit starts")
     auths = [r for r in runs() if r["event"] == "auth"]
     check(len(auths) == 1, f"rtbit auth reset-password ran once ({len(auths)})")
     if auths:
         a = auths[0]
-        check(a["argv"] == ["auth", "reset-password", "-u", "admin"], f"auth argv {a['argv']}")
+        check(a["argv"] == ["auth", "reset-password", "-u", LEGACY_USER],
+              f"imported qBittorrent user name used ({a['argv']})")
         check(a["password_len"] == 24, "generated 24-character password arrived on stdin")
         check(not a["password_in_argv"] and not a["password_in_env"], "password not in argv/env")
         check(a["time"] < first["time"], "credentials stored before rtbit started")
@@ -448,11 +523,37 @@ def checks(sup, cli_priv):
     if pw_file.exists():
         check(pw_file.read_text().strip() not in text, "Web UI password never logged")
     check("generated a random password" in text, "generated password announced in the log")
-    check(Path(MEDIA / "downloads").is_dir() and Path(MEDIA / "completed").is_dir(),
-          "download/completed folders created")
+    check(QBT_SAVE.is_dir() and QBT_TEMP.is_dir(), "imported download/completed folders exist")
+    check(not Path("/media/rbittorrent").exists(), "default folders not created (import wins)")
     resolv = (WORK / "resolv.conf").read_text()
     check("nameserver 10.2.0.1" in resolv and "8.8.8.8" not in resolv,
           "resolv.conf locked to in-tunnel DNS")
+
+    step("qBittorrent import into the running rtbit")
+    wait_for(lambda: "qBittorrent import finished" in log_text(), 60, "qBittorrent import")
+    text = log_text()
+    logins = api_events("/api/v2/auth/login")
+    check(any(e["ok"] and e["username"] == LEGACY_USER for e in logins),
+          f"signed in to rtbit's qBittorrent API as {LEGACY_USER}")
+    check(not [r for r in runs() if r.get("denied")], "no API call without the session cookie")
+    cats = {e["form"].get("category"): e["form"].get("savePath")
+            for e in api_events("/api/v2/torrents/createCategory")}
+    check(cats.get("tv-sonarr") == str(QBT_TV), f"category tv-sonarr with its save path ({cats})")
+    check("radarr" in cats, "category without its own save path imported too")
+    adds = api_events("/api/v2/torrents/add")
+    check(len(adds) == 1, f"one torrent re-added, the missing one skipped ({len(adds)})")
+    if adds:
+        f = adds[0]["fields"]
+        check(f.get("savepath") == str(QBT_TV) and f.get("category") == "tv-sonarr",
+              f"torrent added at its old save path + category ({f})")
+        check(f.get("torrents", {}).get("filename") == f"{HASH_OK}.torrent"
+              and f.get("contentLayout") == "Original" and f.get("stopped") == "false",
+              "torrent file, layout and state passed on")
+    check(f"{HASH_GONE}.torrent" in text and "does not exist" in text,
+          "torrent with a missing save path reported as skipped")
+    for marker in (".migrated", ".torrents_migrated"):
+        m = WORK / "config" / marker
+        check(m.is_file() and (m.stat().st_mode & 0o777) == 0o600, f"/config/{marker} written (0600)")
 
     step("rtbit capability sandbox")
     st = first["status"]
@@ -564,6 +665,8 @@ def checks(sup, cli_priv):
     wait_for(lambda: len(starts()) >= 3, 30, "rtbit respawn")
     check(starts()[2]["env"]["RTBIT_LISTEN_PORT"] == str(PORT_B), "respawned on the same port")
 
+    check(len(api_events("/api/v2/torrents/add")) == 1, "rtbit restarts do not import twice")
+
     step("orderly shutdown on SIGTERM")
     third = starts()[2]
     sup.send_signal(signal.SIGTERM)
@@ -580,6 +683,101 @@ def checks(sup, cli_priv):
     check("wg0" not in links, "wg0 removed")
     text = log_text()
     check(text.find("rtbit stopped") < text.find("shutdown complete"), "rtbit stopped before tunnel teardown")
+
+
+def run_direct_test(supervisor: Path):
+    """Fresh install, no WireGuard anywhere: direct connection (VPN off)."""
+    cleanup()
+    shutil.rmtree(WORK, ignore_errors=True)
+    (WORK / "data").mkdir(parents=True)
+    (WORK / "config").mkdir()
+    (WORK / "share").mkdir()
+    (WORK / "app_configs").mkdir()
+
+    step("direct mode: network namespaces (the WireGuard server stays unused)")
+    _, cli_pub = wg_keypair()
+    setup_network(cli_pub)
+    sup_copy = WORK / "rbittorrent-supervisor"
+    shutil.copy(supervisor, sup_copy)
+    sup_copy.chmod(0o755)
+    fake = WORK / "fake_rtbit.py"
+    shutil.copy(HERE / "fake_rtbit.py", fake)
+    fake.chmod(0o755)
+    resolv = WORK / "resolv.conf"
+    resolv.write_text("nameserver 8.8.8.8\n")
+    options = {
+        "listen_port": 4240,
+        "download_dir": str(MEDIA / "downloads"),
+        "completed_dir": str(MEDIA / "completed"),
+        "local_allow_cidrs": ["10.99.0.0/24"],
+        "enable_dht": False,
+        "log_level": "debug",
+    }
+    (WORK / "data" / "options.json").write_text(json.dumps(options))
+    inet = subprocess.Popen(
+        ["ip", "netns", "exec", NS_INET, sys.executable, str(Path(__file__).resolve()),
+         "--role", "inet", "--state", str(WORK / "inet.json"),
+         "--switch", str(WORK / "switch_port")],
+    )
+    log = open(WORK / "supervisor.log", "w")
+    env = {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "RBITTORRENT_OPTIONS": str(WORK / "data" / "options.json"),
+        "RBITTORRENT_CONFIG_ROOT": str(WORK / "config"),
+        "RBITTORRENT_RTBIT": str(fake),
+        "RBITTORRENT_RESOLV_CONF": str(resolv),
+        "RBITTORRENT_APP_CONFIGS": str(WORK / "app_configs"),
+        "RBITTORRENT_SHARE": str(WORK / "share"),
+    }
+    step("direct mode: start rbittorrent-supervisor without any VPN setup")
+    sup = subprocess.Popen(
+        ["ip", "netns", "exec", NS_CLI, str(sup_copy)],
+        env=env, stdout=log, stderr=subprocess.STDOUT,
+    )
+    try:
+        wait_for(lambda: starts(), 60, "rtbit (fake) to start on a direct connection")
+        first = starts()[0]
+        text = log_text()
+        check("VPN OFF" in text, "loud warning: the connection is unprotected")
+        check("real IP address" in text, "the warning says peers see the real IP address")
+        check(first["env"].get("RTBIT_LISTEN_PORT") == "4240", "rtbit listens on listen_port 4240")
+        check("RTBIT_BIND_DEVICE" not in first["env"], "rtbit is not bound to wg0")
+        check(first["env"].get("RTBIT_LISTEN_IP") == "0.0.0.0", "rtbit listens on all addresses")
+        check("SUPERVISOR_TOKEN" not in first["env"], "no Supervisor token in rtbit's environment")
+        tables = sh("nft", "list", "tables", ns=NS_CLI, check=False).stdout
+        check("killswitch" not in tables, f"no kill-switch table in direct mode ({tables.strip()!r})")
+        links = sh("ip", "link", "show", ns=NS_CLI).stdout
+        check("wg0" not in links, "no wg0 in direct mode")
+        check(resolv.read_text() == "nameserver 8.8.8.8\n", "resolv.conf untouched")
+        check(not inet_state()["pmp"], "no NAT-PMP requests")
+        ok, out = tcp_probe(NS_RTR, "10.99.0.2", 4240)
+        check(ok, f"peers can reach listen_port 4240 directly ({out})")
+        status, body = wait_for(
+            lambda: (lambda r: r if r[0] == 200 else None)(
+                http_get(NS_RTR, SUPERVISOR_IP, "10.99.0.2", INGRESS_PORT, "/__health")),
+            60, "watchdog /__health = 200 in direct mode")
+        check('"vpn":false' in body and '"port":4240' in body,
+              f"/__health reports the direct connection for the status bar ({body})")
+        status, body = http_get(NS_RTR, OTHER_APP_IP, "10.99.0.2", INGRESS_PORT, "/__health")
+        check(status == 403, f"the Ingress proxy still refuses other apps ({status})")
+
+        step("direct mode: orderly shutdown on SIGTERM")
+        sup.send_signal(signal.SIGTERM)
+        try:
+            code = sup.wait(timeout=40)
+        except subprocess.TimeoutExpired:
+            code = None
+        check(code == 0, f"supervisor exited 0 (got {code})")
+        stops = [r for r in runs() if r["event"] == "stop"]
+        check(any(r["pid"] == first["pid"] for r in stops), "rtbit stopped gracefully")
+    finally:
+        if sup.poll() is None:
+            sup.kill()
+        inet.terminate()
+        log.close()
+        print("\n----- supervisor log (direct mode) -----")
+        print(log_text())
+        print("----- end of log -----")
 
 
 def main():
@@ -599,14 +797,15 @@ def main():
     if not a.supervisor or not a.supervisor.exists():
         print("--supervisor PATH is required", file=sys.stderr)
         return 2
-    try:
-        run_test(a.supervisor.resolve())
-    except Exception as e:  # noqa: BLE001 - report any setup failure as a test failure
-        FAILURES.append(f"aborted: {e}")
-        print(f"\nABORTED: {e}", flush=True)
-    finally:
-        if not a.keep:
-            cleanup()
+    for scenario in (run_test, run_direct_test):
+        try:
+            scenario(a.supervisor.resolve())
+        except Exception as e:  # noqa: BLE001 - report any setup failure as a test failure
+            FAILURES.append(f"{scenario.__name__} aborted: {e}")
+            print(f"\nABORTED: {e}", flush=True)
+        finally:
+            if not a.keep:
+                cleanup()
     if FAILURES:
         print(f"\n{len(FAILURES)} check(s) failed:")
         for f in FAILURES:
