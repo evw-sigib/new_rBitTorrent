@@ -1,0 +1,25 @@
+diff --git a/crates/rtbit/src/main.rs b/crates/rtbit/src/main.rs
+index 7832fde..b806880 100644
+--- a/crates/rtbit/src/main.rs
++++ b/crates/rtbit/src/main.rs
+@@ -1458,10 +1458,19 @@ async fn start_http_api(
+ 
+     let listen_addr = listener.bind_addr();
+     http_api_opts.web_ui_port = Some(listen_addr.port());
++    // rBittorrent: credentials in the credential store (`rtbit auth
++    // reset-password`) protect the API too, so the banner must not claim
++    // that auth is "not set up" when only those exist.
+     let basic_auth_user = http_api_opts
+         .basic_auth
+         .as_ref()
+-        .map(|(user, _)| user.clone());
++        .map(|(user, _)| user.clone())
++        .or_else(|| {
++            http_api_opts
++                .credential_store
++                .as_ref()
++                .and_then(|store| store.username())
++        });
+     log_startup_banner(listen_addr, basic_auth_user.as_deref(), &startup);
+     let http_api = HttpApi::new(api, Some(http_api_opts));
+ 

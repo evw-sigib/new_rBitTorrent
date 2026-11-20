@@ -1,0 +1,129 @@
+diff --git a/crates/librtbit/src/http_api/handlers/qbit/app.rs b/crates/librtbit/src/http_api/handlers/qbit/app.rs
+index 7cacc4b..007fe47 100644
+--- a/crates/librtbit/src/http_api/handlers/qbit/app.rs
++++ b/crates/librtbit/src/http_api/handlers/qbit/app.rs
+@@ -19,7 +19,32 @@ pub(super) async fn h_app_webapi_version() -> &'static str {
+ }
+ 
+ pub(super) async fn h_app_default_save_path(State(state): State<Arc<QbitState>>) -> String {
+-    state.api_state.api.api_output_folder()
++    qbit_save_paths(&state.api_state.api).0
++}
++
++/// The save path and temp path as qBittorrent reports them. With a completed
++/// folder set, finished torrents end up there, so that is the save path, and
++/// unfinished ones sit in the download folder, which is what qBittorrent calls
++/// the temp path. Sonarr and Radarr check their remote path mappings against
++/// the save path. Without a completed folder, everything stays in the download
++/// folder.
++pub(super) fn qbit_save_paths(api: &Api) -> (String, Option<String>) {
++    let output = api.api_output_folder();
++    match api.api_completed_folder() {
++        Some(completed) => (completed_root(&completed), Some(output)),
++        None => (output, None),
++    }
++}
++
++/// A `{category}` template names one folder per category; the fixed part in
++/// front of the placeholder is the folder they all live in.
++fn completed_root(folder: &str) -> String {
++    match folder.split_once("{category}") {
++        Some((root, _)) if !root.trim_end_matches('/').is_empty() => {
++            root.trim_end_matches('/').to_owned()
++        }
++        _ => folder.to_owned(),
++    }
+ }
+ 
+ pub(super) async fn h_app_build_info() -> impl IntoResponse {
+@@ -35,15 +60,15 @@ pub(super) async fn h_app_build_info() -> impl IntoResponse {
+ pub(super) async fn h_app_preferences(
+     State(state): State<Arc<QbitState>>,
+ ) -> axum::Json<QbitPreferences> {
+-    let save_path = state.api_state.api.api_output_folder();
++    let (save_path, temp_path) = qbit_save_paths(&state.api_state.api);
+     let session = state.api_state.api.session();
+     let (download, upload) = session.normal_rate_limits();
+     let alt = session.alt_speed_status().config;
+ 
+     axum::Json(QbitPreferences {
+         save_path,
+-        temp_path_enabled: false,
+-        temp_path: String::new(),
++        temp_path_enabled: temp_path.is_some(),
++        temp_path: temp_path.unwrap_or_default(),
+         max_connec: -1,
+         max_connec_per_torrent: -1,
+         max_uploads: -1,
+diff --git a/crates/librtbit/src/http_api/handlers/qbit/tests.rs b/crates/librtbit/src/http_api/handlers/qbit/tests.rs
+index d6f75cc..c62b0a9 100644
+--- a/crates/librtbit/src/http_api/handlers/qbit/tests.rs
++++ b/crates/librtbit/src/http_api/handlers/qbit/tests.rs
+@@ -17,11 +17,11 @@ use crate::{
+ use super::{
+     AddTaskForm, CreatorParams, CreatorStatus, CreatorTask, QbitSessions, QbitState,
+     QbitTorrentCreator, RequiredTaskIdQuery, SyncSnapshots, creator_params, creator_task_status,
+-    h_app_preferences, h_app_set_preferences, h_app_version, h_torrentcreator_add_task,
+-    h_torrentcreator_delete_task, h_torrentcreator_torrent_file, h_torrents_add_tags,
+-    h_torrents_create_tags, h_torrents_delete_tags, h_torrents_info, h_torrents_recheck,
+-    h_torrents_remove_tags, h_torrents_rename_tag, h_torrents_set_tags, matches_category,
+-    origin_allowed, qbit_file_name,
++    h_app_default_save_path, h_app_preferences, h_app_set_preferences, h_app_version,
++    h_torrentcreator_add_task, h_torrentcreator_delete_task, h_torrentcreator_torrent_file,
++    h_torrents_add_tags, h_torrents_create_tags, h_torrents_delete_tags, h_torrents_info,
++    h_torrents_recheck, h_torrents_remove_tags, h_torrents_rename_tag, h_torrents_set_tags,
++    matches_category, origin_allowed, qbit_file_name,
+ };
+ 
+ async fn qbit_state() -> (Arc<QbitState>, Arc<Session>, tempfile::TempDir) {
+@@ -83,6 +83,50 @@ async fn preferences_reports_fixed_listener_and_runtime_announce_port() {
+     assert_eq!(preferences.web_ui_port, 3031);
+ }
+ 
++#[tokio::test]
++async fn save_path_is_the_completed_folder_with_the_download_folder_as_temp_path() {
++    let (state, session, output) = qbit_state().await;
++    let download = output.path().to_string_lossy().into_owned();
++
++    // No completed folder: everything stays in the download folder.
++    let preferences = serde_json::to_value(
++        h_app_preferences(axum::extract::State(state.clone()))
++            .await
++            .0,
++    )
++    .unwrap();
++    assert_eq!(preferences["save_path"], download.as_str());
++    assert_eq!(preferences["temp_path_enabled"], false);
++    assert_eq!(preferences["temp_path"], "");
++    assert_eq!(
++        h_app_default_save_path(axum::extract::State(state.clone())).await,
++        download
++    );
++
++    // A completed folder is where finished torrents end up.
++    session.set_completed_folder(Some("/media/completed".into()));
++    let preferences = serde_json::to_value(
++        h_app_preferences(axum::extract::State(state.clone()))
++            .await
++            .0,
++    )
++    .unwrap();
++    assert_eq!(preferences["save_path"], "/media/completed");
++    assert_eq!(preferences["temp_path_enabled"], true);
++    assert_eq!(preferences["temp_path"], download.as_str());
++    assert_eq!(
++        h_app_default_save_path(axum::extract::State(state.clone())).await,
++        "/media/completed"
++    );
++
++    // A per-category template reports the folder the categories live in.
++    session.set_completed_folder(Some("/media/completed/{category}".into()));
++    assert_eq!(
++        h_app_default_save_path(axum::extract::State(state)).await,
++        "/media/completed"
++    );
++}
++
+ #[tokio::test]
+ async fn set_preferences_updates_port_idempotently_without_rebinding_listener() {
+     let (state, session, _output) = qbit_state().await;

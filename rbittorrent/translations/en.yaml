@@ -1,0 +1,159 @@
+---
+configuration:
+  vpn_enabled:
+    name: VPN (WireGuard kill-switch)
+    description: >-
+      On: all torrent traffic goes through WireGuard behind a fail-closed
+      kill-switch; if the tunnel is down, nothing leaks, rtbit simply waits.
+      Switched on automatically as soon as /config/wg0.conf exists (also one
+      taken over from qBittorrent) or any WireGuard field below is filled
+      in; an incomplete WireGuard setup then stops the app instead of
+      falling back. Off with no WireGuard setup at all (a fresh install):
+      rtbit uses your normal internet connection and your own IP address is
+      visible to peers and trackers; the log and the sidebar say so.
+  wireguard_conf:
+    name: WireGuard configuration (paste)
+    description: >-
+      Setup method 2. Paste the complete .conf file from
+      account.protonvpn.com → Downloads → WireGuard configuration (create it
+      with "NAT-PMP (Port Forwarding)" on and a P2P server). Line breaks may
+      be lost when pasting: a single line, or one with "; " between entries,
+      works too. Ignored when /config/wg0.conf exists (method 1, which is
+      also filled in automatically from an old qBittorrent app's WireGuard
+      file). The separate fields below only fill in values the paste does
+      not contain.
+  wg_private_key:
+    name: Private key
+    description: >-
+      Setup method 3 (only when there is no wg0.conf and no paste):
+      [Interface] PrivateKey, 44 characters ending in '='.
+  wg_public_key:
+    name: Server public key
+    description: "Method 3: [Peer] PublicKey of the VPN server."
+  wg_preshared_key:
+    name: Preshared key
+    description: "Method 3: [Peer] PresharedKey. Proton does not use one; leave empty."
+  wg_endpoint:
+    name: Server endpoint
+    description: >-
+      Method 3: [Peer] Endpoint as host:port, e.g. 190.2.131.156:51820.
+      Hostnames are resolved once at startup, before the kill-switch locks
+      DNS. IPv4 only.
+  wg_address:
+    name: Tunnel address
+    description: >-
+      Method 3: [Interface] Address, e.g. 10.2.0.2/32. IPv6 addresses are
+      ignored (all IPv6 traffic is blocked).
+  wg_dns:
+    name: DNS servers
+    description: >-
+      Comma-separated DNS servers, reached only through the tunnel. Defaults
+      to Proton's 10.2.0.1.
+  webui_username:
+    name: Web UI username
+    description: >-
+      Account for the Web UI and the qBittorrent-compatible API on port 8080
+      (Sonarr, Radarr, Prowlarr, qBitController, the qBittorrent
+      integration). The Home Assistant sidebar signs in with it
+      automatically. Left at "admin", an imported qBittorrent user name is
+      used instead.
+  webui_password:
+    name: Web UI password
+    description: >-
+      8-256 characters. Moving from qBittorrent? Enter its old Web UI
+      password here and your *arr apps keep working unchanged (qBittorrent
+      stores only a hash, so the password cannot be imported). Leave empty to
+      have a random password generated once and saved in
+      /config/.webui-password. Applied on every start, so this field always
+      wins.
+  import_from_qbittorrent:
+    name: Import from qBittorrent
+    description: >-
+      On the first start, take over an existing qBittorrent installation
+      (another app's config folder, /share/qBittorrent or
+      /config/qBittorrent): its WireGuard file (when the VPN fields here are
+      empty), its save folders and user name (when these options are left at
+      their defaults) and all categories with their save paths. Runs once;
+      delete /config/.migrated to run it again.
+  import_active_torrents:
+    name: Import active torrents
+    description: >-
+      Also re-add every torrent from qBittorrent at its old save path: rtbit
+      checks the existing files and keeps seeding without downloading again.
+      Stop the qBittorrent app first so both do not seed the same files. Can
+      be switched on later; runs once (see /config/.torrents_migrated).
+  enable_dht:
+    name: DHT
+    description: >-
+      Find peers through the BitTorrent DHT (recommended). Turn off for
+      private trackers that forbid it.
+  enable_nat_pmp:
+    name: NAT-PMP port forwarding
+    description: >-
+      Lease a public port from the VPN gateway (RFC 6886) and pass it to
+      rtbit, so other peers can connect to you. Needs a Proton plan with
+      port forwarding, a P2P server and a config generated with NAT-PMP on.
+      Turn off for providers that forward one fixed port (TorGuard, AirVPN,
+      Windscribe, ...): set that port as the listen port and it is opened on
+      the tunnel instead (static port mode).
+  nat_pmp_gateway:
+    name: NAT-PMP gateway
+    description: Gateway inside the tunnel that answers NAT-PMP. Proton uses 10.2.0.1.
+  listen_port:
+    name: Listen port
+    description: >-
+      rtbit's BitTorrent port. VPN off: the port on your normal connection
+      (map 4240 in the Network section and on your router for inbound
+      peers). VPN with NAT-PMP off: the fixed port your provider forwards
+      to you, opened on the tunnel only. With NAT-PMP, the leased port
+      replaces it automatically (this one is used until the first lease).
+  download_dir:
+    name: Download folder
+    description: >-
+      Incomplete downloads. Must be below /media, /share or /config. The log
+      warns loudly when less than 1 GiB is free here (e.g. a USB disk that
+      is no longer mounted).
+  completed_dir:
+    name: Completed folder
+    description: >-
+      Finished torrents are moved here. Must be below /media, /share or
+      /config. Keep it on the same disk as the download folder (and as your
+      media library, for Sonarr/Radarr hardlinks). Clear it to keep finished
+      torrents in the download folder, as qBittorrent does by default.
+      Torrents saved elsewhere (a category folder, a path Sonarr/Radarr
+      chose) are never moved.
+  local_allow_cidrs:
+    name: LAN networks allowed to reach port 8080
+    description: >-
+      Private IPv4 networks that may connect to the Web UI and qBittorrent
+      API on port 8080 (password-protected). Home Assistant's internal
+      network 172.30.32.0/23 is always added. These networks only ever get
+      replies; they never receive torrent traffic. Proton's in-tunnel
+      addresses (DNS, NAT-PMP gateway) always stay inside the tunnel.
+  log_level:
+    name: Log level
+    description: >-
+      Verbosity of the supervisor and rtbit. At "info", rtbit's per-peer and
+      DHT messages are reduced to warnings to spare SD cards; choose "debug"
+      to see everything.
+  allow_unsandboxed:
+    name: Allow running without the filesystem sandbox
+    description: >-
+      Leave this off. The app refuses to start when neither its AppArmor
+      profile nor Landlock can confine rtbit, because rtbit could then read
+      your WireGuard key, the Web UI password and other apps' files. Turn it
+      on only to accept that risk on a host without either.
+network:
+  8080/tcp: >-
+    Web UI and qBittorrent-compatible API on qBittorrent's own default port,
+    for LAN browsers, Sonarr/Radarr/Prowlarr, qBitController and the
+    qBittorrent integration (password-protected). The sidebar does not need
+    this port.
+  4240/tcp: >-
+    BitTorrent peers on a direct connection (VPN off) only. The app forwards
+    it to the listen port inside the container. Unused with the VPN on: the
+    tunnel carries all torrent traffic.
+  4240/udp: >-
+    Reserved for uTP peers. rtbit accepts peers over TCP only (its uTP is
+    experimental and off), and its DHT and UDP trackers use their own
+    ports, so leave this empty.

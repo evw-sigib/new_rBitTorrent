@@ -1,0 +1,127 @@
+#include <tunables/global>
+
+# rBittorrent's AppArmor profile. The Supervisor loads it for the app and
+# renames the profile to the app's slug. Home Assistant OS kernels have no
+# Landlock, so this is the filesystem sandbox there.
+#
+# The container's own processes (the Rust supervisor, PID 1) keep what
+# Docker's default profile allows. rtbit and the Ingress proxy each switch to
+# a child profile when they are started: rtbit can only reach shared storage
+# (/media, /share) and its own state in /config, never /data, /app_configs,
+# the WireGuard configuration or another process's memory or environment.
+# The supervisor verifies both switches and refuses to run a child that is
+# not confined.
+profile rbittorrent flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # The supervisor: WireGuard, nftables and routes (netlink), NAT-PMP, the
+  # Supervisor API, the qBittorrent takeover.
+  file,
+  network,
+  capability,
+  unix,
+  signal,
+  ptrace (read, readby),
+  umount,
+
+  # The same hardening as Docker's default profile.
+  deny @{PROC}/* w,
+  deny @{PROC}/{[^1-9],[^1-9][^0-9],[^1-9s][^0-9y][^0-9s],[^1-9][^0-9][^0-9][^0-9/]*}/** w,
+  deny @{PROC}/sys/[^k]** w,
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+  deny mount,
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  # How the children get there: the forked child changes to its profile
+  # (`change_profile`) before it sets no_new_privs and runs the binary, which
+  # then stays in that profile (`ix`). An exec transition (`cx`) would come
+  # after no_new_privs, and AppArmor refuses those. The Supervisor renames
+  # this profile to the app's slug (`local_rbittorrent`,
+  # `1a2b3c4d_rbittorrent`), hence the pattern.
+  change_profile -> {,*_}rbittorrent//{rtbit,ingress},
+
+  profile rtbit flags=(attach_disconnected,mediate_deleted) {
+    #include <abstractions/base>
+
+    # The capabilities rtbit keeps (the supervisor drops all others).
+    capability chown,
+    capability dac_override,
+    capability fowner,
+    capability fsetid,
+
+    network inet stream,
+    network inet dgram,
+    network inet6 stream,
+    network inet6 dgram,
+    network netlink raw,
+    network netlink dgram,
+    # The async runtime's signal handling (a socketpair).
+    network unix stream,
+    unix (create, getattr, getopt, setopt, shutdown, send, receive, connect) type=stream,
+
+    signal (receive),
+    ptrace (readby),
+
+    /usr/local/bin/rtbit mrix,
+    /etc/** r,
+    /usr/share/zoneinfo/** r,
+    @{PROC}/** r,
+    /sys/** r,
+    /dev/null rw,
+    /dev/zero r,
+    /dev/random r,
+    /dev/urandom r,
+
+    # Shared storage: downloads, completed torrents, imported torrents.
+    /media/ r,
+    /media/** rwlk,
+    /share/ r,
+    /share/** rwlk,
+    # Its database and cache (/config/db, /config/cache), and download
+    # folders placed under /config.
+    /config/ r,
+    /config/** rwlk,
+
+    # Never: the WireGuard configuration (and its temporary files), the
+    # generated Web UI password, the app's options and secrets,
+    # other apps' folders, the supervisor's memory and environment.
+    deny /config/*.conf rwlk,
+    deny /config/.* rwlk,
+    deny /config/wireguard/** rwlk,
+    deny /data/** rwlk,
+    deny /app_configs/** rwlk,
+    deny /addon_configs/** rwlk,
+    deny @{PROC}/1/** rw,
+  }
+
+  profile ingress flags=(attach_disconnected,mediate_deleted) {
+    #include <abstractions/base>
+
+    # Port 8099 and the connection to rtbit's Web UI on 127.0.0.1:8080.
+    network inet stream,
+    network inet dgram,
+    network unix stream,
+    unix (create, getattr, getopt, setopt, shutdown, send, receive, connect) type=stream,
+
+    signal (receive),
+    ptrace (readby),
+
+    /usr/local/bin/rbittorrent-supervisor mrix,
+    /etc/** r,
+    /usr/share/zoneinfo/** r,
+    owner @{PROC}/@{pid}/** r,
+    @{PROC}/sys/vm/overcommit_memory r,
+    # The allocator checks whether transparent huge pages are on.
+    /sys/kernel/mm/transparent_hugepage/enabled r,
+    /dev/null rw,
+    /dev/urandom r,
+  }
+}
