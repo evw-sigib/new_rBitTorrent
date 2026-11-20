@@ -1,8 +1,34 @@
 diff --git a/crates/librtbit/src/session/mod.rs b/crates/librtbit/src/session/mod.rs
-index a867d34..262e3ca 100644
+index a867d34..d74396f 100644
 --- a/crates/librtbit/src/session/mod.rs
 +++ b/crates/librtbit/src/session/mod.rs
-@@ -1786,9 +1786,27 @@ impl Session {
+@@ -90,6 +90,16 @@ pub const SUPPORTED_SCHEMES: [&str; 4] = ["http:", "https:", "magnet:", "file:"]
+ 
+ pub type TorrentId = usize;
+ 
++/// Whether a file move failed only because the target is on another
++/// filesystem (a rename cannot cross filesystems).
++fn crosses_devices(error: &anyhow::Error) -> bool {
++    error.chain().any(|cause| {
++        cause
++            .downcast_ref::<std::io::Error>()
++            .is_some_and(|e| e.kind() == std::io::ErrorKind::CrossesDevices)
++    })
++}
++
+ fn expand_folder_template(folder: &Path, category: Option<&str>) -> PathBuf {
+     let folder = folder.to_string_lossy();
+     if !folder.contains("{category}") {
+@@ -1756,7 +1766,7 @@ impl Session {
+     /// Move all files of a completed torrent from its current output folder
+     /// to the target folder.
+     async fn move_completed_torrent(
+-        &self,
++        self: &Arc<Self>,
+         id: TorrentId,
+         handle: &ManagedTorrentHandle,
+         target_folder: PathBuf,
+@@ -1786,9 +1796,27 @@ impl Session {
          let category = handle.shared().category.read().clone();
          let session_output =
              expand_folder_template(&self.output_folder.read().clone(), category.as_deref());
@@ -33,3 +59,236 @@ index a867d34..262e3ca 100644
  
          let dest_base = if relative_path == Path::new("") {
              target_folder.clone()
+@@ -1796,70 +1824,99 @@ impl Session {
+             target_folder.join(relative_path)
+         };
+ 
+-        // Create the destination base directory
+-        tokio::fs::create_dir_all(&dest_base)
+-            .await
+-            .with_context(|| format!("error creating completed directory {dest_base:?}"))?;
++        // The torrent moves with its files, so the API reports the new path
++        // and the next start finds the files there. On the same filesystem
++        // the files are renamed while the torrent keeps seeding.
++        let moved = match handle.relocate_files(dest_base.clone()) {
++            Ok(()) => {
++                self.try_update_persistence_metadata(handle).await;
++                Ok(())
++            }
++            Err(error) if crosses_devices(&error) => {
++                debug!(
++                    id,
++                    "completed folder is on another filesystem, copying the files"
++                );
++                self.copy_completed_torrent(id, handle, &metadata, &current_output, &dest_base)
++                    .await
++            }
++            Err(error) => Err(error),
++        };
++        moved.with_context(|| format!("error moving the torrent to {dest_base:?}"))?;
+ 
+-        // Move each file
++        // Remove the folders the files left behind, up to the download folder.
+         for fi in metadata.file_infos.iter() {
+-            if fi.attrs.padding {
+-                continue;
++            let mut dir = current_output.join(&fi.relative_filename);
++            while dir.pop() && dir.starts_with(&current_output) && dir != session_output {
++                if tokio::fs::remove_dir(&dir).await.is_err() {
++                    break;
++                }
+             }
++        }
+ 
+-            let src = current_output.join(&fi.relative_filename);
+-            let dst = dest_base.join(&fi.relative_filename);
+-
+-            // Create parent directories for the destination if needed
+-            if let Some(parent) = dst.parent() {
+-                tokio::fs::create_dir_all(parent)
+-                    .await
+-                    .with_context(|| format!("error creating directory {parent:?}"))?;
+-            }
++        info!(id, ?dest_base, "completed torrent moved successfully");
++        Ok(())
++    }
+ 
+-            // Try rename first (fast, same filesystem)
+-            match tokio::fs::rename(&src, &dst).await {
+-                Ok(()) => {
+-                    debug!(id, ?src, ?dst, "moved file via rename");
++    /// A move to another filesystem: copy every file, point the (paused)
++    /// torrent at the copies, then delete the originals. A finished torrent
++    /// only reads its files, so they do not change while they are copied.
++    async fn copy_completed_torrent(
++        self: &Arc<Self>,
++        id: TorrentId,
++        handle: &ManagedTorrentHandle,
++        metadata: &TorrentMetadata,
++        from: &Path,
++        to: &Path,
++    ) -> anyhow::Result<()> {
++        let files: Vec<(PathBuf, PathBuf)> = metadata
++            .file_infos
++            .iter()
++            .filter(|fi| !fi.attrs.padding)
++            .map(|fi| {
++                (
++                    from.join(&fi.relative_filename),
++                    to.join(&fi.relative_filename),
++                )
++            })
++            .filter(|(src, _)| src.exists())
++            .collect();
++        let mut copied = Vec::new();
++        let result: anyhow::Result<()> = async {
++            for (src, dst) in &files {
++                if tokio::fs::try_exists(dst).await.unwrap_or(true) {
++                    anyhow::bail!("cannot move to {dst:?}: destination already exists");
+                 }
+-                Err(rename_err) => {
+-                    // Rename failed (likely cross-device), fall back to copy + delete
+-                    debug!(
+-                        id,
+-                        ?src,
+-                        ?dst,
+-                        "rename failed ({rename_err}), falling back to copy+delete"
+-                    );
+-                    tokio::fs::copy(&src, &dst)
++                if let Some(parent) = dst.parent() {
++                    tokio::fs::create_dir_all(parent)
+                         .await
+-                        .with_context(|| format!("error copying {src:?} to {dst:?}"))?;
+-                    tokio::fs::remove_file(&src).await.with_context(|| {
+-                        format!("error removing source file {src:?} after copy")
+-                    })?;
+-                    debug!(id, ?src, ?dst, "moved file via copy+delete");
++                        .with_context(|| format!("error creating directory {parent:?}"))?;
+                 }
++                copied.push(dst.clone());
++                tokio::fs::copy(src, dst)
++                    .await
++                    .with_context(|| format!("error copying {src:?} to {dst:?}"))?;
+             }
++            let to = to.to_owned();
++            self.with_writes_paused(handle, |h| h.rebind_location(to))
++                .await
+         }
+-
+-        // Try to clean up empty source directories
+-        if current_output != session_output
+-            && let Err(e) = tokio::fs::remove_dir(&current_output).await
+-        {
+-            debug!(
+-                id,
+-                ?current_output,
+-                "could not remove source directory (may not be empty): {e}"
+-            );
++        .await;
++        if let Err(error) = result {
++            for dst in copied {
++                let _ = tokio::fs::remove_file(dst).await;
++            }
++            return Err(error);
++        }
++        for (src, _) in files {
++            if let Err(error) = tokio::fs::remove_file(&src).await {
++                warn!(
++                    id,
++                    ?src,
++                    "error removing the original after copying it: {error}"
++                );
++            }
+         }
+-
+-        info!(id, ?dest_base, "completed torrent moved successfully");
+-
+-        // Note: we don't update the torrent's output_folder or persistence here because
+-        // the torrent is already finished. The files are now in the completed folder.
+-        // If we wanted to update persistence for the new location, the ManagedTorrentOptions
+-        // output_folder would need to be mutable (wrapped in RwLock), which is a larger change.
+-        // For now, the move is fire-and-forget from the torrent's perspective.
+-
+         Ok(())
+     }
+ 
+@@ -1955,6 +2012,19 @@ mod tests {
+ 
+     use super::torrent_file_from_info_bytes;
+ 
++    #[test]
++    fn crosses_devices_finds_exdev_in_the_error_chain() {
++        let exdev = anyhow::Error::new(std::io::Error::from_raw_os_error(18))
++            .context("error renaming a -> b")
++            .context("error relocating torrent; rolled back");
++        assert!(super::crosses_devices(&exdev));
++        let other = anyhow::Error::new(std::io::Error::from_raw_os_error(13)).context("x");
++        assert!(!super::crosses_devices(&other));
++        assert!(!super::crosses_devices(&anyhow::anyhow!(
++            "destination already exists"
++        )));
++    }
++
+     #[test]
+     fn expand_folder_template_replaces_and_sanitizes_category() {
+         assert_eq!(
+diff --git a/crates/librtbit/src/torrent_state/mod.rs b/crates/librtbit/src/torrent_state/mod.rs
+index b6f88ba..c7fa43b 100644
+--- a/crates/librtbit/src/torrent_state/mod.rs
++++ b/crates/librtbit/src/torrent_state/mod.rs
+@@ -510,6 +510,55 @@ impl ManagedTorrent {
+         Ok(())
+     }
+ 
++    /// Move a finished torrent's files under `new_root` without stopping it:
++    /// each file is renamed and reopened under its own lock, so peers keep
++    /// reading and the tracker still hears about the completion. Only on one
++    /// filesystem; a failed rename rolls the others back.
++    pub(crate) fn relocate_files(&self, new_root: std::path::PathBuf) -> anyhow::Result<()> {
++        let g = self.locked.read();
++        let files = match &g.state {
++            ManagedTorrentState::Live(live) => &live.files,
++            ManagedTorrentState::Paused(paused) => &paused.files,
++            _ => bail!("torrent is not in a relocatable state"),
++        };
++        std::fs::create_dir_all(&new_root)
++            .with_context(|| format!("error creating destination directory {new_root:?}"))?;
++        files.move_root(&new_root)?;
++        *self.shared.output_folder_override.write() = new_root;
++        Ok(())
++    }
++
++    /// Point a stopped torrent at a copy of its files under `new_root` (a
++    /// move to another filesystem, which `set_location` refuses). The caller
++    /// copied every file there first; the storage is opened afresh on them.
++    pub(crate) fn rebind_location(&self, new_root: std::path::PathBuf) -> anyhow::Result<()> {
++        let metadata = self
++            .metadata
++            .load_full()
++            .context("torrent metadata was not loaded")?;
++        let mut g = self.locked.write();
++        let paused = match &mut g.state {
++            ManagedTorrentState::Paused(paused) => paused,
++            _ => bail!("torrent must be stopped before changing its location"),
++        };
++        let old_root =
++            std::mem::replace(&mut *self.shared.output_folder_override.write(), new_root);
++        match self
++            .shared
++            .storage_factory
++            .create_and_init(&self.shared, &metadata)
++        {
++            Ok(files) => {
++                paused.files = files;
++                Ok(())
++            }
++            Err(error) => {
++                *self.shared.output_folder_override.write() = old_root;
++                Err(error)
++            }
++        }
++    }
++
+     pub fn shared(&self) -> &ManagedTorrentShared {
+         &self.shared
+     }

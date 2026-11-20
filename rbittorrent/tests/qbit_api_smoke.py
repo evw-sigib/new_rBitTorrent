@@ -155,6 +155,13 @@ def main():
         check(key in prefs, f"app/preferences has {key}")
     status, default_save = c.call("GET", "app/defaultSavePath")
     check(status == 200 and default_save.strip(), f"app/defaultSavePath ({default_save.strip()!r})")
+    check(default_save.strip() == prefs["save_path"],
+          "app/defaultSavePath is the preferences' save_path")
+    if prefs.get("temp_path_enabled"):
+        check(prefs.get("temp_path") and prefs["temp_path"] != prefs["save_path"],
+              f"the temp path is the download folder ({prefs.get('temp_path')!r})")
+    else:
+        check(not prefs.get("temp_path"), "no temp path without a completed folder")
 
     print("=== categories")
     cat_path = save_dir or prefs["save_path"]

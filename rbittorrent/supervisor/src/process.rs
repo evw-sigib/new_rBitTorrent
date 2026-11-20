@@ -1134,6 +1134,81 @@ mod tests {
         assert!(ok.status().expect("allowed runs").success());
     }
 
+    /// rtbit may read `/proc` (the runtime and the allocator read their own
+    /// entries there), but not the secrets of the processes around it:
+    /// Landlock lets a sandboxed task inspect only tasks in its own domain,
+    /// so the environment, open files, memory maps and binary of the
+    /// supervisor and the helpers stay out of reach although the folder
+    /// itself is readable. The child drops the same capabilities as rtbit:
+    /// `CAP_PERFMON` or `CAP_SYS_ADMIN` would let it read another task's
+    /// environment and maps past the ptrace check. Run as root, the test also
+    /// covers Home Assistant OS, which has no Landlock: there the dropped
+    /// capabilities alone keep rtbit out, because a task may only inspect
+    /// tasks whose capabilities are a subset of its own (and AppArmor adds
+    /// its own ptrace check on top).
+    #[test]
+    fn rtbit_reads_its_own_proc_entries_but_not_its_parents() {
+        use std::os::unix::process::CommandExt as _;
+        if let Err(why) = landlock::abi() {
+            eprintln!("skipping: {why}");
+            return;
+        }
+        let policy = spec("/bin/sh").fs_policy();
+        assert!(policy.read_only.contains(&PathBuf::from("/proc")));
+        let ruleset = Arc::new(landlock::build(&policy).expect("ruleset"));
+        // SAFETY: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        let drop = caps_to_drop(last_cap());
+        let run = |script: &str, caps: bool, landlock: bool| {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg(script);
+            let rs = ruleset.clone();
+            let drop = drop.clone();
+            // SAFETY: capability syscalls, prctl and one Landlock syscall, as
+            // in rtbit's own pre_exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if caps {
+                        drop_capabilities(&drop)?;
+                    }
+                    if landlock {
+                        set_no_new_privs()?;
+                        rs.restrict_self()?;
+                    }
+                    Ok(())
+                });
+            }
+            cmd.output().expect("spawn")
+        };
+
+        // Without the sandbox the same uid reads the parent's entries, so
+        // what blocks them below is the sandbox.
+        for script in [
+            "cat /proc/$PPID/environ >/dev/null",
+            "cat /proc/$PPID/maps >/dev/null",
+            "readlink /proc/$PPID/exe >/dev/null",
+            "readlink /proc/$PPID/fd/0 >/dev/null",
+        ] {
+            let out = run(script, false, false);
+            assert!(out.status.success(), "{script} unsandboxed: {out:?}");
+            let out = run(script, root, true);
+            assert!(!out.status.success(), "{script} sandboxed: {out:?}");
+            if root {
+                let out = run(script, true, false);
+                assert!(!out.status.success(), "{script} without Landlock: {out:?}");
+            }
+        }
+        for script in [
+            "cat /proc/self/status >/dev/null",
+            "cat /proc/self/environ >/dev/null",
+            "readlink /proc/self/exe >/dev/null",
+            "cat /proc/$PPID/stat >/dev/null",
+        ] {
+            let out = run(script, root, true);
+            assert!(out.status.success(), "{script} sandboxed: {out:?}");
+        }
+    }
+
     fn spec(binary: &str) -> RtbitSpec {
         RtbitSpec {
             binary: binary.into(),

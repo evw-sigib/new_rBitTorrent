@@ -22,7 +22,14 @@ A second scenario starts a fresh install with no WireGuard setup anywhere:
 the direct connection (VPN off) must run rtbit on `listen_port` without a
 kill-switch, a tunnel or NAT-PMP, and say loudly that it is unprotected.
 
-Usage: sudo python3 e2e_netns.py --supervisor PATH [--keep]
+With --rtbit, a third scenario runs the real rtbit in VPN mode: it downloads
+a torrent from a seeder behind the WireGuard server, announced by a tracker
+there, while a tracker on the LAN must hear nothing. Everything rtbit sends
+must come out of the tunnel as 10.2.0.2 with the NAT-PMP port, and nothing
+but WireGuard and Web UI replies may leave the app on the LAN.
+
+Usage: sudo python3 e2e_netns.py --supervisor PATH [--rtbit PATH]
+           [--scenario all|vpn|direct|real] [--keep]
 """
 
 import argparse
@@ -37,6 +44,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 NS_CLI, NS_RTR, NS_INET = "e2e-cli", "e2e-rtr", "e2e-inet"
@@ -70,6 +78,14 @@ QBT_SAVE = MEDIA / "qbt"
 QBT_TEMP = MEDIA / "qbt" / "incomplete-qbt"
 QBT_TV = MEDIA / "qbt" / "tv"
 HASH_OK, HASH_GONE = "a" * 40, "b" * 40
+
+# The real-rtbit scenario: a tracker and a seeder behind the WireGuard
+# server, a tracker on the LAN that must hear nothing.
+TRACKER_PORT, SEED_PORT = 6969, 6881
+PAYLOAD_NAME = "e2e-payload.bin"
+PAYLOAD_SIZE = 8 * 1024 * 1024 + 1234
+PIECE_LENGTH = 256 * 1024
+REAL_USER, REAL_PASSWORD = "e2e", "e2e-not-a-secret"
 
 HERE = Path(__file__).resolve().parent
 FAILURES = []
@@ -244,15 +260,152 @@ def wg_keypair():
     return priv, pub
 
 
+def in_netns(ns, fn, *args):
+    """Runs fn(*args) in a thread that joined the network namespace `ns`
+    (a network namespace is per thread), and returns its result."""
+    result = {}
+
+    def run():
+        fd = os.open(f"/run/netns/{ns}", os.O_RDONLY)
+        try:
+            os.setns(fd, os.CLONE_NEWNET)
+        finally:
+            os.close(fd)
+        try:
+            result["value"] = fn(*args)
+        except BaseException as e:  # noqa: BLE001 - re-raised in the caller
+            result["error"] = e
+
+    t = threading.Thread(target=run)
+    t.start()
+    t.join()
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
 # --------------------------------------------------------------------------
 # "internet" side services (run inside e2e-inet via --role inet)
 # --------------------------------------------------------------------------
 
 
+def bt_tracker(host, peer, record):
+    """A minimal HTTP tracker: records every announce and hands out `peer`."""
+    import http.server
+
+    class Announce(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - http.server's naming
+            url = urllib.parse.urlsplit(self.path)
+            q = urllib.parse.parse_qs(url.query, encoding="latin-1")
+
+            def one(key):
+                return q.get(key, [""])[0]
+
+            record({"src": self.client_address[0], "path": url.path,
+                    "info_hash": one("info_hash").encode("latin-1").hex(),
+                    "port": one("port"), "event": one("event"), "left": one("left")})
+            body = (b"d8:intervali30e12:min intervali10e5:peers6:"
+                    + socket.inet_aton(peer[0]) + struct.pack("!H", peer[1]) + b"e")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    http.server.ThreadingHTTPServer((host, TRACKER_PORT), Announce).serve_forever()
+
+
+def bt_seeder(host, meta, record, save, hold=4.0):
+    """A minimal BitTorrent seeder (BEP 3: handshake, bitfield, unchoke,
+    piece). Records each connection's source and the bytes it was sent.
+    The last piece is offered only `hold` seconds after the handshake, so
+    the download stays open long enough to look at its sockets."""
+    data = Path(meta["payload"]).read_bytes()
+    plen = meta["piece_length"]
+    pieces = (len(data) + plen - 1) // plen
+    info_hash = bytes.fromhex(meta["info_hash"])
+    bitfield = bytearray((pieces + 7) // 8)
+    for i in range(pieces - 1):
+        bitfield[i // 8] |= 0x80 >> (i % 8)
+
+    def serve(c, addr):
+        rec = record({"src": addr[0], "bytes": 0, "handshake": False})
+
+        def recv(n):
+            buf = b""
+            while len(buf) < n:
+                chunk = c.recv(n - len(buf))
+                if not chunk:
+                    raise EOFError
+                buf += chunk
+            return buf
+
+        send_lock = threading.Lock()
+
+        def send(b):
+            with send_lock:
+                c.sendall(b)
+
+        def offer_last():
+            try:
+                send(struct.pack("!IBI", 5, 4, pieces - 1))  # have
+            except OSError:
+                pass
+
+        timer = threading.Timer(hold, offer_last)
+        try:
+            c.settimeout(120)
+            hs = recv(68)
+            if hs[1:20] != b"BitTorrent protocol" or hs[28:48] != info_hash:
+                return
+            rec["handshake"] = True
+            send(b"\x13BitTorrent protocol" + bytes(8) + info_hash
+                 + b"-E2E0001-" + os.urandom(11))
+            send(struct.pack("!IB", 1 + len(bitfield), 5) + bitfield)
+            send(struct.pack("!IB", 1, 1))  # unchoke
+            timer.start()
+            blocks = 0
+            while True:
+                (length,) = struct.unpack("!I", recv(4))
+                if length == 0:
+                    continue
+                msg = recv(length)
+                if msg[0] == 6 and length == 13:  # request
+                    index, begin, size = struct.unpack("!III", msg[1:])
+                    off = index * plen + begin
+                    block = data[off:off + size]
+                    send(struct.pack("!IBII", 9 + len(block), 7, index, begin) + block)
+                    rec["bytes"] += len(block)
+                    blocks += 1
+                    if blocks % 16 == 0:
+                        save()
+                elif msg[0] == 2:  # interested
+                    send(struct.pack("!IB", 1, 1))
+        except (OSError, EOFError, struct.error):
+            pass
+        finally:
+            timer.cancel()
+            save()
+            c.close()
+
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((host, SEED_PORT))
+    s.listen(8)
+    while True:
+        c, addr = s.accept()
+        threading.Thread(target=serve, args=(c, addr), daemon=True).start()
+
+
 def inet_services(state_path: Path, switch_path: Path):
-    """NAT-PMP gateway on 10.2.0.1:5351 plus TCP/UDP canaries on all addresses."""
+    """NAT-PMP gateway on 10.2.0.1:5351 plus TCP/UDP canaries on all addresses.
+    With a torrent in seed/ next to the state file, also a tracker and a
+    seeder on 192.0.2.53 (behind the tunnel)."""
     lock = threading.Lock()
-    state = {"pmp": [], "tcp": [], "udp": []}
+    state = {"pmp": [], "tcp": [], "udp": [], "announces": [], "peers": []}
     start = time.monotonic()
 
     def save():
@@ -313,9 +466,29 @@ def inet_services(state_path: Path, switch_path: Path):
                 state["udp"].append({"src": addr[0], "dst": dst})
                 save()
 
+    def locked_save():
+        with lock:
+            save()
+
+    def recorder(key):
+        def record(rec):
+            with lock:
+                state[key].append(rec)
+                save()
+            return rec
+        return record
+
+    services = [natpmp, tcp_canary, udp_canary]
+    meta_path = state_path.parent / "seed" / "meta.json"
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text())
+        services.append(lambda: bt_tracker(
+            OTHER_TUNNEL_HOST, (OTHER_TUNNEL_HOST, SEED_PORT), recorder("announces")))
+        services.append(lambda: bt_seeder(
+            OTHER_TUNNEL_HOST, meta, recorder("peers"), locked_save))
     with lock:
         save()
-    for fn in (natpmp, tcp_canary, udp_canary):
+    for fn in services:
         threading.Thread(target=fn, daemon=True).start()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     while True:
@@ -957,9 +1130,325 @@ def run_direct_test(supervisor: Path):
         print("----- end of log -----")
 
 
+# --------------------------------------------------------------------------
+# the real rtbit in VPN mode
+# --------------------------------------------------------------------------
+
+
+def make_seed_torrent():
+    """Random content, a .torrent for it and the seeder's metadata."""
+    import hashlib
+    import qbit_api_smoke as qbit
+
+    seed = WORK / "seed"
+    seed.mkdir(parents=True)
+    data = os.urandom(PAYLOAD_SIZE)
+    (seed / PAYLOAD_NAME).write_bytes(data)
+    info = {
+        "name": PAYLOAD_NAME, "piece length": PIECE_LENGTH, "length": len(data),
+        # Private: trackers only, no DHT or peer exchange.
+        "private": 1,
+        "pieces": b"".join(hashlib.sha1(data[i:i + PIECE_LENGTH]).digest()
+                           for i in range(0, len(data), PIECE_LENGTH)),
+    }
+    inet_tracker = f"http://{OTHER_TUNNEL_HOST}:{TRACKER_PORT}/announce"
+    lan_tracker = f"http://10.99.0.1:{TRACKER_PORT}/announce"
+    torrent = qbit.bencode({"announce": inet_tracker,
+                            "announce-list": [[inet_tracker], [lan_tracker]], "info": info})
+    info_hash = hashlib.sha1(qbit.bencode(info)).hexdigest()
+    (seed / "meta.json").write_text(json.dumps({
+        "payload": str(seed / PAYLOAD_NAME), "piece_length": PIECE_LENGTH,
+        "info_hash": info_hash}))
+    return torrent, info_hash, hashlib.sha1(data).hexdigest()
+
+
+def recording_listener(ns, host, port, log: Path):
+    """A TCP listener that writes one line per connection to `log`."""
+    code = (
+        "import socket,sys\n"
+        "s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+        f"s.bind(({host!r},{port}));s.listen(8)\n"
+        "while True:\n"
+        "  c,a=s.accept()\n"
+        f"  open({str(log)!r},'a').write(a[0]+'\\n');c.close()\n"
+    )
+    return subprocess.Popen(["ip", "netns", "exec", ns, sys.executable, "-c", code])
+
+
+def lan_counters():
+    """Packets the app sent onto the LAN, by kind (counted on the router)."""
+    out = sh("nft", "list", "table", "inet", "e2elan", ns=NS_RTR, check=False).stdout
+    return {m.group(2): int(m.group(1))
+            for m in re.finditer(r'packets (\d+) bytes \d+ comment "(\w+)"', out)}
+
+
+def rtbit_pid():
+    for d in app_processes():
+        try:
+            argv = (d / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+        except OSError:
+            continue
+        if argv and argv[0].endswith(b"/rtbit") and b"server" in argv:
+            return int(d.name)
+    return None
+
+
+def run_real_rtbit_test(supervisor: Path, rtbit: Path):
+    """VPN mode with the real rtbit: a download through the tunnel."""
+    import hashlib
+    import qbit_api_smoke as qbit
+
+    cleanup()
+    shutil.rmtree(WORK, ignore_errors=True)
+    (WORK / "data").mkdir(parents=True)
+    (WORK / "config").mkdir()
+    (WORK / "share").mkdir()
+    (WORK / "app_configs").mkdir()
+    downloads, completed = MEDIA / "downloads", MEDIA / "completed"
+
+    step("real rtbit: network namespaces, WireGuard server, tracker and seeder")
+    cli_priv, cli_pub = wg_keypair()
+    srv_pub = setup_network(cli_pub)
+    # Both binaries must be reachable for the sandboxed children ("nobody"
+    # for the Ingress proxy; Landlock allows exactly the binary's path).
+    binaries = {}
+    for name, src in (("rbittorrent-supervisor", supervisor), ("rtbit", rtbit)):
+        binaries[name] = WORK / name
+        shutil.copy(src, binaries[name])
+        binaries[name].chmod(0o755)
+    torrent, info_hash, payload_sha1 = make_seed_torrent()
+    resolv = WORK / "resolv.conf"
+    resolv.write_text("nameserver 8.8.8.8\n")
+    # Everything the app sends onto the LAN, counted where it arrives.
+    sh("nft", "-f", "-", ns=NS_RTR, input_text=(
+        "table inet e2elan {\n chain pre {\n"
+        "  type filter hook prerouting priority -300; policy accept;\n"
+        f"  iifname \"lan0\" ip saddr 10.99.0.2 ip daddr {ENDPOINT_IP} udp dport 51820"
+        " counter comment \"wireguard\" accept\n"
+        "  iifname \"lan0\" ip saddr 10.99.0.2 tcp sport { 8080, 8099 }"
+        " counter comment \"webui\" accept\n"
+        # Home Assistant's Supervisor API, asked once before the kill-switch.
+        f"  iifname \"lan0\" ip saddr 10.99.0.2 ip daddr {SUPERVISOR_IP} tcp dport 80"
+        " counter comment \"supervisor\" accept\n"
+        "  iifname \"lan0\" ip saddr 10.99.0.2 counter comment \"other\""
+        " log prefix \"e2e-lan-other \" accept\n"
+        " }\n}\n"))
+    lan_tracker_log = WORK / "lan-tracker.log"
+    lan_tracker = recording_listener(NS_RTR, "10.99.0.1", TRACKER_PORT, lan_tracker_log)
+
+    conf = f"""[Interface]
+# NAT-PMP (Port Forwarding) = on
+PrivateKey = {cli_priv}
+Address = {CLIENT_TUNNEL_IP}/32
+DNS = {TUNNEL_GW}
+
+[Peer]
+PublicKey = {srv_pub}
+AllowedIPs = 0.0.0.0/0
+Endpoint = {ENDPOINT_IP}:51820
+"""
+    options = {
+        "vpn_enabled": True,
+        "wireguard_conf": conf,
+        "webui_username": REAL_USER,
+        "webui_password": REAL_PASSWORD,
+        "import_from_qbittorrent": False,
+        "download_dir": str(downloads),
+        "completed_dir": str(completed),
+        "enable_nat_pmp": True,
+        "nat_pmp_gateway": TUNNEL_GW,
+        "listen_port": 4240,
+        "local_allow_cidrs": ["10.99.0.0/24"],
+        "enable_dht": False,
+        "log_level": "debug",
+    }
+    (WORK / "data" / "options.json").write_text(json.dumps(options))
+    inet = subprocess.Popen(
+        ["ip", "netns", "exec", NS_INET, sys.executable, str(Path(__file__).resolve()),
+         "--role", "inet", "--state", str(WORK / "inet.json"),
+         "--switch", str(WORK / "switch_port")],
+    )
+
+    step("real rtbit: start rbittorrent-supervisor in e2e-cli")
+    log = open(WORK / "supervisor.log", "w")
+    env = {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "RBITTORRENT_OPTIONS": str(WORK / "data" / "options.json"),
+        "RBITTORRENT_CONFIG_ROOT": str(WORK / "config"),
+        "RBITTORRENT_RTBIT": str(binaries["rtbit"]),
+        "RBITTORRENT_RESOLV_CONF": str(resolv),
+        "RBITTORRENT_APP_CONFIGS": str(WORK / "app_configs"),
+        "RBITTORRENT_SHARE": str(WORK / "share"),
+        "SUPERVISOR_TOKEN": E2E_SUPERVISOR_TOKEN,
+    }
+    sup = subprocess.Popen(
+        ["ip", "netns", "exec", NS_CLI, str(binaries["rbittorrent-supervisor"])],
+        env=env, stdout=log, stderr=subprocess.STDOUT,
+    )
+    base = "http://10.99.0.2:8080"
+    client = qbit.Client(base)
+
+    def login():
+        try:
+            status, text = client.call(
+                "POST", "auth/login", form={"username": REAL_USER, "password": REAL_PASSWORD})
+        except OSError:
+            return None
+        return status == 200 and text.strip() == "Ok."
+
+    def api(method, path):
+        return in_netns(NS_RTR, client.call, method, path)
+
+    def info():
+        status, text = in_netns(NS_RTR, client.call, "GET", "torrents/info")
+        return json.loads(text) if status == 200 else []
+
+    try:
+        wait_for(lambda: in_netns(NS_RTR, login), 120,
+                 "rtbit's qBittorrent API to accept the login from the LAN")
+        text = log_text()
+        check("kill-switch active" in text
+              and text.find("kill-switch active") < text.find("rtbit started"),
+              "kill-switch installed before the real rtbit started")
+        check("rtbit filesystem sandbox active" in text, "rtbit runs in the filesystem sandbox")
+        check("rtbit privileges dropped" in text, "rtbit runs without its dropped capabilities")
+        check(f"forwarded port {PORT_A}" in text, f"NAT-PMP leased port {PORT_A}")
+        check(cli_priv not in text and REAL_PASSWORD not in text,
+              "neither the WireGuard key nor the Web UI password is logged")
+
+        step("real rtbit: the save path Sonarr and Radarr see")
+        status, body = api("GET", "app/preferences")
+        prefs = json.loads(body) if status == 200 else {}
+        check(prefs.get("save_path") == str(completed),
+              f"preferences.save_path is completed_dir ({prefs.get('save_path')!r})")
+        check(prefs.get("temp_path_enabled") is True and prefs.get("temp_path") == str(downloads),
+              f"the temp path is download_dir ({prefs.get('temp_path_enabled')!r}, "
+              f"{prefs.get('temp_path')!r})")
+        status, body = api("GET", "app/defaultSavePath")
+        check(body.strip() == str(completed), f"app/defaultSavePath is completed_dir ({body!r})")
+
+        step("real rtbit: download a torrent through the tunnel")
+        status, body = in_netns(NS_RTR, client.call, "POST", "torrents/add", None, {},
+                                {"torrents": ("e2e.torrent", torrent)})
+        check(status == 200 and body.strip() == "Ok.", f"torrents/add answers Ok. ({status} {body!r})")
+
+        seen_socks = set()
+
+        def done():
+            # rtbit's connections to the seeder and the tracker, while they last.
+            socks = sh("ss", "-Htn", "state", "established", ns=NS_CLI).stdout
+            seen_socks.update(
+                " ".join(line.split()[2:4]) for line in socks.splitlines()
+                if f"{OTHER_TUNNEL_HOST}:{SEED_PORT}" in line
+                or f"{OTHER_TUNNEL_HOST}:{TRACKER_PORT}" in line)
+            ts = [t for t in info() if t["hash"] == info_hash]
+            return ts[0] if ts and ts[0]["progress"] >= 1 else None
+
+        try:
+            wait_for(done, 180, "the download to finish")
+        except Exception as e:  # noqa: BLE001 - report, then look at the rest
+            check(False, f"the download finished ({e}; {info()})")
+        final = completed / PAYLOAD_NAME
+        try:
+            wait_for(lambda: final.is_file() and final.stat().st_size == PAYLOAD_SIZE, 60,
+                     "the finished file in completed_dir")
+        except Exception:  # noqa: BLE001 - the check below reports it
+            pass
+        got = hashlib.sha1(final.read_bytes()).hexdigest() if final.is_file() else None
+        check(got == payload_sha1, f"the file arrived intact in completed_dir ({final})")
+        check(not (downloads / PAYLOAD_NAME).exists(), "and is no longer in download_dir")
+        ts = [t for t in info() if t["hash"] == info_hash]
+        check(bool(ts) and ts[0]["save_path"].rstrip("/") == str(completed),
+              f"torrents/info reports the completed folder ({ts[0]['save_path'] if ts else None!r})")
+        pid = rtbit_pid()
+        rss = None
+        if pid:
+            for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    rss = int(line.split()[1])
+        print(f"  info  rtbit VmRSS after an {PAYLOAD_SIZE >> 20} MiB download, "
+              f"seeding: {rss} KiB", flush=True)
+
+        step("real rtbit: everything went through the tunnel")
+        state = inet_state()
+        announces = [a for a in state["announces"] if a["info_hash"] == info_hash]
+        check(bool(announces), f"the tracker behind the tunnel got announces ({len(announces)})")
+        check(all(a["src"] == CLIENT_TUNNEL_IP for a in announces),
+              f"every announce came from the tunnel address "
+              f"({sorted({a['src'] for a in announces})})")
+        check(all(a["port"] == str(PORT_A) for a in announces),
+              f"every announce gives the NAT-PMP port {PORT_A} "
+              f"({sorted({a['port'] for a in announces})})")
+        peers = [p for p in state["peers"] if p.get("handshake")]
+        check(bool(peers) and all(p["src"] == CLIENT_TUNNEL_IP for p in peers),
+              f"rtbit reached the seeder from the tunnel address "
+              f"({sorted({p['src'] for p in peers})})")
+        check(sum(p["bytes"] for p in peers) >= PAYLOAD_SIZE,
+              f"the seeder sent the whole file ({sum(p['bytes'] for p in peers)} bytes)")
+        check(not lan_tracker_log.exists(),
+              f"the tracker on the LAN heard nothing "
+              f"({lan_tracker_log.read_text().split() if lan_tracker_log.exists() else []})")
+        print("  info  rtbit's connections seen:", *sorted(seen_socks), sep="\n    ")
+        check(any(f"{OTHER_TUNNEL_HOST}:{SEED_PORT}" in c for c in seen_socks)
+              and all(c.startswith(f"{CLIENT_TUNNEL_IP}%wg0:") for c in seen_socks),
+              "rtbit's peer and tracker sockets are bound to wg0")
+        counters = lan_counters()
+        check(counters.get("wireguard", 0) > 0,
+              f"the WireGuard envelope went over the LAN ({counters})")
+        check(counters.get("other", -1) == 0,
+              f"nothing but WireGuard, Web UI replies and the Supervisor API reached the LAN "
+              f"({counters})")
+        ok, out = tcp_probe(NS_INET, CLIENT_TUNNEL_IP, PORT_A)
+        check(ok, f"peers reach rtbit on the forwarded port through the tunnel ({out})")
+        ok, out = tcp_probe(NS_RTR, "10.99.0.2", PORT_A)
+        check(not ok, f"the forwarded port is closed on the LAN side ({out})")
+
+        def stop(what):
+            sup.send_signal(signal.SIGTERM)
+            try:
+                code = sup.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                code = None
+            check(code == 0, f"supervisor exited 0 {what} (got {code})")
+            check(rtbit_pid() is None, f"rtbit is gone {what}")
+
+        step("real rtbit: orderly shutdown on SIGTERM")
+        stop("on SIGTERM")
+
+        step("real rtbit: after a restart the torrent is still finished, in completed_dir")
+        served = sum(p["bytes"] for p in inet_state()["peers"])
+        sup = subprocess.Popen(
+            ["ip", "netns", "exec", NS_CLI, str(binaries["rbittorrent-supervisor"])],
+            env=env, stdout=log, stderr=subprocess.STDOUT,
+        )
+        client = qbit.Client(base)
+        wait_for(lambda: in_netns(NS_RTR, login), 120, "the login after the restart")
+        ts = wait_for(lambda: [t for t in info() if t["hash"] == info_hash], 60,
+                      "the torrent after the restart")
+        time.sleep(5)
+        ts = [t for t in info() if t["hash"] == info_hash] or ts
+        check(ts[0]["progress"] >= 1 and ts[0]["save_path"].rstrip("/") == str(completed),
+              f"finished, in completed_dir ({ts[0]['progress']}, {ts[0]['save_path']!r})")
+        again = sum(p["bytes"] for p in inet_state()["peers"]) - served
+        check(again == 0 and not (downloads / PAYLOAD_NAME).exists(),
+              f"nothing downloaded again ({again} bytes)")
+        stop("after the restart")
+    finally:
+        if sup.poll() is None:
+            sup.kill()
+        inet.terminate()
+        lan_tracker.terminate()
+        log.close()
+        print("\n----- supervisor log (real rtbit) -----")
+        print(log_text()[-60000:])
+        print("----- end of log -----")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--supervisor", type=Path)
+    ap.add_argument("--rtbit", type=Path, help="the real rtbit, for the third scenario")
+    ap.add_argument("--scenario", choices=("all", "vpn", "direct", "real"), default="all")
     ap.add_argument("--keep", action="store_true", help="keep namespaces for debugging")
     ap.add_argument("--role", default="test")
     ap.add_argument("--state", type=Path)
@@ -974,7 +1463,19 @@ def main():
     if not a.supervisor or not a.supervisor.exists():
         print("--supervisor PATH is required", file=sys.stderr)
         return 2
-    for scenario in (run_test, run_direct_test):
+    scenarios = {"vpn": run_test, "direct": run_direct_test}
+    if a.rtbit:
+        if not a.rtbit.exists():
+            print("--rtbit PATH does not exist", file=sys.stderr)
+            return 2
+        def run_real(sup):
+            run_real_rtbit_test(sup, a.rtbit.resolve())
+        scenarios["real"] = run_real
+    elif a.scenario == "real":
+        print("--scenario real needs --rtbit PATH", file=sys.stderr)
+        return 2
+    chosen = [f for name, f in scenarios.items() if a.scenario in ("all", name)]
+    for scenario in chosen:
         try:
             scenario(a.supervisor.resolve())
         except Exception as e:  # noqa: BLE001 - report any setup failure as a test failure

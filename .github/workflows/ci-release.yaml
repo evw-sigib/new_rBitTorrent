@@ -390,6 +390,18 @@ jobs:
           for f in /config/wg0.conf /config/.webui-password /config/.migrated; do
             if confined rtbit sh -c "echo x > $f" 2>/dev/null; then echo "rtbit's profile lets it write $f"; exit 1; fi
           done
+          # /proc stays readable (the runtime reads its own entries), but not
+          # another process's environment, memory map, files or binary: the
+          # profile has no `ptrace (read)` and none of the capabilities that
+          # would get past that check. dockerd stands in for the supervisor.
+          confined rtbit cat /proc/self/status >/dev/null
+          other=$(pgrep -o dockerd)
+          for f in environ maps; do
+            if confined rtbit cat "/proc/$other/$f" >/dev/null 2>&1; then echo "rtbit's profile reads /proc/<pid>/$f"; exit 1; fi
+          done
+          for f in exe fd/0; do
+            if confined rtbit readlink "/proc/$other/$f" >/dev/null 2>&1; then echo "rtbit's profile follows /proc/<pid>/$f"; exit 1; fi
+          done
           if confined rtbit ls /app_configs/other >/dev/null 2>&1; then echo "rtbit's profile lists /app_configs"; exit 1; fi
           confined ingress cat /etc/hostname
           if confined ingress sh -c 'echo x > /media/rbt-aa/ingress' 2>/dev/null; then echo "the Ingress profile can write"; exit 1; fi
@@ -444,6 +456,24 @@ jobs:
             echo "| rbittorrent-supervisor | $(stat -c %s rbittorrent-supervisor) bytes |"
             echo "| rtbit | $(stat -c %s rtbit) bytes |"
           } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Real rtbit in VPN mode (WireGuard, network namespaces)
+        run: |
+          set -euo pipefail
+          # Ubuntu's mirrors answer 503 now and then: retry before failing.
+          for i in 1 2 3 4; do
+            sudo apt-get -o Acquire::Retries=5 update -qq \
+              && sudo apt-get -o Acquire::Retries=5 install -y -qq \
+                wireguard-tools nftables iproute2 && break
+            [ "$i" = 4 ] && exit 1
+            sleep $((i * 15))
+          done
+          sudo modprobe wireguard
+          # The binaries extracted from the image under test; rtbit downloads
+          # a torrent through the tunnel while the router counts what leaves.
+          sudo python3 "$APP_DIR/tests/e2e_netns.py" --scenario real \
+            --supervisor ./rbittorrent-supervisor --rtbit ./rtbit | tee real.log
+          grep -o 'rtbit VmRSS after .*' real.log \
+            | sed 's/^\(.*\): \(.*\)$/| \1 (${{ matrix.arch }}) | \2 |/' >> "$GITHUB_STEP_SUMMARY" || true
       - name: rtbit memory benchmark (rtbit alone)
         env:
           IMG: local/rbittorrent:test

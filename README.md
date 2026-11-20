@@ -25,11 +25,12 @@
 | `rbittorrent/rtbit/auth-banner.patch` | rtbit's startup log reports the stored Web UI login as `auth: enabled` |
 | `rbittorrent/rtbit/swagger-vendored.patch` | Build-only: Swagger UI from a checksum-pinned crate, no download from github.com |
 | `rbittorrent/rtbit/ipv4-fallback.patch` | IPv4-only mode opens IPv4 DHT and UDP tracker sockets (hosts booted with `ipv6.disable=1`) |
-| `rbittorrent/rtbit/completed-move.patch` | Only torrents in the download folder move to the completed folder; others stay put |
+| `rbittorrent/rtbit/completed-move.patch` | Only torrents in the download folder move to the completed folder, others stay put; the torrent follows its files (API path, restarts) |
+| `rbittorrent/rtbit/qbit-save-path.patch` | The qBittorrent API reports the completed folder as the save path (what Sonarr and Radarr check) |
 | `rbittorrent/apparmor.txt` | AppArmor profile: rtbit and the Ingress proxy run in confined child profiles (the sandbox on Home Assistant OS) |
 | `rbittorrent/supervisor/` | `rbittorrent-supervisor`, the Rust PID 1 (config, firewall, WireGuard, NAT-PMP, migration, process, Ingress, benchmark) |
-| `rbittorrent/tests/` | Kernel end-to-end leak test (network namespaces + real WireGuard) |
-| `.github/workflows/ci-release.yaml` | fmt, clippy, tests, live nftables, e2e (VPN + direct mode), native per-arch image builds and smoke tests, GHCR publishing of the tested images |
+| `rbittorrent/tests/` | Kernel end-to-end leak test (network namespaces + real WireGuard), with the real rtbit downloading through the tunnel; qBittorrent API test |
+| `.github/workflows/ci-release.yaml` | fmt, clippy, tests, live nftables, e2e (VPN + direct mode), native per-arch image builds and smoke tests (AppArmor, Landlock, the qBittorrent API, a real download through WireGuard), GHCR publishing of the tested images |
 
 ## Development
 
@@ -40,6 +41,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 NFT_LIVE_TEST=1 unshare -rn cargo test nft_live -- --nocapture   # needs nft
 sudo python3 ../tests/e2e_netns.py --supervisor target/release/rbittorrent-supervisor
+# the real rtbit in VPN mode (a static rtbit, e.g. copied out of the image):
+sudo python3 ../tests/e2e_netns.py --scenario real --supervisor PATH --rtbit PATH
 ```
 
 ## Releases
@@ -54,9 +57,11 @@ exactly the images it smoke-tested as `<version>` and `latest`.
 ## Credits
 
 [rustTorrent](https://github.com/thedancingdeveloper-org/rusttorrent) (`rtbit`)
-is the BitTorrent engine, built from its release source with four small
+is the BitTorrent engine, built from its release source with six small
 patches in `rbittorrent/rtbit/`: the mimalloc allocator, a startup-log fix,
-a build-only Swagger UI change and an IPv4 fallback for hosts without IPv6.
+a build-only Swagger UI change, an IPv4 fallback for hosts without IPv6,
+a fix for moving finished torrents, and the save path the qBittorrent API
+reports.
 
 [repo-badge]: https://img.shields.io/badge/Add%20repository-Home%20Assistant-41BDF5?logo=home-assistant
 [repo-add]: https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fevw-sigib%2Fnew_rBitTorrent

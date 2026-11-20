@@ -41,21 +41,28 @@ RUN git clone --depth 1 --branch "${RTBIT_TAG}" "${RTBIT_REPO}" . \
 # without it they fall back to 0.0.0.0 when the kernel has no IPv6
 # (ipv6.disable=1 made upstream exit at once).
 # completed-move.patch: only torrents still in the download folder are moved
-# to the completed folder. Upstream also moved torrents saved elsewhere and,
-# on every restart, flattened finished multi-file torrents into it.
+# to the completed folder, and the torrent moves with its files. Upstream also
+# moved torrents saved elsewhere, flattened finished multi-file torrents into
+# it on every restart, and left the torrent pointing at the download folder:
+# the API showed the old path, and the next start looked for the files there.
+# qbit-save-path.patch: the qBittorrent API reports the completed folder as
+# the save path and the download folder as the temp path, as qBittorrent
+# does; Sonarr and Radarr check their path mappings against the save path.
 # The order matters: auth-banner and swagger-vendored are made on top of
 # mimalloc.patch, completed-move on top of ipv4-fallback.
 COPY rtbit/mimalloc.patch rtbit/auth-banner.patch rtbit/swagger-vendored.patch \
-     rtbit/ipv4-fallback.patch rtbit/completed-move.patch /tmp/
+     rtbit/ipv4-fallback.patch rtbit/completed-move.patch rtbit/qbit-save-path.patch /tmp/
 RUN git apply --verbose /tmp/mimalloc.patch /tmp/auth-banner.patch /tmp/swagger-vendored.patch \
-      /tmp/ipv4-fallback.patch /tmp/completed-move.patch \
+      /tmp/ipv4-fallback.patch /tmp/completed-move.patch /tmp/qbit-save-path.patch \
+ && grep -q 'fn qbit_save_paths' crates/librtbit/src/http_api/handlers/qbit/app.rs \
  && grep -q 'static GLOBAL: mimalloc::MiMalloc' crates/rtbit/src/main.rs \
  && grep -q 'store.username()' crates/rtbit/src/main.rs \
  && grep -q '"vendored"' crates/librtbit/Cargo.toml \
  && grep -q 'UDP trackers: cannot open' crates/librtbit-tracker-comms/src/tracker_comms_udp.rs \
  && grep -q 'DHT: cannot open' crates/librtbit-dht/src/dht.rs \
  && grep -q 'new_with_ipv4_only' crates/librtbit/src/session/mod.rs \
- && grep -q 'outside the download folder, not moving it' crates/librtbit/src/session/mod.rs
+ && grep -q 'outside the download folder, not moving it' crates/librtbit/src/session/mod.rs \
+ && grep -q 'fn relocate_files' crates/librtbit/src/torrent_state/mod.rs
 ENV OPENSSL_STATIC=1 \
     CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
     CARGO_PROFILE_RELEASE_OPT_LEVEL=3 \

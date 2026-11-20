@@ -367,6 +367,12 @@ It always asks for the user name and password. Only the networks in
 `local_allow_cidrs` can reach it, and they only ever get replies: torrent
 traffic never leaves through your LAN.
 
+Like qBittorrent with a temp folder, the API reports `completed_dir` as the
+save path and `download_dir` as the temp path (without `completed_dir`,
+both are `download_dir`). These are the app's own paths (`/media/...`):
+Sonarr or Radarr on another machine needs a *Remote Path Mapping* from
+them to the same share on that machine.
+
 CI checks the calls these clients make against the real rtbit, inside
 both sandboxes (`tests/qbit_api_smoke.py`): login and logout,
 `app/version`, `webapiVersion`, `preferences`, `defaultSavePath`,
@@ -525,6 +531,13 @@ folder chosen in its own Web UI, and that choice wins over `download_dir`;
 keep it under `/media` or `/share`, or the sandbox refuses the writes.) If the tunnel goes down, traffic stops: nothing falls back
 to your normal connection.
 
+CI tests this in the kernel, on both architectures, with the binaries from
+the image: rtbit downloads a torrent through a real WireGuard tunnel from
+a seeder behind it. The tracker there sees only the tunnel address and the
+NAT-PMP port, a tracker on the LAN hears nothing, every rtbit socket is
+bound to `wg0`, and the router counts no packet from the app other than
+WireGuard, Web UI replies and the one call to the Supervisor API.
+
 To check it yourself:
 1. Add a magnet with a tracker that reports your IP, e.g. *ipleak.net* →
    *Torrent Address detection*. Only the VPN IP from the status box may
@@ -566,12 +579,19 @@ To check it yourself:
   to `completed_dir` only when it lies in `download_dir`: upstream also
   moved torrents saved elsewhere (category folders, imported torrents,
   paths Sonarr/Radarr chose) and flattened them into `completed_dir`, again
-  at every restart. Everything the build downloads is pinned: crates by
+  at every restart. The torrent now moves with its files and keeps seeding:
+  upstream left it pointing at `download_dir`, so the API gave Sonarr and
+  Radarr the old path and the next start looked for the files there. A
+  `completed_dir` on another filesystem works too (the files are copied). `rtbit/qbit-save-path.patch` makes the qBittorrent
+  API report `completed_dir` as the save path and `download_dir` as the
+  temp path, the way qBittorrent reports a temp folder (upstream reported
+  `download_dir`, where finished torrents no longer are). Everything the
+  build downloads is pinned: crates by
   `Cargo.lock`, and the Web UI's npm packages (rtbit's build runs `npm ci`)
   by upstream's `package-lock.json`. The patches apply in this order, as
   the Dockerfile does: `mimalloc`, `auth-banner`, `swagger-vendored`,
-  `ipv4-fallback`, `completed-move` (each later one expects the earlier
-  ones' changes).
+  `ipv4-fallback`, `completed-move`, `qbit-save-path` (each later one
+  expects the earlier ones' changes).
 - Its SHA-1 piece hashing picks ARMv8 or SHA-NI instructions at runtime. No
   `target-cpu` flags are set, so it also runs on a Raspberry Pi 3 or 4.
 - The [speed test](#speed-test) costs nothing while idle: its threads and
@@ -699,7 +719,8 @@ contains keys or passwords.
 
 The BitTorrent engine is
 [rustTorrent](https://github.com/thedancingdeveloper-org/rusttorrent)
-(`rtbit`), built from its release source with four small patches: the
+(`rtbit`), built from its release source with six small patches: the
 mimalloc allocator, a startup-log fix, Swagger UI from the checksum-pinned
 `utoipa-swagger-ui-vendored` crate instead of a download at build time,
-and an IPv4 fallback for hosts without IPv6.
+an IPv4 fallback for hosts without IPv6, a fix for moving finished
+torrents, and the save path the qBittorrent API reports.
