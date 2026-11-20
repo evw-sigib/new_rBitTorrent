@@ -292,6 +292,7 @@ def in_netns(ns, fn, *args):
 def bt_tracker(host, peer, record):
     """A minimal HTTP tracker: records every announce and hands out `peer`."""
     import http.server
+    import socketserver
 
     class Announce(http.server.BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802 - http.server's naming
@@ -315,7 +316,15 @@ def bt_tracker(host, peer, record):
         def log_message(self, *_):
             pass
 
-    http.server.ThreadingHTTPServer((host, TRACKER_PORT), Announce).serve_forever()
+    class Server(http.server.ThreadingHTTPServer):
+        def server_bind(self):
+            # HTTPServer looks up the host's name between bind() and listen().
+            # That reverse lookup can take seconds, and until it returns the
+            # port refuses connections. The name is never used here.
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = self.server_address[:2]
+
+    Server((host, TRACKER_PORT), Announce).serve_forever()
 
 
 def bt_seeder(host, meta, record, save, hold=4.0):
@@ -1332,6 +1341,9 @@ Endpoint = {ENDPOINT_IP}:51820
         check(body.strip() == str(completed), f"app/defaultSavePath is completed_dir ({body!r})")
 
         step("real rtbit: download a torrent through the tunnel")
+        wait_for(lambda: all(
+            f"{OTHER_TUNNEL_HOST}:{port} " in sh("ss", "-Hltn", ns=NS_INET).stdout
+            for port in (TRACKER_PORT, SEED_PORT)), 20, "the tracker and the seeder to listen")
         status, body = in_netns(NS_RTR, client.call, "POST", "torrents/add", None, {},
                                 {"torrents": ("e2e.torrent", torrent)})
         check(status == 200 and body.strip() == "Ok.", f"torrents/add answers Ok. ({status} {body!r})")
@@ -1377,6 +1389,8 @@ Endpoint = {ENDPOINT_IP}:51820
         state = inet_state()
         announces = [a for a in state["announces"] if a["info_hash"] == info_hash]
         check(bool(announces), f"the tracker behind the tunnel got announces ({len(announces)})")
+        check(bool(announces) and announces[0]["event"] == "started",
+              f"the first announce is `started` ({[a['event'] for a in announces]})")
         check(all(a["src"] == CLIENT_TUNNEL_IP for a in announces),
               f"every announce came from the tunnel address "
               f"({sorted({a['src'] for a in announces})})")
