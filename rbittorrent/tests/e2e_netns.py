@@ -1185,9 +1185,14 @@ def recording_listener(ns, host, port, log: Path):
 
 
 def install_lan_counters():
-    """Counts everything the app sends onto the LAN, where it arrives (the router)."""
+    """Counts everything the app sends onto the LAN, where it arrives (the router).
+    Anything else is also recorded by destination, protocol and ports."""
     sh("nft", "-f", "-", ns=NS_RTR, input_text=(
-        "table inet e2elan {\n chain pre {\n"
+        "table inet e2elan {\n"
+        " set other_l4 { type ipv4_addr . inet_proto . inet_service . inet_service;"
+        " flags dynamic; size 256; }\n"
+        " set other_icmp { type ipv4_addr . icmp_type . icmp_code; flags dynamic; size 256; }\n"
+        " chain pre {\n"
         "  type filter hook prerouting priority -300; policy accept;\n"
         f"  iifname \"lan0\" ip saddr 10.99.0.2 ip daddr {ENDPOINT_IP} udp dport 51820"
         " counter accept comment \"wireguard\"\n"
@@ -1196,9 +1201,48 @@ def install_lan_counters():
         # Home Assistant's Supervisor API, asked once before the kill-switch.
         f"  iifname \"lan0\" ip saddr 10.99.0.2 ip daddr {SUPERVISOR_IP} tcp dport 80"
         " counter accept comment \"supervisor\"\n"
-        "  iifname \"lan0\" ip saddr 10.99.0.2 counter"
-        " log prefix \"e2e-lan-other \" accept comment \"other\"\n"
+        "  iifname \"lan0\" ip saddr 10.99.0.2 meta l4proto { tcp, udp }"
+        " add @other_l4 { ip daddr . meta l4proto . th sport . th dport }\n"
+        "  iifname \"lan0\" ip saddr 10.99.0.2 ip protocol icmp"
+        " add @other_icmp { ip daddr . icmp type . icmp code }\n"
+        "  iifname \"lan0\" ip saddr 10.99.0.2 counter accept comment \"other\"\n"
         " }\n}\n"))
+
+
+def lan_other_packets():
+    """What the "other" packets were: `daddr . proto . sport . dport` or
+    `daddr . icmp type . code`, each seen once or more."""
+    seen = []
+    for name in ("other_l4", "other_icmp"):
+        out = sh("nft", "list", "set", "inet", "e2elan", name, ns=NS_RTR, check=False).stdout
+        m = re.search(r"elements = \{([^}]*)\}", out)
+        if m:
+            seen += [e.strip() for e in m.group(1).split(",") if e.strip()]
+    return sorted(seen)
+
+
+def snapshot_lan_at(log_path: Path, marker: str, into: dict, timeout=180.0):
+    """Takes the LAN counters the moment `marker` shows up in the log (polled
+    every 20 ms in a thread), so traffic before and after it can be told apart."""
+    def watch():
+        deadline, pos, tail = time.time() + timeout, 0, ""
+        while time.time() < deadline:
+            try:
+                with open(log_path, errors="replace") as f:
+                    f.seek(pos)
+                    chunk = f.read()
+                    pos = f.tell()
+            except OSError:
+                chunk = ""
+            tail = (tail + chunk)[-4096:]
+            if marker in tail:
+                into["counters"] = lan_counters()
+                into["other"] = lan_other_packets()
+                return
+            time.sleep(0.02)
+    t = threading.Thread(target=watch, daemon=True)
+    t.start()
+    return t
 
 
 def lan_counters():
@@ -1298,6 +1342,8 @@ Endpoint = {ENDPOINT_IP}:51820
         ["ip", "netns", "exec", NS_CLI, str(binaries["rbittorrent-supervisor"])],
         env=env, stdout=log, stderr=subprocess.STDOUT,
     )
+    at_killswitch = {}
+    snapshot_lan_at(WORK / "supervisor.log", "kill-switch active", at_killswitch)
     base = "http://10.99.0.2:8080"
     client = qbit.Client(base)
 
@@ -1410,12 +1456,23 @@ Endpoint = {ENDPOINT_IP}:51820
         check(any(f"{OTHER_TUNNEL_HOST}:{SEED_PORT}" in c for c in seen_socks)
               and all(c.startswith(f"{CLIENT_TUNNEL_IP}%wg0:") for c in seen_socks),
               "rtbit's peer and tracker sockets are bound to wg0")
-        counters = lan_counters()
+        counters, others = lan_counters(), lan_other_packets()
         check(counters.get("wireguard", 0) > 0,
               f"the WireGuard envelope went over the LAN ({counters})")
-        check(counters.get("other", -1) == 0,
-              f"nothing but WireGuard, Web UI replies and the Supervisor API reached the LAN "
-              f"({counters})")
+        before = at_killswitch.get("counters", {})
+        before_others = at_killswitch.get("other", [])
+        nameservers = re.findall(r"(?m)^nameserver\s+(\S+)", Path("/etc/resolv.conf").read_text())
+        print(f"  info  before the kill-switch: {before or 'no snapshot'}, other packets "
+              f"{before_others}; the host's nameservers {nameservers}", flush=True)
+        check(bool(before) and counters.get("other", -1) == before.get("other", -2),
+              f"after the kill-switch nothing but WireGuard and Web UI replies reached the LAN "
+              f"({counters}; at the kill-switch {before}; other packets {others})")
+        # Before the kill-switch only the supervisor itself runs: it asks the
+        # Supervisor API (counted apart) and looks up its name ("supervisor").
+        check(all(p.split(" . ")[1:2] == ["udp"] and p.endswith(" . 53")
+                  for p in before_others),
+              f"before the kill-switch only the Supervisor API and its DNS lookup "
+              f"went to the LAN ({before_others})")
         ok, out = tcp_probe(NS_INET, CLIENT_TUNNEL_IP, PORT_A)
         check(ok, f"peers reach rtbit on the forwarded port through the tunnel ({out})")
         ok, out = tcp_probe(NS_RTR, "10.99.0.2", PORT_A)
