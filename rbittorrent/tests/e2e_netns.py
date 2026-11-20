@@ -1175,11 +1175,28 @@ def recording_listener(ns, host, port, log: Path):
     return subprocess.Popen(["ip", "netns", "exec", ns, sys.executable, "-c", code])
 
 
+def install_lan_counters():
+    """Counts everything the app sends onto the LAN, where it arrives (the router)."""
+    sh("nft", "-f", "-", ns=NS_RTR, input_text=(
+        "table inet e2elan {\n chain pre {\n"
+        "  type filter hook prerouting priority -300; policy accept;\n"
+        f"  iifname \"lan0\" ip saddr 10.99.0.2 ip daddr {ENDPOINT_IP} udp dport 51820"
+        " counter accept comment \"wireguard\"\n"
+        "  iifname \"lan0\" ip saddr 10.99.0.2 tcp sport { 8080, 8099 }"
+        " counter accept comment \"webui\"\n"
+        # Home Assistant's Supervisor API, asked once before the kill-switch.
+        f"  iifname \"lan0\" ip saddr 10.99.0.2 ip daddr {SUPERVISOR_IP} tcp dport 80"
+        " counter accept comment \"supervisor\"\n"
+        "  iifname \"lan0\" ip saddr 10.99.0.2 counter"
+        " log prefix \"e2e-lan-other \" accept comment \"other\"\n"
+        " }\n}\n"))
+
+
 def lan_counters():
     """Packets the app sent onto the LAN, by kind (counted on the router)."""
     out = sh("nft", "list", "table", "inet", "e2elan", ns=NS_RTR, check=False).stdout
     return {m.group(2): int(m.group(1))
-            for m in re.finditer(r'packets (\d+) bytes \d+ comment "(\w+)"', out)}
+            for m in re.finditer(r'packets (\d+) bytes \d+[^\n]* comment "(\w+)"', out)}
 
 
 def rtbit_pid():
@@ -1219,20 +1236,7 @@ def run_real_rtbit_test(supervisor: Path, rtbit: Path):
     torrent, info_hash, payload_sha1 = make_seed_torrent()
     resolv = WORK / "resolv.conf"
     resolv.write_text("nameserver 8.8.8.8\n")
-    # Everything the app sends onto the LAN, counted where it arrives.
-    sh("nft", "-f", "-", ns=NS_RTR, input_text=(
-        "table inet e2elan {\n chain pre {\n"
-        "  type filter hook prerouting priority -300; policy accept;\n"
-        f"  iifname \"lan0\" ip saddr 10.99.0.2 ip daddr {ENDPOINT_IP} udp dport 51820"
-        " counter comment \"wireguard\" accept\n"
-        "  iifname \"lan0\" ip saddr 10.99.0.2 tcp sport { 8080, 8099 }"
-        " counter comment \"webui\" accept\n"
-        # Home Assistant's Supervisor API, asked once before the kill-switch.
-        f"  iifname \"lan0\" ip saddr 10.99.0.2 ip daddr {SUPERVISOR_IP} tcp dport 80"
-        " counter comment \"supervisor\" accept\n"
-        "  iifname \"lan0\" ip saddr 10.99.0.2 counter comment \"other\""
-        " log prefix \"e2e-lan-other \" accept\n"
-        " }\n}\n"))
+    install_lan_counters()
     lan_tracker_log = WORK / "lan-tracker.log"
     lan_tracker = recording_listener(NS_RTR, "10.99.0.1", TRACKER_PORT, lan_tracker_log)
 
